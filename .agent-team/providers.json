@@ -1,0 +1,28 @@
+{
+  "_comment": "Provider adapters are data, not code. Each entry says how to invoke one CLI agent headlessly: `command` + `args` are fixed flags ONLY — the prompt is never one of them; orchestrator.mjs writes it to the child process's stdin instead. Only providers actually installed on this machine are listed: claude (2.1.207) and codex (codex-cli 0.139.0) were both found on PATH and verified against their own --help at scaffold time. Gemini CLI is not installed here and was deliberately left out — add it (see _extension_pattern) if it's installed later. No agent in roster.json currently uses 'codex' — it's listed here so an agent can be reassigned to it later without touching this file again.",
+
+  "claude": {
+    "description": "Claude Code, headless single-prompt mode, prompt via stdin",
+    "command": "claude",
+    "args": ["-p", "--dangerously-skip-permissions"],
+    "verify_note": "verified live against claude 2.1.207 (the exact version installed on this machine): `-p` with no positional prompt argument reads the prompt from stdin, and --dangerously-skip-permissions is the correct no-prompt-approval flag — required for unattended runs since nothing is present to answer a permission prompt",
+    "usageLimitPatterns": ["usage limit reached", "hit your (session|usage) limit", "limit will reset", "resets \\d{1,2}:\\d{2}\\s*(am|pm)?"],
+    "usageLimitNote": "Case-insensitive regexes matched against invokeProvider's combined stdout+stderr by orchestrator.mjs's isUsageLimitHit. A real limit hit was previously observed to produce \"You've hit your session limit · resets HH:MMam/pm (your timezone)\" — the two originally-guessed patterns didn't match that exact wording, so both the matching and the original patterns are kept here. Re-check again if the exact wording changes in a future CLI version."
+  },
+
+  "codex": {
+    "description": "OpenAI Codex CLI, headless exec mode, prompt via stdin",
+    "command": "codex",
+    "args": ["exec", "--dangerously-bypass-approvals-and-sandbox"],
+    "verify_note": "verified live against codex-cli 0.139.0 (the exact version installed on this machine): `codex exec --help` documents that omitting the PROMPT argument (or passing `-`) reads instructions from stdin; --full-auto does NOT exist on this version, the correct flag is --dangerously-bypass-approvals-and-sandbox. Re-check against the installed version before relying on this if codex is ever upgraded.",
+    "usageLimitPatterns": ["usage limit", "rate limit", "hit your (session|usage) limit"],
+    "usageLimitNote": "NOT verified against a real limit hit on this project — based on documentation only. Re-verify against a real hit before trusting this in an unattended run."
+  },
+
+  "_extension_pattern": {
+    "_comment": "To add Gemini CLI or another provider later: install it, then add an entry with this shape. Three things must be true: a genuinely non-interactive single-prompt mode (exits on its own, doesn't wait on a TTY); reads its prompt from stdin when no prompt argument is given (never pass a multi-line prompt as a CLI argument); and some flag that skips interactive approval.",
+    "command": "<the binary name>",
+    "args": ["<flags — no prompt placeholder, stdin carries it>", "<any no-approval flag>"],
+    "verify_note": "<what you checked and against which version>"
+  }
+}

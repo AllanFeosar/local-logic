@@ -1,0 +1,54 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "dev",
+      "description": "Main development - builds and runs CLI",
+      "runtimeExecutable": "bun",
+      "runtimeArgs": ["run", "dev"],
+      "port": null
+    },
+    {
+      "name": "dev:profile",
+      "description": "Interactive provider launcher",
+      "runtimeExecutable": "bun",
+      "runtimeArgs": ["run", "dev:profile"],
+      "port": null
+    },
+    {
+      "name": "dev:openai",
+      "description": "OpenAI provider",
+      "runtimeExecutable": "bun",
+      "runtimeArgs": ["run", "dev:openai"],
+      "port": null
+    },
+    {
+      "name": "dev:gemini",
+      "description": "Google Gemini provider",
+      "runtimeExecutable": "bun",
+      "runtimeArgs": ["run", "dev:gemini"],
+      "port": null
+    },
+    {
+      "name": "dev:ollama",
+      "description": "Ollama local provider",
+      "runtimeExecutable": "bun",
+      "runtimeArgs": ["run", "dev:ollama"],
+      "port": null
+    },
+    {
+      "name": "dev:codex",
+      "description": "Codex provider",
+      "runtimeExecutable": "bun",
+      "runtimeArgs": ["run", "dev:codex"],
+      "port": null
+    },
+    {
+      "name": "dev:atomic-chat",
+      "description": "Atomic Chat provider",
+      "runtimeExecutable": "bun",
+      "runtimeArgs": ["run", "dev:atomic-chat"],
+      "port": null
+    }
+  ]
+}

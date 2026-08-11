@@ -1,0 +1,28 @@
+node_modules/
+dist/
+*.tsbuildinfo
+.env
+.env.*
+!.env.example
+.openclaude-profile.json
+reports/
+
+# Python bytecode cache (python-bridge/)
+__pycache__/
+*.pyc
+*.pyo
+
+# Local MCP server config — real absolute paths, machine-specific
+.mcp.json
+!.mcp.json.example
+
+# synaptic-memory (mempalace + graphify) — local paths, gitignored per its own convention
+mempalace.project.json
+mempalace.yaml
+graphify-out/
+
+# Personal/local Claude Code settings (machine-specific paths, permission grants)
+.claude/settings.local.json
+
+# Transient hook state (subagent-gate circuit-breaker counters)
+.claude/hooks/.subagent-gate-state.json

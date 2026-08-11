@@ -1,0 +1,42 @@
+# .graphifyignore — files/folders graphify should skip when building
+# graphify-out/graph.json for openclaude-main.
+#
+# fnmatch glob syntax (same as .gitignore). Graphify already skips common
+# noise by default (node_modules, __pycache__, .git, dist, build,
+# graphify-out, etc.) — only patterns not already in that built-in list are
+# listed here. Run `/graphify --update` after editing this file to apply
+# changes to an existing graph.
+
+# Secrets — never graph these
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+.openclaude-profile.json
+.mcp.json
+
+# Lock files (no useful graph signal)
+bun.lock
+package-lock.json
+*.lock
+
+# Build output not already caught by the default dist/ skip
+*.mjs.map
+
+# Python artefacts (python-bridge/)
+*.pyc
+*.pyo
+__pycache__/
+*.egg-info/
+venv/
+.venv/
+
+# IDE noise
+.idea/
+.vscode/
+
+# Nested VS Code extension's own node_modules (belt-and-suspenders —
+# graphify's default node_modules skip should already cover this)
+vscode-extension/openclaude-vscode/node_modules/

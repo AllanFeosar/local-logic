@@ -1,0 +1,15 @@
+{
+  "integrationMode": "remote",
+  "remoteBackendUrl": "http://localhost:3001",
+  "remoteBackendPort": 3001,
+  "useBuiltInAgents": true,
+  "useRemoteAgents": true,
+  "agents": {
+    "CodeReviewer": "remote",
+    "SecurityAuditor": "remote",
+    "Architect": "remote",
+    "PerformanceAnalyzer": "remote",
+    "General": "built-in",
+    "Explore": "built-in"
+  }
+}

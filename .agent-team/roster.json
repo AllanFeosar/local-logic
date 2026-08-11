@@ -1,0 +1,95 @@
+{
+  "_comment": "Orchestrator's source of truth. AGENTS.md's routing table is generated FROM this for humans; orchestrator.mjs reads this file directly. All 8 agents currently run on 'claude' (Claude Code) — codex is installed on this machine (codex-cli 0.139.0, verified) and listed in providers.json for future reassignment, but nothing here uses it yet. Keep ownership globs in sync with each agent's own .claude/agents/<name>.md Directory ownership section and with the roster-partition check from the scaffold's step 2 — same paths, three places, never drifting.",
+
+  "agents": [
+    {
+      "name": "tui-agent",
+      "provider": "claude",
+      "ownership": ["src/components/**", "src/ink/**", "src/ink.ts", "src/screens/**", "src/hooks/**", "src/keybindings/**", "src/vim/**", "src/context/**", "src/state/**", "src/dialogLaunchers.tsx", "src/replLauncher.tsx", "src/interactiveHelpers.tsx", "src/entrypoints/**", "src/main.tsx", "src/setup.ts", "src/projectOnboardingState.ts", "src/buddy/**", "src/assistant/**", "src/moreright/**", "src/outputStyles/**", "src/history.ts"],
+      "selfVerification": "npx tsc --noEmit && bun test src/components/**/*.test.ts* src/ink/**/*.test.ts",
+      "routing": ["ink", "component", "repl", "screen", "dialog", "keybinding", "vim mode", "terminal ui", "onboarding", "buddy", "companion ui"],
+      "worktree": true,
+      "setupCommand": "bun install"
+    },
+    {
+      "name": "commands-skills-agent",
+      "provider": "claude",
+      "ownership": ["src/commands/**", "src/commands.ts", "src/skills/**", "src/plugins/**", "src/utils/skills/**", "src/utils/plugins/**", "src/utils/git/**", "src/utils/github/**", "src/utils/suggestions/**", "src/utils/processUserInput/**"],
+      "selfVerification": "npx tsc --noEmit && bun test src/commands/**/*.test.ts* src/skills/**/*.test.ts",
+      "routing": ["slash command", "/command", "skill", "plugin", "marketplace", "git helper", "github command", "todo command"],
+      "worktree": true,
+      "setupCommand": "bun install"
+    },
+    {
+      "name": "provider-router-agent",
+      "provider": "claude",
+      "ownership": ["src/services/**", "src/QueryEngine.ts", "src/query.ts", "src/context.ts", "src/cost-tracker.ts", "src/costHook.ts", "src/upstreamproxy/**", "src/coordinator/**", "src/utils/mcp/**", "src/utils/model/**", "src/utils/settings/**", "src/memdir/**", "src/migrations/**", "src/types/**", "src/constants/**", "src/schemas/**", "src/config/**", "src/voice/**", "src/bootstrap/**", "scripts/provider-bootstrap.ts", "scripts/provider-discovery.ts", "scripts/provider-launch.ts", "scripts/provider-recommend.ts"],
+      "selfVerification": "bun run test:provider && bun run test:provider-recommendation && bun test src/services/mcp src/services/oauth src/services/github src/memdir src/upstreamproxy src/services/remoteAgentService.test.ts src/utils/context.test.ts src/utils/sessionStorage.test.ts src/utils/conversationRecovery.test.ts src/utils/conversationRecovery.hooks.test.ts src/utils/toolResultStorage.test.ts src/utils/githubModelsCredentials.test.ts src/utils/githubModelsCredentials.hydrate.test.ts src/utils/buildConfig.test.ts src/utils/model/providers.test.ts && npx tsc --noEmit",
+      "routing": ["provider", "openai", "bedrock", "vertex", "mcp", "oauth", "auth", "query engine", "context building", "compaction", "cost tracking", "model routing", "streaming"],
+      "worktree": true,
+      "setupCommand": "bun install"
+    },
+    {
+      "name": "tools-execution-agent",
+      "provider": "claude",
+      "ownership": ["src/tools/**", "src/Tool.ts", "src/tools.ts", "src/Task.ts", "src/tasks/**", "src/tasks.ts", "src/utils/task/**", "src/utils/swarm/**", "src/utils/ultraplan/**", "src/utils/background/**", "src/utils/todo/**", "src/utils/permissions/**", "src/utils/sandbox/**", "src/utils/bash/**", "src/utils/shell/**", "src/utils/powershell/**", "src/utils/computerUse/**", "src/utils/claudeInChrome/**", "src/utils/teleport/**", "src/utils/hooks/**", "src/utils/secureStorage/**", "src/utils/filePersistence/**", "src/bridge/**", "src/remote/**", "src/server/**", "src/coordinator/**", "src/schemas/hooks.ts"],
+      "selfVerification": "npx tsc --noEmit && bun test src/tools src/services/tools src/bridge src/utils/promptShellExecution.test.ts src/utils/ripgrep.test.ts",
+      "routing": ["tool", "bash", "sandbox", "permission", "hook config", "agenttool", "teammate", "swarm", "computer use", "web browser tool", "bridge permission", "remote permission"],
+      "worktree": true,
+      "setupCommand": "bun install"
+    },
+    {
+      "name": "security-audit-agent",
+      "provider": "claude",
+      "ownership": [],
+      "selfVerification": "N/A — audit-only agent; every finding must cite a real file:line verified by reading the current code",
+      "routing": ["security audit", "permission review", "sandbox review", "security gate", "pre-commit audit"],
+      "worktree": false
+    },
+    {
+      "name": "python-bridge-agent",
+      "provider": "claude",
+      "ownership": ["python-bridge/**"],
+      "selfVerification": "cd python-bridge && python -m py_compile server.py local_models/*.py",
+      "routing": ["python bridge", "local model", "document qa", "image caption", "fastapi", "huggingface model"],
+      "worktree": true
+    },
+    {
+      "name": "vscode-extension-agent",
+      "provider": "claude",
+      "ownership": ["vscode-extension/openclaude-vscode/**"],
+      "selfVerification": "cd vscode-extension/openclaude-vscode && npm test",
+      "routing": ["vscode extension", "control center", "vscode command", "vscode theme", "webview"],
+      "worktree": true,
+      "setupCommand": "cd vscode-extension/openclaude-vscode && npm install"
+    },
+    {
+      "name": "build-release-agent",
+      "provider": "claude",
+      "ownership": ["scripts/build.ts", "scripts/no-telemetry-plugin.ts", "scripts/system-check.ts", "bin/**", "tsconfig.json", "package.json", "src/native-ts/**", "src/utils/nativeInstaller/**", "src/utils/dxt/**", "src/utils/telemetry/**", "src/utils/deepLink/**"],
+      "selfVerification": "bun run smoke && bun run typecheck",
+      "routing": ["build", "bundler", "feature flag", "packaging", "native module", "telemetry setup", "release"],
+      "worktree": true,
+      "setupCommand": "bun install"
+    }
+  ],
+
+  "securityAgent": "security-audit-agent",
+  "securitySensitivePaths": [
+    "src/tools/**",
+    "src/utils/permissions/**",
+    "src/utils/sandbox/**",
+    "src/utils/bash/**",
+    "src/utils/shell/**",
+    "src/utils/powershell/**",
+    "src/utils/computerUse/**",
+    "src/utils/claudeInChrome/**",
+    "src/utils/teleport/**",
+    "src/utils/secureStorage/**",
+    "src/bridge/**",
+    "src/remote/**",
+    "src/services/oauth/**",
+    "src/services/mcp/auth.ts",
+    "src/utils/settings/permissionValidation.ts"
+  ]
+}
