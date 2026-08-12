@@ -3,9 +3,10 @@ export const DESCRIPTION = `Delegates a math problem to a local specialist reaso
 When to use:
 - Multi-step algebra, calculus, word problems, proofs, or competition-style problems.
 - Anything where a careless arithmetic slip would matter and deserves a dedicated, careful pass.
+- Any multiplication, division, or exponentiation where either operand has 3 or more digits (e.g. "847 x 293", "8473 x 2957"). You are NOT a reliable calculator at this size — you will often produce a confident-looking wrong answer or, on harder cases, garbled reasoning that doesn't even attempt the right operation. Delegate rather than trust your own arithmetic here, every time, no exceptions for "this one looks easy."
 
 When NOT to use:
-- Trivial arithmetic you can compute directly (e.g. "12*7", "15% of 80"). Delegating these wastes several minutes for no benefit.
+- Genuinely trivial arithmetic: both operands 2 digits or fewer (e.g. "12*7", "15% of 80", "9+16"). Delegating these wastes several minutes for no benefit.
 - Anything that isn't actually math (this model is not a general assistant and was not evaluated for other tasks).
 
 Timing: the specialist model reasons visibly before answering and this routinely takes 1-5 minutes. That is expected, not a hang — do not retry or assume failure just because it's slow.

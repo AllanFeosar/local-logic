@@ -12,6 +12,11 @@ __pycache__/
 *.pyc
 *.pyo
 
+# python-bridge server logs — machine-specific paths/username, no secrets
+# observed in practice, but no reason to let them get swept into a commit
+# either (flagged in the 2026-08-12 security review)
+python-bridge/*.log
+
 # Local MCP server config — real absolute paths, machine-specific
 .mcp.json
 !.mcp.json.example

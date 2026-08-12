@@ -13,6 +13,7 @@ import {
   type MemoryHeader,
   scanMemoryFiles,
 } from './memoryScan.js'
+import { rerankMemoriesByRelevance } from './rerank.js'
 
 export type RelevantMemory = {
   path: string
@@ -55,14 +56,22 @@ export async function findRelevantMemories(
   }
 
   // Above a certain memory count, sending the full manifest to Sonnet is
-  // wasteful — narrow it down with local embeddings first. Below the
-  // threshold this is a no-op (see EMBEDDING_PREFILTER_THRESHOLD), and it
-  // fails open to the full list if the local embedding model isn't
-  // reachable, so this never makes memory retrieval worse, only faster on
-  // large memory dirs when it's available.
+  // wasteful — narrow it down first with two-stage local retrieval: an
+  // embedding recall pass (cheap, cosine similarity over a short
+  // filename+description string), then a reranker precision pass
+  // (Qwen3-Reranker judging each surviving candidate against the query
+  // directly). Below the threshold both stages are a no-op (see
+  // EMBEDDING_PREFILTER_THRESHOLD), and each stage fails open to its input
+  // unchanged if its local model isn't reachable, so this never makes
+  // memory retrieval worse, only faster/more precise on large memory dirs
+  // when it's available.
   const candidateMemories =
     memories.length > EMBEDDING_PREFILTER_THRESHOLD
-      ? await preFilterMemoriesByEmbedding(query, memories, signal)
+      ? await rerankMemoriesByRelevance(
+          query,
+          await preFilterMemoriesByEmbedding(query, memories, signal),
+          signal,
+        )
       : memories
 
   const selectedFilenames = await selectRelevantMemories(

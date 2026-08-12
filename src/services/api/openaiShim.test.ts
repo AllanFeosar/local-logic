@@ -386,3 +386,87 @@ test('sanitizes malformed MCP tool schemas before sending them to OpenAI', async
   expect(properties?.priority?.enum).toEqual([0, 1, 2, 3])
   expect(properties?.priority).not.toHaveProperty('default')
 })
+
+function mockSimpleChatCompletion(
+  captureBody: (body: Record<string, unknown>) => void,
+): FetchType {
+  return (async (_input, init) => {
+    captureBody(JSON.parse(String(init?.body)))
+    return new Response(
+      JSON.stringify({
+        id: 'chatcmpl-1',
+        model: 'qwen3:1.7b',
+        choices: [{ message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }],
+        usage: { prompt_tokens: 5, completion_tokens: 1, total_tokens: 6 },
+      }),
+      { headers: { 'Content-Type': 'application/json' } },
+    )
+  }) as FetchType
+}
+
+// Regression test for the bug documented in LOCAL_AI_STATUS.md: a prior fix
+// set only `think: false`, which is a native-Ollama-API field silently
+// ignored on Ollama's OpenAI-compatible endpoint (confirmed against
+// https://github.com/ollama/ollama/issues/14820 /
+// https://github.com/ollama/ollama/issues/15288 — that fix never actually
+// worked, and this gap in coverage is exactly why it went unnoticed). Ollama's
+// OpenAI shim reads `reasoning_effort` instead, so both fields must be sent.
+test('sends both think:false and reasoning_effort:none to a local provider URL', async () => {
+  process.env.OPENAI_BASE_URL = 'http://localhost:11434/v1'
+  let requestBody: Record<string, unknown> | undefined
+  globalThis.fetch = mockSimpleChatCompletion(body => {
+    requestBody = body
+  })
+
+  const client = createOpenAIShimClient({}) as OpenAIShimClient
+  await client.beta.messages.create({
+    model: 'qwen3:1.7b',
+    system: 'test system',
+    messages: [{ role: 'user', content: '12 x 7' }],
+    max_tokens: 64,
+    stream: false,
+  })
+
+  expect(requestBody?.think).toBe(false)
+  expect(requestBody?.reasoning_effort).toBe('none')
+})
+
+test('does not send think/reasoning_effort to a remote provider URL', async () => {
+  process.env.OPENAI_BASE_URL = 'https://api.openai.com/v1'
+  let requestBody: Record<string, unknown> | undefined
+  globalThis.fetch = mockSimpleChatCompletion(body => {
+    requestBody = body
+  })
+
+  const client = createOpenAIShimClient({}) as OpenAIShimClient
+  await client.beta.messages.create({
+    model: 'gpt-4o',
+    system: 'test system',
+    messages: [{ role: 'user', content: 'hello' }],
+    max_tokens: 64,
+    stream: false,
+  })
+
+  expect(requestBody).not.toHaveProperty('think')
+  expect(requestBody).not.toHaveProperty('reasoning_effort')
+})
+
+test('does not send think/reasoning_effort for a tool-call-recovery-listed model even on a local URL', async () => {
+  process.env.OPENAI_BASE_URL = 'http://localhost:11434/v1'
+  let requestBody: Record<string, unknown> | undefined
+  globalThis.fetch = mockSimpleChatCompletion(body => {
+    requestBody = body
+  })
+
+  const client = createOpenAIShimClient({}) as OpenAIShimClient
+  await client.beta.messages.create({
+    model: 'hf.co/mradermacher/VibeThinker-3B-GGUF:Q4_K_M',
+    system: 'test system',
+    messages: [{ role: 'user', content: 'solve for x' }],
+    max_tokens: 64,
+    stream: false,
+  })
+
+  expect(requestBody).not.toHaveProperty('think')
+  expect(requestBody).not.toHaveProperty('reasoning_effort')
+})

@@ -145,30 +145,178 @@ Also required to be running for any of this to work:
   session.
 - Fast test suite: 42/42 passing across 8 files.
 
-## Open items for next session
+## Session 2 (2026-08-12) — re-verification findings
 
-- **Not yet re-verified**: a full interactive REPL test with Qwen3 making
-  its own delegation decisions naturally, now that the `/think` fix +
-  rebuild are in. The one live REPL test done this session surfaced the
-  `/think` bug (now fixed) — should re-run the same prompts
-  (`847 × 293`, `12 × 7`, a document-QA-shaped question, an image-caption
-  request) to confirm delegation actually happens correctly end-to-end.
-- Wire up Qwen3-Reranker-0.6B — natural next step, pairs with the existing
-  embedding pre-filter for genuine two-stage retrieval.
+The Phase-0 REPL re-verification this doc asked for turned up a real
+problem: **bug #4's `/think`-suffix fix never actually worked.**
+`body.think = false` is a native-Ollama-API field and is silently ignored
+on Ollama's OpenAI-compatible `/v1/chat/completions` endpoint (confirmed
+live, repeatedly, against Ollama 0.32.8 — the visible `reasoning` trace and
+the suffix corruption were both still present with `think: false` in the
+request body). Last session's "verified clean/correct across repeated
+runs" claim did not hold up under fresh testing and no test ever covered
+it (`grep think openaiShim.test.ts` — zero matches), which is how this
+went unnoticed. Root cause and fix confirmed against Ollama's own tracked
+issues: https://github.com/ollama/ollama/issues/14820 and
+https://github.com/ollama/ollama/issues/15288 — the OpenAI-compat endpoint
+maps `reasoning_effort` (not `think`) to the internal think state. **Fixed**
+in `openaiShim.ts`'s `_doOpenAIRequest`: now sends both `think: false`
+(harmless no-op on Ollama, kept for other local servers like LM Studio that
+may honor it) and `reasoning_effort: 'none'` (the field Ollama's OpenAI
+shim actually reads). Verified clean across repeated live calls with no
+test coverage gap this time — a regression test is in flight.
+
+Also tightened `AskMathModelTool`'s description (`src/tools/AskMathModelTool/prompt.ts`):
+the original "don't delegate trivial arithmetic (e.g. 12*7)" carve-out was
+being applied too broadly by the 1.7B router, causing it to self-compute
+3+ digit multiplication it can't reliably do. Sharpened the threshold
+explicitly (both operands ≤2 digits = trivial, 3+ digits = always
+delegate).
+
+**Bigger finding, not yet fixed — needs your call before proceeding:**
+even after both fixes above, delegation is still unreliable, and the
+reason looks structural rather than a small prompt tweak. Live-testing
+"12 x 7" produced a tool call to `Skill` with `skill: "math"` — there is
+no "math" skill; the actual skill list is `update-config, debug, simplify,
+batch, agent-team-scaffold, graphify`. The router reached for a
+plausible-sounding but nonexistent tool instead of the real
+`AskMathModel` sitting right there in its own tool list, and also passed
+malformed arguments (`args` as an object where a string was required).
+This session's tool list is ~65 entries (the ~25 built-ins plus ~40 tools
+across the newly-added mempalace/lmstudio/graphify MCP servers) —
+dramatically more than the ~10 the router was validated against
+originally. This matches, almost exactly, the routing-degradation risk
+called out in `LOCAL_AI_MASTER_PLAN.md` §6 before any of this MCP tooling
+existed. Likely not fully fixable by more prompt tweaking alone; the
+plan's own mitigations (domain-gateway tools, semantic tool pre-filtering,
+router upgrade to qwen3:4b) are the real answer, but implementing those
+touches tool-selection behavior project-wide, not just the local-AI
+specialists, so it's flagged for a decision rather than done unilaterally.
+See the question list relayed separately.
+
+### Session 2 — completed this pass
+
+- **Qwen3-Reranker-0.6B wired into genuine two-stage retrieval**
+  (`src/memdir/rerank.ts`, new). Implements the real logprob-based
+  pointwise scoring from Qwen3-Reranker's reference approach (not a lazy
+  numeric-rating fallback) — requests a single output token with wide
+  `top_logprobs` from Ollama's `/api/generate`, reads back "yes"/"no"
+  probability mass, softmax-normalizes. Uses `raw: true` to supply its own
+  chat-template prompt directly, which sidesteps the `/think`-suffix bug
+  class entirely (no Ollama template auto-injection in raw mode). Wired
+  into `findRelevantMemories.ts` as a second narrowing pass after the
+  embedding pre-filter (top 20 → top 10) before Sonnet's final selection.
+  Fails open like the embedding pre-filter. `bun test src/memdir`: 21/21
+  pass, including a live test against the real reranker model.
+- **Bridge model manager** (`python-bridge/local_models/manager.py`, new).
+  Budget cap + LRU eviction, single-flight loading, heavy-model
+  exclusivity flag (mechanism only — no heavy models registered yet),
+  device-placement stub (informational, CPU-only enforced regardless —
+  real CUDA placement is still an explicit separate decision, see
+  question list), and a `/status` endpoint. RSS is read via raw `ctypes`
+  calls to `kernel32`/`psapi` — deliberately not `psutil`, to avoid any
+  risk to the shared/borrowed Debate venv. `document_qa.py` and
+  `image_caption.py` now route through the manager; both routes
+  re-verified working identically to before.
+- **Eval harness** (`scripts/eval/`, new — `specialistEval.ts`, `cases.ts`,
+  `README.md`, `npm run eval:specialists`). Runs real test cases against
+  the live specialists (4 math, including a word problem beyond raw
+  arithmetic; 4 DocumentQA, including a deliberately unanswerable
+  question that correctly scored low confidence (0.056) rather than a
+  confident wrong answer; 2+ image-caption cases) and writes
+  `reports/eval-specialists.{json,md}`. Frontier-comparison column is
+  left blank by default — no live paid API call happens unless run with
+  an explicit `--frontier` opt-in, so nothing here can silently spend
+  money.
+- **Full-suite test triage**: `bun test` from the project root shows
+  340 pass / 22 fail. All 22 were individually traced and confirmed
+  unrelated to any change made this session or last: 10 are in
+  `vscode-extension/` (separate npm package, missing the `vscode` module
+  in this environment); 2 are the `providerConfig.ts` codexplan-alias bug
+  and the `withRetry.ts` rate-limit-header bug documented above (proven
+  pre-existing via revert-and-rerun against the untouched tree by two
+  independent agents); 6 are `applyProviderFlag`/`remoteAgentService`
+  tests polluted by this project's own pre-existing `.env` file (has a
+  live NVIDIA NIM API key/model/base-URL configured, which `bun test`
+  auto-loads — confirmed this does NOT leak into actual CLI runtime,
+  `.openclaude-profile.json`'s ollama profile correctly wins there); the
+  remaining 4 are live Ollama/bridge tests that pass cleanly when run in
+  isolation (transient resource contention when many live-model tests
+  hit the same local Ollama instance concurrently during a full-suite
+  run) except `toolCallRecoveryIntegration.test.ts`'s live-model
+  assertion, which is already-documented model-generation variance on
+  the non-load-bearing `toolCallRecovery.ts` safety net (see below).
+
+### Open items for next session
+
 - Extend `python-bridge/` to more of the ~20 unused downloaded models —
-  `python-bridge/README.md` documents the exact pattern (copy
-  `document_qa.py`/`image_caption.py`'s lazy-load structure, add a route,
-  add a matching TS tool).
-- **Agreed next direction (not started)**: build a small head-to-head eval
-  — a handful of real test cases per specialist, run through both the
-  local ensemble and a single frontier-model call, compared side by side.
-  Turns "trying to overcome top-tier AI" into actual measured evidence
-  instead of assumption, consistent with how skeptical this whole project
-  has been about unverified claims throughout.
+  now via `manager.py`'s `ModelSpec` pattern (see its module docstring)
+  rather than the old hand-rolled lazy-load-global pattern. Tier A next:
+  TabPFN, TAPAS, Chronos (all small, no GPU needed).
 - The Python bridge's torch build is CPU-only (no CUDA in the reused
-  venv) — fine for the two small models wired so far, worth reconsidering
-  if bigger/slower models get added later.
+  venv) — fine for the models wired so far, but the GPU sits completely
+  idle (RTX 3050, 4GB VRAM, confirmed available). Needs a dedicated venv
+  to use — explicit decision needed, see question list, not done this
+  session on purpose (this exact kind of shared-venv operation broke
+  things once already per bug #5 above).
 - `toolCallRecovery.ts` (VibeThinker tool-call recovery) is fully built and
   tested but not load-bearing in the current architecture — VibeThinker is
   never asked to call tools itself anymore, only invoked for plain-text
-  math completions. Kept as a safety net in case that changes.
+  math completions. Kept as a safety net in case that changes. Its one
+  live integration test shows normal run-to-run variance on the model's
+  exact output shape — expected, not a regression.
+- **Security review complete** (read-only audit of every new/changed
+  surface this session). No HIGH or MEDIUM findings. `isLocalProviderUrl`
+  confirmed not security-relevant and not spoofable in any way that
+  matters (traced every call site — never gates credentials or auth).
+  `rerank.ts`'s network calls confirmed safe (no auth headers, no
+  credentials, fails open, response handling defensive throughout).
+  `manager.py`'s raw `ctypes` RSS reader confirmed correct and memory-safe
+  (struct layout, sizes, restype/argtypes, and return-value checking all
+  verified against the Win32 API contract). Bridge confirmed bound to
+  `127.0.0.1` only, `/status` confirmed to leak nothing sensitive (no
+  paths, env vars, or credentials in its payload). Eval harness confirmed
+  to make zero live paid API calls without explicit `--frontier`, and
+  separately confirmed `AskMathModelTool` uses its own
+  `MATH_MODEL_BASE_URL` (always local Ollama) rather than `OPENAI_BASE_URL`,
+  so even the `.env` NVIDIA-key pollution mentioned above can't reach a
+  paid provider through it.
+  One LOW finding, since fixed: `/image-caption` had no auth and let a
+  caller distinguish "file doesn't exist" (404) from "file exists but
+  isn't a loadable image" (previously an unhandled 500) — a filesystem
+  existence oracle for an unauthenticated local endpoint, compounded by
+  DNS rebinding being possible against a loopback-only service with no
+  `Host` validation. Fixed: both cases now return an identical generic 404
+  (`server.py`, `image_caption.py`), and a `Host`-header check middleware
+  rejects anything not addressed to `127.0.0.1`/`localhost` (`server.py`).
+  Both verified live — legitimate routes still work identically, a
+  spoofed `Host` header now gets 403, a non-image existing file now gets
+  the same 404 as a missing one. The broader "confine `image_path` to an
+  allowlisted root directory" recommendation was deliberately **not**
+  implemented — the tool's whole purpose is captioning arbitrary
+  user-pointed local images, so an allowlist is a real design decision
+  (which roots?), not a mechanical fix; see question list.
+  Also fixed: `.gitignore` had no pattern for the bridge's `*.log` files,
+  so they showed as untracked-and-committable (contents checked, no
+  secrets, just machine paths/username, but no reason to risk it).
+  Separately, the audit independently re-confirmed (a third time, by a
+  different, read-only agent, via the same revert-and-rerun style
+  evidence) that the `providerConfig.ts`/`withRetry.ts` failures are
+  pre-existing, and identified a related but distinct process bug worth
+  fixing eventually: `bun test`'s `test:provider` gate is not hermetic
+  (inherits the root `.env`, which is what actually breaks those two
+  tests on this machine) and includes a live 90-second VibeThinker call
+  with self-documented nondeterministic output in what should be a
+  deterministic gate. Not fixed this session (out of scope — provider-
+  router-agent's test infrastructure, not the local-AI plan) but flagged
+  for whoever picks that up next: make the affected tests set their own
+  provider env explicitly, and move the live tool-call-recovery assertion
+  behind the same opt-in `*.live.test.ts` convention already used
+  elsewhere in this repo.
+- While restarting the bridge to verify the security fixes, found and
+  cleaned up two stray `server.py` processes running simultaneously — one
+  against the correct Debate venv, one against an unrelated system Python
+  install at `C:\Users\allge\AppData\Local\Programs\Python\Python311\`.
+  Killed both, restarted cleanly through the one correct path. Not
+  investigated further where the second one came from (likely a stray
+  manual run during today's agent work) — worth a glance if it recurs.

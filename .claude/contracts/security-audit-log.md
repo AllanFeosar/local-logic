@@ -123,3 +123,71 @@ src/tools/BashTool/bashPermissions.ts (~2.5k lines), bashSecurity.ts, readOnlyVa
 or their PowerShell equivalents, which together hold the bulk of the command-allowlist
 logic. Their entry points were verified to be reached only via checkPermissions, but the
 allowlist rules themselves are unaudited and should be scheduled as a dedicated follow-up.
+
+## 2026-08-12 — Local-AI session 2: /think→reasoning_effort fix, Qwen3-Reranker, bridge model manager, eval harness
+Files audited: src/memdir/rerank.ts, src/memdir/rerank.test.ts, src/memdir/rerank.live.test.ts, src/memdir/embeddingPreFilter.ts, src/memdir/findRelevantMemories.ts, src/services/api/openaiShim.ts, src/services/api/openaiShim.test.ts, src/services/api/providerConfig.ts (read for isLocalProviderUrl call-site tracing, not modified), src/tools/AskMathModelTool/prompt.ts, src/entrypoints/cli.tsx (read for isLocalProviderUrl call-site tracing, not modified), scripts/system-check.ts (read for isLocalProviderUrl call-site tracing, not modified), scripts/eval/specialistEval.ts, scripts/eval/cases.ts, python-bridge/server.py, python-bridge/local_models/manager.py, python-bridge/local_models/document_qa.py, python-bridge/local_models/image_caption.py, python-bridge/start.ps1, .gitignore
+Verdict: 0 Critical, 0 High, 0 Medium, 1 Low
+Recommendation: ship (Low finding fixed and re-verified live before this entry was written)
+Findings: none blocking — 1 Low finding recorded inline below, fixed same session; no separate handoff report
+
+Read-only audit performed by security-audit-agent (dispatched by the orchestrating session, not
+this agent — it has no Write/Edit tools by design); this log entry and the corresponding code
+fixes were applied by the orchestrating session directly from that agent's findings, then
+re-verified live against the running bridge before this entry was staged.
+
+Explicit checks confirmed (all pass):
+- rerank.ts / embeddingPreFilter.ts / findRelevantMemories.ts: no SSRF (target URL is a
+  trusted env-var-overridable localhost default, never derived from request input), no
+  auth/credential headers sent, defensive response parsing throughout, both stages fail open
+  to their unmodified input so neither can be forced to smuggle attacker-chosen content past
+  Sonnet's final selection (findRelevantMemories.ts re-resolves against the full manifest).
+  Informational only: rerank.ts's raw:true hand-built Qwen3 chat-template prompt means a
+  memory description containing literal <|im_start|> markers could forge a template turn —
+  reachable consequence is bounded to candidate list re-ordering, no execution/egress.
+- openaiShim.ts's new think:false / reasoning_effort:'none' fields: isLocalProviderUrl
+  (providerConfig.ts:210-247) traced at every call site (cli.tsx:95, openaiShim.ts:878/925,
+  system-check.ts:8) — never gates credential transmission, TLS, or any permission check;
+  Authorization/api-key headers are attached purely on key presence, independent of
+  localness. Parsing itself resists userinfo-based hostname spoofing (uses URL().hostname).
+  A crafted OPENAI_BASE_URL could still get misclassified as local (e.g. RFC1918/`*.local`
+  patterns are intentionally broad), but env vars are trusted input and the only effect is
+  two extra harmless body fields — no security consequence.
+- manager.py's raw ctypes GetProcessMemoryInfo/GetCurrentProcess usage: struct layout,
+  sizes, restype/argtypes, and return-value checking verified correct against the Win32 API
+  contract; no unsafe buffer sizing, no unchecked return, no memory-safety issue.
+- Bridge confirmed bound to 127.0.0.1 only (server.py, start.ps1 — grepped for 0.0.0.0/--host/
+  CORS/add_middleware across python-bridge/, exactly one host-binding hit). /status endpoint
+  payload confirmed to contain no filesystem paths, env vars, credentials, or request bodies.
+- Eval harness (scripts/eval/) confirmed to make zero live paid frontier-API calls without an
+  explicit --frontier flag (three call sites, all gated); confirmed AskMathModelTool uses its
+  own MATH_MODEL_BASE_URL (always local Ollama), not OPENAI_BASE_URL, so this project's
+  pre-existing .env (a live NVIDIA NIM key, unrelated to this session's work) cannot reach a
+  paid provider through the math path even by accident.
+- Untracked bridge log files read in full at audit time: no API keys, tokens, credentials, or
+  PII — only machine-local absolute paths and username.
+
+LOW — Unauthenticated /image-caption endpoint let a caller distinguish "file doesn't exist"
+(404) from "file exists but isn't a loadable image" (previously an unhandled 500 via
+PIL.UnidentifiedImageError) — a filesystem existence oracle, compounded by no Host-header
+validation against DNS rebinding on the loopback-only service.
+Fix (applied same session, verified live): python-bridge/server.py now catches OSError
+alongside FileNotFoundError and returns the identical generic 404 for both cases
+(image_caption.py's caption() carries a comment explaining why this collapse is deliberate);
+a reject_unexpected_host ASGI middleware rejects any request whose Host header isn't
+127.0.0.1/localhost with 403. Verified: /document-qa and /image-caption still succeed on
+legitimate calls, a non-image existing file and a missing file now return byte-identical 404
+responses, and a spoofed Host header gets 403. The broader "confine image_path to an
+allowlisted root directory" recommendation was deliberately not applied — project owner
+confirmed (2026-08-12) the existing project-level tool/permission model is the intended
+control for this, not a path allowlist inside the bridge itself.
+
+Also fixed same session (not a security finding, hygiene only): .gitignore had no pattern
+for python-bridge/*.log, so the bridge's stdout/stderr logs showed as untracked-and-
+committable; contents were confirmed to hold no secrets before adding the ignore pattern.
+
+Not covered by this entry (pre-existing, confirmed unrelated to this session's diff via
+git diff --stat showing zero changes to the files involved, cross-checked by three
+independent agents including this one): the providerConfig.ts codexplan-alias-resolution
+bug and the withRetry.ts Anthropic rate-limit-header-parsing bug surfaced by test failures
+during this session's work. Both are being fixed in a follow-up covered by their own
+audit-log entry when that work lands.

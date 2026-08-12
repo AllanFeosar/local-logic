@@ -885,11 +885,26 @@ class OpenAIShimMessages {
       // last user turn when think mode is on, and for terse prompts this
       // is textually indistinguishable from real content — confirmed via
       // direct testing that "847 x 293" + " /think" gets misread by the
-      // model as an incomplete division ("847 x 293 /"), producing a wrong
-      // answer. think: false removes that suffix entirely. Recovery-listed
-      // models (VibeThinker) are excluded — those are deliberately
-      // reasoning-heavy and untouched here; this only affects the router.
+      // model as an incomplete division, producing a wrong or garbled
+      // answer. Recovery-listed models (VibeThinker) are excluded — those
+      // are deliberately reasoning-heavy and untouched here; this only
+      // affects the router.
+      //
+      // IMPORTANT: `think` is a native-Ollama-API field and is silently
+      // ignored on Ollama's OpenAI-compatible `/v1/chat/completions`
+      // endpoint (confirmed live against Ollama 0.32.8 — the suffix bug
+      // and visible `reasoning` trace persist with `think: false` sent
+      // here; a prior fix that relied solely on this field did not
+      // actually work despite passing verification at the time, see
+      // https://github.com/ollama/ollama/issues/14820 /
+      // https://github.com/ollama/ollama/issues/15288). Ollama's OpenAI
+      // shim instead maps `reasoning_effort` to its internal think state,
+      // so that's the field that actually takes effect on this endpoint.
+      // `think` is kept alongside it (harmless if ignored) for any other
+      // local OpenAI-compatible server — e.g. LM Studio — that may honor
+      // it instead.
       body.think = false
+      body.reasoning_effort = 'none'
     }
     // Convert max_tokens to max_completion_tokens for OpenAI API compatibility.
     // Azure OpenAI requires max_completion_tokens and does not accept max_tokens.

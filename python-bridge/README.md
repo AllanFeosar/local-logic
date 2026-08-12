@@ -40,16 +40,52 @@ torch install) if larger/slower models get added here later.
   (distilbert-base-cased-distilled-squad, extractive QA over a text passage)
 - `POST /image-caption` — `{image_path}` → `{caption}`
   (blip-image-captioning-large, captions a local image file)
+- `GET /status` — what's currently loaded (name, estimated MB, heavy/
+  device/fp16 flags, in-use count, how long it's been resident), the
+  committed-MB estimate against the configured budget, and a real current
+  process RSS reading. For debugging and for the eval harness.
 - `GET /health` — liveness check
+
+## The model manager
+
+`local_models/manager.py` is a shared lazy-load registry every model
+module registers into (see its own docstring for the full design). It
+gives every model, for free:
+
+- a configurable **RAM budget** (`MODEL_BRIDGE_BUDGET_MB` env var, default
+  ~4.5 GB) with **LRU eviction** when loading a new model would exceed it,
+- **single-flight loading** (concurrent requests for a not-yet-loaded
+  model share one load instead of racing),
+- a **heavy-model exclusivity flag** (`ModelSpec(heavy=True)`) that evicts
+  everything else and loads alone — no heavy models use this yet, it's the
+  mechanism Tier C models (SD, MusicGen, TTS) opt into later,
+- a **device placement config stub** (`device`/`fp16` on `ModelSpec`) —
+  informational only today; this venv's torch is CPU-only, so it's logged
+  and surfaced in `/status` but not acted on. Wiring real CUDA placement is
+  a separate, explicit decision (a dedicated CUDA venv — see
+  `LOCAL_AI_MASTER_PLAN.md` §5), not attempted here.
+
+`/status`'s process RSS reading is stdlib-only (`ctypes` + the Windows API
+on this platform) — deliberately **not** `psutil`, to avoid adding any new
+dependency to the shared/reused venv (see "Why this exists" above re: the
+`torchvision` incident).
 
 ## Adding another model
 
 1. Copy `local_models/document_qa.py` or `local_models/image_caption.py` as
-   a template: lazy-load singleton (`_load()`), a sync function, and an
-   `asyncio.to_thread`-wrapped async version so CPU-bound inference doesn't
-   block the event loop. This is the exact pattern already used in
-   `Debate/backend/app/infrastructure/local_models/` — copied on purpose so
-   both codebases stay consistent.
+   a template:
+   - a `_do_load()` that imports concrete model classes (not `Auto*`/
+     `pipeline()` — see the transformers-v5 breakage notes in those files)
+     and returns a handle,
+   - a `manager.register(ModelSpec(name=..., loader=_do_load,
+     estimated_mb=..., heavy=..., device=..., fp16=...))` call at import
+     time,
+   - a sync inference function that does `with manager.use(name) as
+     handle: ...` instead of a private `_model` global,
+   - the same `asyncio.to_thread`-wrapped async version so CPU-bound
+     inference doesn't block the event loop.
+   Don't reintroduce a bespoke per-module lazy-singleton — it'll drift out
+   of sync with the shared budget/LRU/heavy-exclusivity bookkeeping.
 2. Add one route in `server.py` that calls the async version.
 3. Add a matching Tool in `openclaude-main/src/tools/` that fetches this
    endpoint — see `src/tools/DocumentQATool/` for the reference shape

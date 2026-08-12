@@ -3,7 +3,7 @@
 # requirements.txt for what's needed if pointing this at a fresh venv instead
 # via $env:MODEL_BRIDGE_PYTHON before running this script).
 
-$defaultPython = "E:\Allan Project\Git Repo Project\Debate Project\Debate\backend\venv\Scripts\python.exe"
+$defaultPython = "E:\Allan Project\Debate Project\Debate\backend\venv\Scripts\python.exe"
 $python = if ($env:MODEL_BRIDGE_PYTHON) { $env:MODEL_BRIDGE_PYTHON } else { $defaultPython }
 
 if (-not (Test-Path $python)) {

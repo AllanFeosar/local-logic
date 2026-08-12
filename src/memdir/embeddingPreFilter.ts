@@ -71,7 +71,10 @@ function cosineSimilarity(a: number[], b: number[]): number {
   return dot / (Math.sqrt(normA) * Math.sqrt(normB))
 }
 
-function memoryEmbeddingText(m: MemoryHeader): string {
+// Exported so rerank.ts can score the same filename+description text it was
+// embedded with — keeping both retrieval stages' notion of "what a memory
+// looks like to a relevance model" in one place instead of two drifting copies.
+export function memoryEmbeddingText(m: MemoryHeader): string {
   return m.description ? `${m.filename}: ${m.description}` : m.filename
 }
 

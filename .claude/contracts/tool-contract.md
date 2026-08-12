@@ -132,11 +132,24 @@ over local HTTP (loopback only, no auth — not internet-facing by design).
 | Route | Backing tool | Request | Response |
 |---|---|---|---|
 | `POST /document-qa` (exact path: see `python-bridge/server.py`) | `DocumentQATool` | `{ question: string, context: string }` | `{ answer: string, score: number }` |
-| `POST /image-caption` | `ImageCaptionTool` | `{ image: string (base64 or path) }` | `{ caption: string }` |
+| `POST /image-caption` | `ImageCaptionTool` | `{ image_path: string }` (corrected 2026-08-12 — was documented as `image`, actual field has always been `image_path`; see `ImageCaptionRequest` in `server.py`) | `{ caption: string }` |
+| `GET /status` | none yet — debugging/eval-harness only | (no body) | `{ budget_mb: number, committed_mb_estimated: number, process_rss_mb: number \| null, rss_source: "windows_working_set" \| "posix_rusage" \| "unavailable", loaded: Array<{ name, estimated_mb, heavy, device, fp16, in_use, loaded_at, resident_seconds }>, registered: string[] }` |
+
+`/document-qa` and `/image-caption`'s request/response shapes are
+unchanged by the 2026-08-12 model-manager work (budget cap + LRU eviction,
+single-flight loading, heavy-model exclusivity flag, device-placement
+stub — see `python-bridge/local_models/manager.py`) — that work is purely
+internal to the bridge (what's resident and when), not part of either
+route's contract. `/status` is new and not yet consumed by any TS tool;
+if the eval harness or a future tool needs to call it from TypeScript,
+that's a `tools-execution-agent` pickup, not done here.
 
 Extending this table is `python-bridge-agent`'s responsibility whenever a
 new route is added — see that agent's own Architecture rules for the
-lazy-load-singleton pattern every route follows.
+lazy-load-singleton pattern every route follows (now: register a
+`ModelSpec` with the shared `local_models.manager` rather than a private
+per-module singleton — see `python-bridge/README.md`'s "Adding another
+model" section).
 
 ---
 
