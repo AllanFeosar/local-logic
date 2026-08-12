@@ -1661,20 +1661,374 @@ Neither direction was chosen or started — flagging both with their real
 tradeoffs is the honest deliverable here, not a recommendation forced
 under time pressure.
 
+## Session 11 (2026-08-12, tools-execution-agent) — Tier 1 restricted AST evaluator: built, wired in, live-verified 6/6, independent security-audit-agent review still required
+
+Picked up Session 10's direction 1 (`LOCAL_AI_MASTER_PLAN.md` §11
+"Verifier isolation — the settled answer"): replace DeepSolve's math
+verification step with a genuinely restricted numeric AST evaluator — an
+**allowlist of AST node types**, not another round of denylist patching on
+`pythonSandbox.ts`. `pythonSandbox.ts` is **not revived** — it's retired in
+place with a top-of-file banner pointing here and at §11, kept only so a
+future reader can see exactly what was tried and why three rounds failed.
+
+### What was built (`deepSolve/restrictedEvaluator.ts`, new)
+
+A small, trusted Python script (`RESTRICTED_EVAL_SCRIPT`, embedded as a
+string constant, spawned via the same process-hygiene discipline
+`pythonSandbox.ts` established: `execa(pythonPath, ['-I','-S','-B','-c',
+SCRIPT], { shell: false, extendEnv: false, ... })`, untrusted snippet on
+stdin only, hard timeout + kill). Unlike `pythonSandbox.ts` there is **no
+temp file and no filesystem write at all** — one process, one fixed
+trusted script, one small JSON result on stdout. Critically, the script
+never calls Python's own `eval()`/`exec()`/`compile()` on the untrusted
+input, not even on a "validated" AST — it parses with `ast.parse()` (reused
+for convenience, not safety — a well-tested standard grammar recognizer,
+not a security dependency) and then **walks the tree itself**, computing a
+result node-by-node via its own hardcoded dispatch. This is what makes "the
+grammar cannot express a reference to anything outside the fixed function
+table" literally true rather than aspirational: there is no `Attribute`
+node type recognized at all (closes every round-1/2/3 exploit class, all of
+which depended on attribute traversal through an already-imported module),
+and `Name` Load only ever resolves against the interpreter's own local
+dict, never Python's real `globals()`/`builtins`/`sys.modules`.
+
+**Exact allowed AST node types** (anything else is rejected — no branch
+exists for it, not "checked against a list"): `Module`, `Assign` (single
+simple `Name` target only), `Expr` (statement), `Constant` (int/float/bool
+literals only — string, bytes, complex, `None`, `Ellipsis` all rejected),
+`BinOp` (`+ - * / // % **`), `UnaryOp` (`+ -` only — `not` is deliberately
+excluded, not on the task's own allowed list), `BoolOp` (`and`/`or`, with
+real short-circuit evaluation), `Compare` (`== != < <= > >=`, including
+chained comparisons like `1 < x < 10`), `Call` (only when `node.func` is a
+bare `Name` whose `.id` is literally a key in `FUNCTION_TABLE` — no
+`**kwargs`, no `*args` unpacking, ≤20 positional args), `Name` (Load only
+resolves against the script's own local-variable dict built from prior
+`Assign` statements; Store only as an `Assign` target). `Import`/
+`ImportFrom`, `Attribute` (any kind, any object), `Subscript`, `Lambda`,
+every comprehension form, `JoinedStr`/f-strings, `Starred`, `With`,
+`Global`/`Nonlocal`, `While`/`For`/`If`/`FunctionDef`/`ClassDef`/`Raise`/
+`Try`, and `eval`/`exec`/`open`/`import`/etc. used as bare call targets are
+all confirmed rejected (see test list below) — there is no dangerous-name
+list to maintain because none of these can be *expressed* by this grammar
+in a way that reaches anything, not because particular spellings are
+banned.
+
+**Exact function table** (13 entries, each a plain wrapper function the
+trusted script defines itself): `sqrt`, `abs`, `pow` (2-arg real exponent
+or 3-arg modular form — `pow(7,100,13)`), `gcd`, `lcm`, `factorial`, `min`,
+`max`, `round` (1- or 2-arg), `floor`, `ceil`, `sum`, `isclose`
+(tolerance-based float equality, usable as the entire check on its own).
+Chosen from the task's own suggested list plus two deliberate, justified
+additions: `isclose` (float-tolerant equality is a common, genuinely useful
+verification pattern — matches a real usage this project's own live tests
+have produced before) and `lcm` (a natural, trivial `gcd` complement for
+number-theory checks). Nothing else was added. Bounds to prevent a chain of
+individually-small-looking operations from compounding into a
+many-gigabyte integer before the timeout would catch it: `MAX_POW_EXPONENT
+= 10_000`, `MAX_FACTORIAL_N = 10_000`, `MAX_ABS_VALUE = 10**50_000` (checked
+after **every** arithmetic/call result, not just at `Pow`, so growth is
+stopped at most one operation after crossing the threshold — a single large
+`**` doesn't blow up, but neither does a chain of smaller-looking `*`s that
+compounds past the bound).
+
+**Grammar shape — the "genuine check" requirement, closing Finding 5's
+class at the grammar level instead of a downstream heuristic**: zero or
+more `name = <expr>` assignment statements, followed by exactly one final
+bare-expression statement whose **top-level node must be `Compare`,
+`BoolOp`, or `Call`** (`validate_final_shape`) — a bare literal, a bare
+variable reference, or a bare arithmetic expression as the final line is
+rejected outright, before ever being evaluated. At runtime, that final
+expression must literally compute to Python's `True`/`False` — a
+non-boolean result (e.g. a plain number) is reported as an `'error'`
+outcome, never treated as a pass. **Decided against supporting multi-line
+scripts with the check stored in an intermediate variable and returned by
+bare `Name` reference** (e.g. `ok = (a==b)\nok`) — this would need real
+dataflow tracing to distinguish a genuine deferred check from an unrelated
+final `True`, which the task's own framing and this project's established
+convention (documented, accepted residual gaps over speculative complexity)
+argued against; a candidate must write the comparison itself on the final
+line. This is a documented, deliberate simplification, not an oversight —
+see the file's own header comment.
+
+**Honest, explicitly documented residual gap** (mirrors the exact gap
+`pythonSandbox.ts`'s own Finding 5 fix accepted): a tautological literal
+comparison (`4 == 4`) is still syntactically valid and not rejected. Unlike
+the old design, this is a **correctness** concern only, not a security one
+— a trivial check still cannot execute anything in this grammar.
+
+### Rejection mechanism
+
+Two independent code paths, both fail closed: (1) grammar rejection
+(`{"status":"rejected","reason":...}`) — the trusted script parsed the
+input, found a disallowed construct, and never evaluated it at all; (2)
+runtime error (`{"status":"error","error":...}`) — the snippet fit the
+grammar but hit a runtime issue evaluating it (undefined variable, division
+by zero, wrong argument count, a bound exceeded, sqrt of a negative number,
+a non-boolean final result). `verification.ts` maps both to `'inconclusive'`
+(never `'fail'`) — a rejected/unevaluable check is not proof the answer is
+wrong, matching this pipeline's existing, unchanged three-bucket contract.
+Only a genuine `{"status":"result","value":true|false}` can produce `'pass'`
+or `'fail'`.
+
+### Wiring changes
+
+- `verification.ts` rewritten: imports `evaluateRestrictedCheck` from
+  `restrictedEvaluator.ts` instead of `runPythonSnippet` from
+  `pythonSandbox.ts`. The old Finding-5 `hasComparison || hasNonPrintCall`
+  downstream heuristic is gone entirely — no longer needed, since
+  `validate_final_shape` enforces the same "genuine check" property at the
+  grammar level before this file ever sees a result. `VerificationResult`/
+  `VerificationOutcome`'s shape (`pass`/`fail`/`inconclusive` +
+  `detail`/`stdout`/`stderr`) is **unchanged** — `solveDeep.ts` needed zero
+  changes.
+- `generateCandidates.ts`'s `buildVerifyInstructions()` rewritten: asks
+  VibeThinker for "a verification check... evaluated by a restricted
+  arithmetic evaluator, NOT a full Python interpreter" with the exact
+  operator/function list spelled out, instead of "write a Python script...
+  use only these stdlib imports... print VERIFIED/FAILED". Explicitly
+  tells the model it's fine to omit the check entirely if the problem needs
+  something outside this grammar (a loop, a simulation) rather than forcing
+  an invalid one — this is what correctly routes those cases to
+  `'inconclusive'` (see eval results below) instead of a malformed snippet.
+- `AskMathModelTool.ts`: `checkPermissions`'s `ask` message and
+  `isReadOnly`'s inline comment updated to describe the new mechanism
+  (still spawns a local process per candidate, so the permission gate is
+  **unchanged** — still `ask` for `deep: true`, not relaxed to `allow`,
+  since that wasn't asked for and deep mode still has a real process-spawn
+  side effect regardless of how safe the computation inside it is).
+  `prompt.ts`'s deep-mode description updated to say "restricted
+  arithmetic/logic check" instead of implying arbitrary Python execution.
+- `pythonSandbox.ts`: **not deleted**, not modified beyond a large top-of-file
+  banner comment marking it retired, pointing at this session and at §11,
+  and stating plainly "do not attempt a round-4 name-ban patch — the shape
+  is wrong, not the name list." Nothing in the live pipeline imports from it
+  anymore (confirmed via `grep -rn "from '\./pythonSandbox" src` — the only
+  remaining import is its own `pythonSandbox.test.ts`, kept passing
+  unchanged as a historical record).
+
+### Tests
+
+**`restrictedEvaluator.test.ts` (new, 59 tests, all passing, real Python
+subprocess per test — not mocked)**: every allowed node type/operator
+computing correctly (literals, all 7 `BinOp`s, both `UnaryOp`s, all 6
+`Compare`s incl. chaining, both `BoolOp`s, multi-statement `Assign`
+sequences, all 13 `FUNCTION_TABLE` entries individually, `isclose` as a
+bare final check); every rejected category (import, from-import, attribute
+access, `eval`/`exec`/`open`/`getattr`/`setattr`/`__import__`/`print` as
+call targets, a bare dangerous identifier with no call proven inert via
+"undefined variable" rather than a special ban, lambda, comprehensions,
+f-strings, subscript, keyword args, ternary, `not`, string/bytes constants,
+tuple-assignment targets, every other disallowed statement type, a bare
+non-check final expression, an assignment as the final statement, oversized
+snippet, empty snippet); a dedicated **regression suite reusing the exact
+exploit payloads from Sessions 8/9/10** — `z = __import__; z(...)`,
+`operator.attrgetter`, `typing.get_type_hints` string-eval,
+`enum.bltns.__import__(...)`, `str.format` globals-leak, and the round-3
+finding that ended `pythonSandbox.ts`, `dataclasses.inspect.os.system(...)`
+and `statistics._random._os` — all confirmed rejected, not because their
+specific names are banned, but as a permanent, concrete record that the
+grammar cannot express any of them; runtime-error classification
+(division/floor-division/modulo by zero, undefined variable, wrong arg
+count, `factorial`/`pow` bounds, `sqrt` of a negative number); the
+documented tautology residual gap; and evaluator plumbing (fails closed
+with no interpreter found, timeout honored under an unreasonably tight
+budget since the grammar can't express a genuine infinite loop to test
+against, unlike `pythonSandbox.test.ts`'s old "kills a real `while True`"
+test).
+
+- `verification.test.ts`: rewritten for the new grammar and mechanism (11
+  tests) — extraction unchanged, classification updated: `import os` still
+  correctly `'inconclusive'`/"not executed" (now via grammar rejection, not
+  an import-allowlist check), a bare `True` is `'inconclusive'`/"not
+  executed" (grammar-rejected, not a downstream "too trivial" heuristic
+  anymore), `4 == 4` now genuinely `'pass'`s (the documented residual gap,
+  asserted explicitly rather than hidden), `isclose(...)` alone `'pass'`es,
+  runtime errors (undefined variable) `'inconclusive'`, timeout
+  `'inconclusive'`.
+- `generateCandidates.test.ts`: `buildDeepPrompt` test updated to check for
+  the new function-table vocabulary (`isclose`, `sqrt`) instead of the old
+  `VERIFIED` sentinel wording.
+- `solveDeep.test.ts`: `PASSING_SNIPPET`/`FAILING_SNIPPET` fixtures updated
+  to the new grammar (`computed = 2 + 2\nexpected = 4\ncomputed ==
+  expected`, no `print`) — all 6 pre-existing behavioral tests (early-exit,
+  reranker fallback, self-consistency fallback, bounded retry,
+  best-effort-unverified, N-cap) pass unchanged in intent.
+- `AskMathModelTool.test.ts`: `checkPermissions`/`isReadOnly` tests
+  unchanged in behavior; one test description updated (no longer claims a
+  temp file is written, since the new mechanism doesn't write one).
+- `pythonSandbox.test.ts`: **unchanged, still 68/68 passing** — the file's
+  own logic wasn't touched, only a banner comment was added above it.
+
+Full `AskMathModelTool/` directory: **179/179 pass** (10 files, including
+every live test in scope). Scoped self-verification command (`bun test
+src/tools src/services/tools src/bridge
+src/utils/promptShellExecution.test.ts src/utils/ripgrep.test.ts`):
+**263/263 pass**, 0 fail, across 26 files — identical pass count to before
+this session's changes, confirming nothing else regressed.
+
+### `solveDeep.live.test.ts` — re-verified live end-to-end with the new evaluator, four separate real runs
+
+Run four times total this session (standalone, inside the `AskMathModelTool/`
+directory run, inside the full scoped suite twice), each a real HTTP call to
+VibeThinker-3B and a real spawned `python.exe` running the new restricted
+evaluator. All four produced a genuinely different, real (model-sampled,
+not templated) restricted-grammar check and all four correctly classified
+`code-verified`/`VERIFIED: true` on the first candidate:
+```
+Final answer: 391
+```python-verify
+computed = 17 * 23
+computed == 391
+```
+VERIFIED: true   METHOD: code-verified   CANDIDATES: {generated:1,passed:1}
+```
+(the other three runs independently produced `computed = ((17+23)**2 -
+17**2 - 23**2) // 2` twice — the same algebraic-identity style Session 6
+saw under the old mechanism — and a third equivalent restatement, all
+correctly evaluated by the new grammar).
+
+### `scripts/eval/deepSolveEval.ts` re-run live against the new evaluator: 6/6 → 6/6, zero cases shifted to `inconclusive`
+
+Ran the full 6-case set live twice (`--n 2`), matching Session 6's own
+evaluation protocol. **Result: single-shot 6/6, DeepSolve 6/6 — all six
+`code-verified` on the first candidate (`candidates=1, retried=false`),
+including both cases marked `[HARD]`.** Full transcript in
+`reports/eval-deep-solve.md`/`.json` (overwritten from Session 6's run).
+
+**This directly tests, and updates, this task's own prediction.** Going in,
+the expectation was that `deep-6-classic-rate-trick` (the "two trains and a
+bird" problem) — the master plan's own named example of a case that "needs
+a loop or a data structure to simulate something" — might now fall through
+to `'inconclusive'` under the narrower grammar, since Session 6's original
+run needed the old (now-retired) arbitrary-Python mechanism. **That did not
+happen in this run.** The actual snippet VibeThinker produced was a direct
+closed-form recomputation, not a simulation:
+```python-verify
+90 * (300 / (70 + 50)) == 225
+```
+— i.e. it independently reached for "closing speed × time-to-meet", which
+fits entirely inside Tier 1's grammar (plain arithmetic, no loop needed).
+The **trap** in this problem is in the *solving* step (naively integrating
+the bird's back-and-forth flight instead of recognizing total-time ×
+bird-speed) — a competent *verification* of the correct answer doesn't
+require simulating the back-and-forth at all, so this particular "hard"
+case turns out not to be a real example of the narrowed-grammar cost after
+all. `deep-5-modular-exponentiation` also used the new function table
+directly and correctly: `computed = pow(7,100,13)\ncomputed == 9` — good
+independent confirmation the model understood the new 3-arg `pow` from the
+rewritten prompt with zero examples given. **Net finding: this session's 6
+existing eval cases do not demonstrate the "narrows what's checkable" cost
+the master plan documented as real and expected** — that cost is real in
+principle (a genuine simulate-and-compare check, e.g. modeling discrete
+timesteps or a data structure, is still correctly unexpressible and would
+correctly fall to `'inconclusive'`) but this particular case set doesn't
+happen to exercise it. Growing `deepSolveCases.ts` with a case that
+*forces* a simulation-shaped check (not just a "hard" problem generally) is
+the natural way to actually observe this tradeoff, and remains open (see
+Open Items).
+
+### Verification performed
+
+- `npx tsc --noEmit`: **3521 errors — exactly matching Session 9's
+  documented baseline, zero new** (grepped specifically for
+  `restrictedEvaluator`/`AskMathModelTool`/`deepSolve` in the diff — zero
+  matches beyond pre-existing baseline noise).
+- `bun run build`: clean.
+- Scoped self-verification (`bun test src/tools src/services/tools
+  src/bridge src/utils/promptShellExecution.test.ts
+  src/utils/ripgrep.test.ts`): **263/263 pass**, 0 fail, across 26 files —
+  run twice, identical both times.
+- `bun run eval:deep-solve -- --n 2`: 6/6 single-shot, 6/6 DeepSolve, all
+  `code-verified`, zero `inconclusive` — see above.
+- `solveDeep.live.test.ts`: 4 separate live runs, all correct — see above.
+
+### Security review — REQUIRED before this is treated as safe to leave reachable, not yet done
+
+Per this project's own established discipline for this exact surface
+(Sessions 8/9/10), **this build does not declare itself safe** — an
+independent security-audit-agent dispatch is the next required step before
+`deep: true` (already reachable today, unchanged from before) should be
+considered settled. What's different this time, worth the auditor knowing
+up front: the mechanism is architecturally much smaller (one file, ~500
+lines including the embedded Python and its own extensive header comment,
+vs. `pythonSandbox.ts`'s ~900 lines across three rounds of denylist
+patches) and the safety argument does not depend on enumerating dangerous
+names at all — the auditor's job is to check whether the **allowlist** is
+actually closed (every AST node type the walker's `evaluate()`/
+`validate_expr()` dispatch does NOT have an explicit branch for is
+rejected, with no silent fallthrough) rather than to hunt for a missed
+denylist entry. Concrete things worth an independent look:
+
+- Whether `validate_expr`/`evaluate`'s `isinstance` dispatch chains have
+  any node type that could reach a branch handling it as something other
+  than "disallowed" — e.g. whether Python's own AST ever represents two
+  different source constructs with the same node class in a way that lets
+  something disallowed slip through a check meant for something allowed
+  (this session did not find one, but didn't set out to disprove it either).
+- Whether the `_finalize` magnitude/type bound (`MAX_ABS_VALUE = 10**50_000`,
+  checked after every operation) is actually sufficient against every
+  combination of the 7 `BinOp`s and 13 functions, or whether some
+  combination this session didn't think of can still compound faster than
+  the per-operation check catches it within the timeout window.
+- Whether `MAX_CALL_ARGS = 20` / `MAX_STATEMENTS = 25` / `MAX_NODES = 300` /
+  `MAX_SNIPPET_CHARS = 4_000` are individually and jointly sufficient
+  against a pathological-but-grammar-valid input (e.g. very deeply nested
+  arithmetic within the 300-node/60-depth budget) causing excessive
+  interpreter recursion or CPU time within the timeout.
+- Whether `validate_final_shape`'s Compare/BoolOp/Call requirement, combined
+  with the runtime True/False requirement, actually closes the "genuine
+  check" concern as claimed, or whether there's a construction this session
+  didn't consider (beyond the documented, accepted tautology gap).
+- A fresh read of `evaluateRestrictedCheck`'s process-spawn plumbing
+  (`restrictedEvaluator.ts`, the TypeScript half) for parity with
+  `pythonSandbox.ts`'s already-reviewed patterns (`shell: false`, minimal
+  env, timeout + no shell injection surface) — this session deliberately
+  duplicated the small amount of shared plumbing (`resolvePythonInterpreter`/
+  `buildMinimalEnv`) rather than importing from the retired file, for
+  independent auditability of this file on its own; worth confirming that
+  duplication didn't introduce a subtle divergence.
+
+### Not touched, per the task's explicit scope
+
+`python-bridge/`, the semantic-tool-pre-filter work
+(`src/services/api/toolPreFilter.ts`, `src/memdir/embeddingClient.ts`), and
+the sibling `openclaude` repo — none were referenced by this session's work.
+
 ## Open items for next session
 
 - ~~Independent re-audit of both DeepSolve security rounds~~ **Done — see
   Session 10 above.** Verdict: not safe, a third bypass class found
   (attribute-reachable `os`/`builtins` via `dataclasses`/`statistics`, no
-  import call, invisible to both the linter and the runtime guard). DeepSolve
-  code execution is deliberately NOT shipped (nothing committed) pending an
-  architectural decision — see Session 10 for the two concrete directions
-  flagged for the project owner.
+  import call, invisible to both the linter and the runtime guard). Session
+  10's architectural decision point was resolved in Session 11: **Tier 1
+  (restricted numeric AST evaluator, `deepSolve/restrictedEvaluator.ts`)
+  built and wired into the live pipeline in place of `pythonSandbox.ts`**,
+  which stays retired (not deleted, not revived). ~~Still needs an
+  independent security-audit-agent pass before being considered settled~~
+  **Done — see Session 12 above.** Round-4 audit verdict: **SAFE TO SHIP**,
+  no HIGH/MEDIUM findings, after being explicitly tasked with finding a new
+  bypass class rather than re-confirming old ones. Two non-blocking
+  correctness gaps it found (non-finite-literal magnitude bypass, a
+  multi-statement `Pow`-chain magnitude blowup) are fixed and
+  regression-tested. This surface is now considered settled; Tier 2 (real
+  OS/WASM isolation for the arbitrary-code subset the restricted grammar
+  can't express) remains deliberately deferred, not built.
 - Grow `deepSolveCases.ts` toward the master plan's own ≥20-problem gate
   with genuinely harder cases (this session's two "hard" picks turned out
   to be within VibeThinker's single-shot reach) — needed to actually
   measure the "beats single-shot" claim rather than just confirming the
-  machinery works.
+  machinery works. **Session 11 addendum**: also add at least one case that
+  genuinely *requires* a simulation/loop-shaped verification (not just a
+  "hard" problem generally) — the current 6-case set doesn't exercise the
+  Tier 1 restricted evaluator's documented "loses arbitrary-algorithm
+  verification" cost at all (even the "two trains and a bird" case turned
+  out to have a closed-form verification, see Session 11), so that
+  real, expected tradeoff has never actually been observed happening.
+- Tier 2 (real isolation for the arbitrary-code subset Tier 1 can't
+  express — WASM/Pyodide preferred on native Windows, Docker-on-WSL2/gVisor
+  second, per §11) is not built. Not urgent unless/until a real case
+  surfaces that needs it (see the item above) — Tier 1 alone covered
+  100% of the existing eval set.
 - The Phase 3.5 gate's second half (a frontier-model head-to-head) —
   deliberately not attempted this session (no live paid API calls without
   explicit opt-in, matching this project's own established eval
@@ -1704,3 +2058,162 @@ under time pressure.
   being resolved first per the phase ordering. Router reliability is
   meaningfully better (70%) but still below the ≥90% gate, so this stays
   blocked until semantic pre-filtering (or another lever) closes the gap.
+
+## Session 12 (2026-08-12, orchestrating session) — Tier 1 evaluator: personally re-verified, independently audited (round 4, SAFE TO SHIP), two correctness fixes applied
+
+Picked up Session 11's hand-off directly — the restricted AST evaluator was
+built and reported complete but explicitly *not* self-declared safe. Before
+trusting that report, matched this exact surface's established discipline
+(Sessions 8/9/10: every prior round was personally re-verified, not taken on
+the building agent's word) rather than proceeding straight to an audit
+dispatch.
+
+### Personal verification (before dispatching the audit)
+
+- Read `restrictedEvaluator.ts` in full. Confirmed directly, not just via
+  its own header comment, that the untrusted snippet is never passed to
+  Python's real `eval()`/`exec()`/`compile()`, that `evaluate()`'s dispatch
+  has no branch that falls through to something other than "disallowed" for
+  any of the excluded node types, and that `Name` Load resolves only
+  against the script's own closed local dict.
+- Wrote an independent 26-case empirical script (not reusing the agent's own
+  test file) covering all 8 legitimate-arithmetic categories plus every
+  historical exploit payload from Sessions 8/9/10 (`z = __import__`,
+  `dataclasses.inspect.os.system(...)`, `statistics._random._os`,
+  `typing.get_type_hints`, `enum.bltns.__import__`, `str.format` globals
+  leak, bare `print("VERIFIED")`/bare `True` forgery) plus several classes
+  this session added itself (lambda smuggling, list comprehension, f-string
+  injection, dunder subscript access, DoS-bound triggers). **26/26 behaved
+  safely** — every exploit rejected or errored, never executed.
+- Ran the real suites directly rather than trusting the reported counts:
+  `restrictedEvaluator.test.ts` (59 tests / 263 `expect()` calls, matched
+  exactly), full `AskMathModelTool/` tree (179/179, including a live
+  end-to-end run against the real local Ollama model that came back
+  `code-verified`).
+- Rebuilt `dist/cli.mjs` and grepped it directly: `pythonSandbox.ts`'s
+  distinctive markers (`RUNTIME_IMPORT_GUARD_PREFIX`, `AST_LINTER_SCRIPT`)
+  are **absent** (confirmed dead/tree-shaken), `restrictedEvaluator.ts`'s
+  (`RESTRICTED_EVAL_SCRIPT`, `validate_final_shape`) are **present**.
+- Confirmed `npx tsc --noEmit` unchanged at exactly 3521 (the established
+  baseline, zero new), and `git status` showed nothing from this work
+  committed yet.
+
+No discrepancy found between the agent's report and direct testing — this is
+the first round of this security-critical component where personal
+verification found *zero* daylight between claim and reality.
+
+### Independent security-audit-agent, round 4 — verdict: SAFE TO SHIP
+
+Dispatched with explicit instructions **not** to just re-run the Sessions
+8/9/10 exploit list (already independently confirmed above) but to hunt for
+a bypass specific to this narrower allowlist architecture. Result: **no
+HIGH or MEDIUM findings.** Adversarial cases tried and confirmed contained,
+beyond what this session's own 26-case script covered: function-value
+aliasing (`f = sqrt; f(4)`), reserved-name shadowing, the walrus operator,
+`*args`/`**kwargs`-shaped unpacking, `AugAssign`/`AnnAssign`/tuple assignment
+targets, NUL bytes in the source, fullwidth-Unicode homoglyph identifiers
+(NFKC-normalizes consistently before both validation and evaluation — not a
+split-brain bug), complex-valued arithmetic (`(-1) ** 0.5`), and a
+1:1-structural proof that the validator's depth-60 recursion limit actually
+bounds the evaluator's own recursion (no separate stack-exhaustion path).
+Process hygiene (`-I` isolation actually defeats a temp-dir/CWD import
+hijack — verified empirically against the local interpreter, not just
+asserted) and the permission-gating integration (`checkPermissions` returns
+`ask` for `deep: true` on the only call path to `solveDeep`, immune to the
+`acceptEdits` fast-path) were both independently re-confirmed. Also
+independently re-confirmed `pythonSandbox.ts` is genuinely unreachable —
+its only importer is its own test file, no barrel re-export exists.
+
+The audit flagged four **non-blocking** items — no security/capability
+impact, but worth recording exactly as reported since two were real
+correctness gaps in a tool whose entire purpose is producing a trustworthy
+`verified: true`/`false` signal:
+
+- **(A, fixed this session)** A bare `Constant` node's value returned
+  directly from `evaluate()` without going through the `_finalize` magnitude
+  check — `x = 1e400` (a valid float literal that overflows to `inf` without
+  a `SyntaxError`, since Python permits this) could plant an unbounded value
+  into `env` untouched by `MAX_ABS_VALUE`. Worse, `NaN` specifically survived
+  even the existing check on other code paths, because `abs(nan) >
+  MAX_ABS_VALUE` evaluates `False` (all comparisons against `NaN` are
+  `False` in Python) — so `y = x - x; y != y` would have resolved to a
+  false `{"status":"result","value":true}`, a genuine "code-verified" pass
+  on an undefined computation.
+- **(B, fixed this session)** The `Pow` bound only checked the *exponent's*
+  magnitude, not the resulting value. A large-int base already within
+  `MAX_ABS_VALUE` (e.g. produced by a prior `x = 10 ** 10000` statement)
+  raised to another bounded-looking exponent could still trigger CPython's
+  eager, exact `int ** int` computation of a ~100-million-digit integer
+  before `_finalize` ever saw the result — contained by the 5-10s process
+  timeout, but contradicting the file's own "checked after every single
+  operation" guarantee.
+- **(C, fixed this session)** A stale comment in `AskMathModelTool.ts`
+  claimed exactly two real-code call sites of `Tool.isReadOnly()`; the audit
+  found a third (`FilesystemPermissionRequest.tsx`, UI label text only, a
+  code path `AskMathModelTool` never reaches). Doc-accuracy only.
+- **(D, no fix needed)** `scripts/eval/deepSolveEval.ts` calls `solveDeep`
+  directly, bypassing `checkPermissions` — this is the same intentional,
+  developer-invoked-harness pattern every other `scripts/eval/*` entry point
+  uses (requires shell access to run at all), not a bypass of the tool's
+  actual gate.
+
+### Fixes applied (`restrictedEvaluator.ts`)
+
+- `_finalize` now explicitly rejects non-finite floats
+  (`math.isfinite(value)` check) before the magnitude comparison, closing
+  both the `inf`-literal and the `NaN`-survives-the-magnitude-check paths in
+  one place.
+- `evaluate()`'s `Constant` branch now returns `_finalize(node.value)`
+  instead of the bare `node.value`, so literals are bound-checked exactly
+  like every other production point (`BinOp`/`UnaryOp`/`Call` already were).
+- `Pow` now estimates the result's magnitude via `right *
+  math.log10(abs(left))` (correct for arbitrary-precision int bases —
+  Python's `math.log10` has a special path for big ints that avoids the
+  `OverflowError` a naive `float(left)` conversion would hit) and rejects
+  **before** calling `**` at all when the estimate alone exceeds
+  `MAX_ABS_VALUE_EXP` (the `10**50_000` bound's exponent, now factored into
+  its own named constant so the two checks can't drift apart).
+- Four new regression tests added to `restrictedEvaluator.test.ts` (63
+  total now, 279 `expect()` calls): the `1e400` literal, the `NaN`
+  self-inequality smuggle, the two-statement `10**10000` then `**10000`
+  chain (asserted to reject in well under a second — proving it's the new
+  pre-check firing, not the 5s timeout), and a legitimate bounded `Pow`
+  chain confirmed unaffected.
+- One caught-and-fixed authoring mistake worth recording: the first attempt
+  at these edits used backtick characters inside code comments *inside* the
+  TypeScript template literal that holds the embedded Python script,
+  which silently terminated the template literal early and broke the build
+  (`error: Expected ";" but found "x"`) — caught immediately by running the
+  test suite, not assumed to be fine; fixed by rewriting those comments
+  without backticks.
+
+### Verification performed (this session, after the fixes)
+
+- `restrictedEvaluator.test.ts`: **63/63 pass**, 279 `expect()` calls.
+- Full `AskMathModelTool/` tree: **183/183 pass**, 504 `expect()` calls.
+- `bun run build`: clean. `npx tsc --noEmit`: **3521, unchanged**.
+- Direct empirical re-check of both fixes via `evaluateRestrictedCheck`
+  outside the test framework: the `inf` literal, the `NaN` smuggle, and the
+  `10**10000` Pow chain all now resolve in well under 200ms with an
+  `'error'` outcome (not the 5000ms timeout), and the legitimate bounded
+  `Pow` chain still resolves correctly to `true` — confirming the fixes are
+  genuine pre-checks, not accidentally relying on the timeout to mask a
+  still-slow path.
+
+### Status: Tier 1 restricted evaluator considered safe to ship
+
+Both this session's own empirical adversarial testing and the independent
+security-audit-agent's round-4 review — deliberately tasked with finding a
+*new* bypass class, not re-confirming old ones — agree: no code-execution,
+sandbox-escape, or permission-bypass path exists in this design. The two
+correctness gaps found are fixed and regression-tested. `pythonSandbox.ts`
+stays retired (not deleted, not revived) exactly per §11's resolution.
+Tier 2 (real OS/WASM isolation for the arbitrary-code subset Tier 1 still
+can't express) remains deliberately deferred, unchanged from Session 11's
+assessment — no case in the current eval set has yet demonstrated needing
+it.
+
+### Not touched, per scope
+
+`python-bridge/`, semantic-tool-pre-filter work, the sibling `openclaude`
+repo — none referenced this session.

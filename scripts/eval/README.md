@@ -90,6 +90,32 @@ harness does not implement (see "Ambiguous/undecided design choices"
 below). Its frontier column always reads a note saying so; fill it in
 manually with a vision-capable frontier model if you want that comparison.
 
+## DeepSolve vs single-shot (`deepSolveEval.ts`)
+
+A separate, narrower harness for the Phase 3.5 "Logic Engine" pipeline
+(`LOCAL_AI_MASTER_PLAN.md` §11 / §8): `scripts/eval/deepSolveEval.ts` +
+`deepSolveCases.ts`, `bun run eval:deep-solve`. For each of 6 fixed cases
+(2 easy/regression, 2 medium, 2 deliberately hard — see `deepSolveCases.ts`'s
+own header for why those two specifically), runs **both**
+`AskMathModelTool.call({ problem })` (single-shot) and
+`solveDeep(problem, signal, { n })` (the generate→verify→search pipeline)
+against the same ground-truth substrings, so the report is a genuine
+side-by-side rather than two independently-graded runs.
+
+```sh
+bun run scripts/eval/deepSolveEval.ts                  # n=3 (the shipped default), all 6 cases
+bun run scripts/eval/deepSolveEval.ts --n 2             # fewer candidates, faster run
+bun run scripts/eval/deepSolveEval.ts --case deep-5-modular-exponentiation
+```
+
+No `--frontier` flag exists here — the master plan's Phase 3.5 gate is
+explicitly two-part (pipeline vs single-shot locally, *then* a separate
+frontier head-to-head), and this harness only covers the first half.
+DeepSolve's own worst case is roughly N x 1-5 minutes *per case* (more if a
+candidate fails and the one bounded retry fires), so a full 6-case run can
+take a while — this is expected, not a hang, matching the tool's own
+documented latency tradeoff.
+
 ## Extending with more specialists
 
 As Tier A/B models come online per the master plan (Qwen3-Reranker,

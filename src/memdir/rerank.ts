@@ -74,10 +74,10 @@ const RERANK_SYSTEM_PROMPT = `Judge whether the Document meets the requirements 
 
 const RERANK_INSTRUCT = `Given a user's query to a coding assistant, determine whether this memory note is relevant context for answering it`
 
-function buildPrompt(query: string, document: string): string {
+function buildPrompt(instruct: string, query: string, document: string): string {
   return (
     `<|im_start|>system\n${RERANK_SYSTEM_PROMPT}<|im_end|>\n` +
-    `<|im_start|>user\n<Instruct>: ${RERANK_INSTRUCT}\n<Query>: ${query}\n<Document>: ${document}<|im_end|>\n` +
+    `<|im_start|>user\n<Instruct>: ${instruct}\n<Query>: ${query}\n<Document>: ${document}<|im_end|>\n` +
     `<|im_start|>assistant\n<think>\n\n</think>\n\n`
   )
 }
@@ -129,7 +129,20 @@ function scoreFromTopLogprobs(
   return total === 0 ? 0 : yesProb / total
 }
 
-async function scoreOne(
+/**
+ * Generic pointwise yes/no-logprob judgment against Qwen3-Reranker — the
+ * primitive `rerankMemoriesByRelevance` is built on, exported so other
+ * callers (e.g. AskMathModelTool's deep-solve pipeline, §11) can reuse the
+ * exact same model/prompt-template-bypass/scoring math against a different
+ * `instruct` string instead of re-implementing it. See this file's header
+ * comment for the full scoring rationale (raw:true template bypass,
+ * top_logprobs, softmax normalization, casing-variant logsumexp combine).
+ * Returns null on any failure (non-OK response, malformed body, thrown
+ * error, or no yes/no-shaped token in the top candidates) — callers decide
+ * how to treat "no signal" (rerankMemoriesByRelevance fails open on it).
+ */
+export async function scoreYesNoJudgment(
+  instruct: string,
   query: string,
   document: string,
   signal: AbortSignal,
@@ -140,7 +153,7 @@ async function scoreOne(
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         model: RERANK_MODEL,
-        prompt: buildPrompt(query, document),
+        prompt: buildPrompt(instruct, query, document),
         raw: true,
         stream: false,
         options: { num_predict: 1, temperature: 0 },
@@ -158,6 +171,14 @@ async function scoreOne(
   } catch {
     return null
   }
+}
+
+async function scoreOne(
+  query: string,
+  document: string,
+  signal: AbortSignal,
+): Promise<number | null> {
+  return scoreYesNoJudgment(RERANK_INSTRUCT, query, document, signal)
 }
 
 export async function rerankMemoriesByRelevance(

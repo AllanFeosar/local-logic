@@ -568,6 +568,33 @@ a menu the router already can't reliably pick from), so it's no longer
   this project didn't previously have. Full detail, live reproductions,
   and the complete three-round history in `LOCAL_AI_STATUS.md` Sessions
   6, 8, 9, and 10.
+  **Resolution direction (2026-08-12, session 11 — online consensus
+  checked, now the recommended path; see §11 "Verifier isolation").** The
+  denylist is confirmed structurally unwinnable (industry-consensus:
+  in-process Python cannot be sandboxed). Adopt the **two-tier** model
+  instead of a round-4 patch: Tier 1 — replace execution with a
+  *restricted numeric AST evaluator* (no import/attribute/exec grammar),
+  which eliminates the whole vulnerability class and is sufficient for
+  most math verification, so the logic engine's math path can ship safely
+  on this alone; Tier 2 — real isolation for the arbitrary-code subset,
+  and on this native-Windows machine the viable options are **WASM
+  (Pyodide/RustPython, capabilities off)** first or **Docker-on-WSL2 /
+  gVisor** second (Firecracker/gVisor/seccomp are Linux-only and
+  unavailable in-process here). `deepSolve/pythonSandbox.ts` stays
+  not-safe-to-ship and must not be revived.
+  **Tier 1 built (2026-08-12, session 11 — `deepSolve/restrictedEvaluator.ts`,
+  wired into `verification.ts` in place of `pythonSandbox.ts`).**
+  **Independent security-audit-agent review done (2026-08-12, session 12,
+  round 4) — verdict SAFE TO SHIP, no HIGH/MEDIUM findings**, after being
+  explicitly tasked with finding a bypass of this narrower allowlist
+  architecture rather than re-confirming the sessions 8/9/10 exploit list
+  (also independently re-confirmed inert). Two non-blocking correctness
+  gaps it found (a non-finite-literal magnitude bypass; a multi-statement
+  `Pow`-chain magnitude blowup, both neither code-execution nor
+  capability-leak) are fixed and regression-tested — see
+  `LOCAL_AI_STATUS.md` Session 12. **This surface is now considered
+  settled.** Tier 2 remains deliberately deferred, not built — no case in
+  the current eval set has demonstrated needing it.
 - **Phase 4 — Hearing**: silero-vad ONNX (re-download, ~2 MB), Whisper
   turbo on GPU, `AudioAnalyze` + `TranscribeAndSummarize`.
   *Gate: transcription spot-check vs a cloud STT on 3 real recordings.*
@@ -615,6 +642,10 @@ destroyed.
 | 4 GB VRAM ceiling | fp16 + attention slicing; CPU fallback per model; never co-resident heavies |
 | Correlated-error ensembles (voting/debate amplify shared blind spots) | Heterogeneous specialists; verify-don't-vote (§11); free-form debate is an explicit anti-goal (§10) |
 | Logic-engine latency (N samples × 1–5 min each) | Deep mode is an explicit opt-in tool call, never the default path; N capped; verifier runs first and early-exits on a provably correct candidate |
+| **Verifier sandbox escape / RCE** (in-process Python denylist is structurally unwinnable — 3 audit rounds, live full RCE via `dataclasses.inspect.os`) | Boundary must live outside the interpreter: Tier 1 restricted numeric AST evaluator (no import/attribute/exec) for most cases; Tier 2 WASM (Windows-native) or Docker-on-WSL2 for arbitrary code. `deepSolve/pythonSandbox.ts` confirmed not-safe-to-ship, do not revive (§11 "Verifier isolation"). **Tier 1 built and wired in as of session 11 — independent security-audit-agent review still pending before default-reachable is considered settled.** |
+| **Learned scorer reward-hacking** (PRMs/rerankers reward fluency not logic — >0.9 reward at <4% accuracy) | Deterministic verifier is load-bearing; reranker is a tie-break among *already-verified* candidates only, never a correctness oracle (§11 "Sharper findings", pipeline step 3) |
+| **Imperfect-verifier ceiling on best-of-N** (resampling against a flawed checker plateaus; verification gets harder as the generator improves) | Prefer executed/rule verifiers over learned judges; cap N; low confidence is an honest output when nothing verifies (§11 "Sharper findings") |
+| **Diversity-hurts (Self-MoA)** — mixing weaker models on one problem lowers quality | Heterogeneity is for routing *across domains*; within one hard problem, best-of-N from the single strongest solver, not a weaker-model mix (§11 "Sharper findings") |
 
 ## 10. Anti-goals (explicit, to keep the project honest)
 
@@ -691,26 +722,93 @@ researched deliberately: failures teach as much as successes.
   chat.** This stack's specialists (VibeThinker, DistilBERT, TabPFN,
   Chronos, qwen3) are different architectures with different training —
   naturally decorrelated, which is the one property ensembles actually
-  need and same-family LLM committees lack. (The user's separate Debate
-  project sits in the debate family — the failure literature above
-  applies to it directly and is worth reading before extending it.)
+  need and same-family LLM committees lack (**important caveat on *when*
+  heterogeneity helps — see "Sharper findings" below**). (The user's
+  separate Debate project sits in the debate family — the failure
+  literature above applies to it directly and is worth reading before
+  extending it.)
+
+### Sharper findings (2026-08-12, round 2 — these change the design, not just confirm it)
+
+A second evidence sweep deliberately hunted for results that *challenge*
+the design above. Four landed, three of them course-corrections:
+
+- **Diversity is not free — mix specialists across *disjoint* problems,
+  never diverse models on the *same* problem.** "Rethinking
+  Mixture-of-Agents" / Self-MoA
+  ([arxiv 2502.00674](https://arxiv.org/abs/2502.00674), Princeton)
+  found that mixing different LLMs on the same task often *lowers*
+  average quality, and sampling the single *best* model repeatedly
+  (Self-MoA) beat heterogeneous mixing by ~3.8% average (6.6% on
+  AlpacaEval). Reconciliation with our "heterogeneous = decorrelated
+  advantage" claim: heterogeneity helps when each specialist owns a
+  *different* problem (our actual design — math vs table-QA vs
+  captioning are disjoint), and *hurts* when several diverse models each
+  attempt the *same* problem and drag weaker outputs into the average.
+  **Rule for the logic engine:** for a single hard math problem, prefer
+  best-of-N from the *one strongest* solver (VibeThinker) over pulling in
+  a weaker second LLM's guesses — Self-MoA's exact finding. Cross-model
+  diversity is for *routing across domains*, not for *voting within one
+  problem*.
+- **"Verification is easier than generation" is true — but with two
+  caveats that cap it.** The premise the whole engine rests on holds
+  ([GV-gap literature](https://arxiv.org/html/2506.18203v1)): errors are
+  easier to spot than to avoid. But (a) verification gets *harder as the
+  generator improves* — subtler errors — and (b) an *imperfect* verifier
+  puts a ceiling on best-of-N: resampling against a flawed checker
+  plateaus, and on hard hypothesis-discovery tasks even top models
+  recover <40% of ground truth as difficulty rises. **Consequence:** keep
+  the verifier *deterministic* (executed check / rule) wherever possible —
+  a code/rule verdict doesn't degrade as VibeThinker improves, a learned
+  judge does. Cap N; don't expect more samples to rescue a weak verifier.
+- **Learned reward models / rerankers are hackable — this is the
+  load-bearing warning.** "Reward Under Attack"
+  ([arxiv 2603.06621](https://arxiv.org/abs/2603.06621)) shows PRMs act
+  as *fluency detectors, not reasoning verifiers*: reward is highly
+  invariant to logic corruption but sensitive to style; policies reach
+  >0.9 PRM reward at <4% real accuracy, ~43% of reward gains from
+  stylistic shortcuts. Best-of-N selectors latch onto length/formatting
+  as spurious signals. **This is why step 3's constraint is hard:** the
+  Qwen3-Reranker scorer is a tie-breaker among *verified* candidates
+  only, never a correctness oracle. If a candidate can't be
+  deterministically verified, low confidence is the honest output — not
+  "the reranker liked it."
+- **The cascade/escalation shape is externally validated (success).**
+  FrugalGPT ([arxiv 2305.05176](https://arxiv.org/abs/2305.05176),
+  Stanford) — cheap model first, escalate to a stronger one only when a
+  scoring function flags low confidence — *matches the best single LLM at
+  up to 98% lower cost*, and follow-ups (SCOPE, SMART) add explicit
+  accuracy-constraint framing. This is the same shape as our
+  router → serial specialist → "escalate depth, not width" (pipeline
+  step 4) and the §7 delegation ledger. It gives the architecture a named
+  precedent and a citation: we're building a local, offline compound-AI
+  cascade, a pattern with a proven cost/quality track record.
 
 ### The pipeline (fits §3's guides)
 
 1. **Generate**: VibeThinker-3B proposes N candidate solutions
    (best-of-N, start N=3–5, temperature-varied).
-2. **Verify — deterministic first**: a generated Python check is
-   actually executed locally (free, exact); early-exit the moment a
-   candidate provably passes.
+2. **Verify — deterministic first, but NOT by executing arbitrary
+   generated Python.** This was the original design and it is now known
+   to be unsafe — see "Verifier isolation" below. The verifier is a
+   **restricted numeric evaluator** (Tier 1) for the common case, with
+   real OS/WASM isolation (Tier 2) reserved for the arbitrary-code
+   subset. Early-exit the moment a candidate provably passes.
 3. **Score what code can't check**: Qwen3-Reranker as a cheap learned
    scorer (the same yes/no-logprob mechanism as `rerank.ts`) over
    surviving candidates; self-consistency vote only as a final tie-break
    among *verified* candidates — never as the primary decision.
+   **Hard constraint (evidence in "Sharper findings" below):** a learned
+   scorer must NEVER override the deterministic verifier and must never
+   be the sole selector — process reward models are demonstrably
+   hackable, scoring fluent-but-wrong answers >0.9 while true accuracy
+   sits below 4%. The reranker breaks ties among already-verified
+   candidates; it does not decide correctness.
 4. **Escalate depth, not width**: if every candidate fails verification,
    one bounded retry — re-prompt VibeThinker with the failed attempt +
    verifier feedback. No open-ended agent conversations.
 
-Memory: VibeThinker (~2 GB) + reranker (0.45 GB) + Python executor
+Memory: VibeThinker (~2 GB) + reranker (0.45 GB) + verifier
 (negligible) under §3's serial-swap policy — comfortably inside the
 7.5 GB guide, zero new models to download. The real cost is latency
 (N × 1–5 min per candidate), which is why deep mode is an explicit
@@ -718,3 +816,90 @@ opt-in tool call (Phase 3.5), never the default path for trivial
 queries. Scope guard: mempalace/memdir already cover the memory layer
 (§7's scope decision) — the logic engine adds compute composition, not
 another memory system.
+
+### Verifier isolation — the settled answer (added 2026-08-12, after a 3-round security audit)
+
+**The finding.** The first implementation of step 2 executed
+model-generated Python behind a static AST denylist + a runtime import
+guard, in-process (`deepSolve/pythonSandbox.ts`). Three independent
+adversarial reviews each closed the reported hole and each found the
+*same class* reachable another way — culminating in a live one-line full
+RCE, `dataclasses.inspect.os.system(...)`, that needs no `import` call at
+all: `os`/`builtins` are already live in the shared module cache and
+reachable by plain attribute traversal from allowed modules
+(`statistics`, `typing`, `dataclasses`, `enum` — all in `ALLOWED_IMPORTS`
+at `pythonSandbox.ts:297`). The static linter's per-attribute check and
+the runtime guard's import chokepoint both miss it by construction. The
+decision to stop iterating and not ship (Phase 3.5 status, session 10)
+was correct.
+
+**The online consensus (checked, unanimous).** In-process Python
+sandboxing via denylists is a *known-unwinnable* problem, not a
+this-project bug. CPython is deeply introspective with a shared, mutable
+module cache, so from almost any allowed object the reachable set of
+dangerous objects is open-ended and CPython-version-dependent — a
+denylist cannot enumerate it. Every current source says the same: move
+the trust boundary **out of the interpreter** to the OS, VM, or WASM
+layer. Sources: [chs.us — Six layers to sandbox untrusted Python, and the
+escape I missed](https://chs.us/2026/07/sandboxing-untrusted-python/);
+[dev.to — 4 ways to sandbox untrusted code in
+2026](https://dev.to/mohameddiallo/4-ways-to-sandbox-untrusted-code-in-2026-1ffb);
+[Zylos — AI agent sandboxing: microVMs, gVisor,
+WASM](https://zylos.ai/research/2026-04-04-ai-agent-sandboxing-security-isolation/);
+[mavdol gist — why Python can't be
+sandboxed](https://gist.github.com/mavdol/2c68acb408686f1e038bf89e5705b28c);
+[openedx/codejail](https://github.com/openedx/codejail).
+
+**The Windows constraint (why the standard answers don't all apply).**
+Firecracker, gVisor, seccomp, and Landlock are **Linux-only** (KVM /
+Linux syscall layer). This machine is native Windows 11, so the three
+most-recommended isolation primitives are unavailable in-process. That
+narrows the real options and is the single most important local fact the
+generic literature omits.
+
+**The theory we adopt — two tiers, boundary outside the interpreter.**
+The guiding principle: *the trust boundary must live at a layer the
+untrusted code cannot introspect its way across.* The in-process denylist
+failed because the boundary lived inside the very object graph the code
+can walk. Two tiers relocate it:
+
+- **Tier 1 — don't run "code" at all (the common case, do this first).**
+  A math/logic verifier does not need `import` or arbitrary statements —
+  it needs to evaluate arithmetic and call a fixed set of math functions.
+  Replace execution with a **restricted numeric AST evaluator**: parse
+  the expression, walk the AST, allow only a hardcoded whitelist of node
+  types (`BinOp`, `UnaryOp`, `Compare`, numeric literals, `Call` to a
+  fixed function table) — no `Import`, no `Attribute`, no free `Name`
+  lookup, no `exec`. There is no object graph to walk because the string
+  is never run as code. This is an **allowlist of capabilities, not a
+  denylist of names** — the inversion the audit is pointing at — and it
+  eliminates the entire vulnerability class at near-zero cost. Sufficient
+  for the large majority of "verify this math answer" cases.
+- **Tier 2 — real isolation, only for the arbitrary-code subset**
+  (code-domain verification, running generated programs). On Windows, in
+  preference order:
+  1. **WASM (Pyodide/RustPython via `wasmtime`), capabilities off** — the
+     standout, because it is the *only* strong-isolation option that runs
+     natively on Windows with no VM. WASM'd Python has no host `os`, no
+     filesystem, no network unless a WASI capability is explicitly
+     granted, so `dataclasses.inspect.os.system` resolves to nothing
+     reachable. Cost: cold-load latency (~1–2 s), negligible against
+     DeepSolve's per-candidate 1–5 min budget.
+  2. **Docker Desktop on the WSL2 backend** — `--network=none`,
+     read-only rootfs, non-root `--user`, dropped caps, tmpfs-only
+     writable dir, memory/CPU/pids limits; `runsc` (gVisor) runtime for
+     defense-in-depth. Reuses the WSL2 path session 10 already flagged,
+     at the cost of a hard Docker/WSL2 dependency.
+
+  Note this project's own `sandbox-runtime` is unconditionally disabled
+  on native Windows (session 10 confirmed via its `isSupportedPlatform()`)
+  but *would* run under WSL2 — so option 2 can reuse already-trusted infra
+  rather than adding new isolation code.
+
+**Project-specific payoff:** because Tier 1 covers most verifiable-math
+checking, the logic engine's math verifier can ship safely and soon on
+the restricted evaluator, while the expensive Tier 2 is needed only for
+the code-execution subset — which stays parked behind WASM/WSL2 isolation
+until built. `deepSolve/pythonSandbox.ts` (the in-process denylist)
+remains **confirmed not-safe-to-ship**; do not revive it, and do not
+attempt a round-4 name-ban patch — the shape is wrong, not the name list.

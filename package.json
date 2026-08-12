@@ -41,6 +41,7 @@
     "eval:specialists": "bun run scripts/eval/specialistEval.ts",
     "eval:routing": "bun run scripts/eval/routingEval.ts",
     "eval:data-analyze": "bun run scripts/eval/dataAnalyzeEval.ts",
+    "eval:deep-solve": "bun run scripts/eval/deepSolveEval.ts",
     "hardening:check": "bun run smoke && bun run doctor:runtime",
     "hardening:strict": "bun run typecheck && bun run hardening:check",
     "prepack": "npm run build"

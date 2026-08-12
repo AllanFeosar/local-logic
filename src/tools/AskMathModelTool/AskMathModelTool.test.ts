@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, expect, test } from 'bun:test'
+import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import type { ToolUseContext } from '../../Tool.js'
 import { AskMathModelTool } from './AskMathModelTool.js'
 
@@ -91,4 +91,43 @@ test('mocked: propagates an error when the HTTP response is not ok', async () =>
   await expect(
     AskMathModelTool.call({ problem: 'x' }, fakeContext()),
   ).rejects.toThrow(/500/)
+})
+
+// 2026-08-12 security review, Finding 4: deep mode's checkPermissions used
+// to return unconditional 'allow' even though it spawns local Python
+// processes — meaning no permission prompt ever fired for that
+// code-execution capability in any mode. Fixed: 'ask' once per invocation
+// when deep is true, unchanged unconditional 'allow' otherwise.
+describe('checkPermissions', () => {
+  test('single-shot mode (deep unset) is unconditional allow, unchanged', async () => {
+    const result = await AskMathModelTool.checkPermissions({ problem: 'x' })
+    expect(result.behavior).toBe('allow')
+  })
+
+  test('single-shot mode (deep: false) is unconditional allow', async () => {
+    const result = await AskMathModelTool.checkPermissions({ problem: 'x', deep: false })
+    expect(result.behavior).toBe('allow')
+  })
+
+  test('deep mode (deep: true) asks for permission rather than auto-allowing', async () => {
+    const result = await AskMathModelTool.checkPermissions({ problem: 'x', deep: true })
+    expect(result.behavior).toBe('ask')
+    if (result.behavior === 'ask') {
+      expect(result.message.length).toBeGreaterThan(0)
+    }
+  })
+})
+
+describe('isReadOnly', () => {
+  test('true for single-shot mode (deep unset)', () => {
+    expect(AskMathModelTool.isReadOnly({ problem: 'x' })).toBe(true)
+  })
+
+  test('true for deep: false', () => {
+    expect(AskMathModelTool.isReadOnly({ problem: 'x', deep: false })).toBe(true)
+  })
+
+  test('false for deep: true — it spawns a local process per candidate to run the restricted evaluator', () => {
+    expect(AskMathModelTool.isReadOnly({ problem: 'x', deep: true })).toBe(false)
+  })
 })

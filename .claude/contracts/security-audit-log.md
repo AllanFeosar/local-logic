@@ -192,6 +192,94 @@ bug and the withRetry.ts Anthropic rate-limit-header-parsing bug surfaced by tes
 during this session's work. Both are being fixed in a follow-up covered by their own
 audit-log entry when that work lands.
 
+## 2026-08-12 — Local-AI sessions 6-12: DeepSolve logic engine (Phase 3.5) — Tier 1 restricted AST evaluator ships, pythonSandbox.ts retired not-safe-to-ship
+Files audited: src/tools/AskMathModelTool/AskMathModelTool.ts, src/tools/AskMathModelTool/AskMathModelTool.test.ts, src/tools/AskMathModelTool/prompt.ts, src/tools/AskMathModelTool/deepSolve/restrictedEvaluator.ts, src/tools/AskMathModelTool/deepSolve/restrictedEvaluator.test.ts, src/tools/AskMathModelTool/deepSolve/verification.ts, src/tools/AskMathModelTool/deepSolve/verification.test.ts, src/tools/AskMathModelTool/deepSolve/generateCandidates.ts, src/tools/AskMathModelTool/deepSolve/generateCandidates.test.ts, src/tools/AskMathModelTool/deepSolve/rerankCandidates.ts, src/tools/AskMathModelTool/deepSolve/rerankCandidates.test.ts, src/tools/AskMathModelTool/deepSolve/solveDeep.ts, src/tools/AskMathModelTool/deepSolve/solveDeep.test.ts, src/tools/AskMathModelTool/deepSolve/solveDeep.live.test.ts, src/tools/AskMathModelTool/deepSolve/pythonSandbox.ts (retired, kept as historical record — see its own top-of-file banner), src/tools/AskMathModelTool/deepSolve/pythonSandbox.test.ts (unchanged, kept passing as historical record).
+Also staged in this commit, declared rather than security-audited (outside the gate's sensitive-path pattern, named here for completeness per this log's own convention): src/memdir/rerank.ts (behavior-preserving extraction of scoreYesNoJudgment for reuse by rerankCandidates.ts — rerankMemoriesByRelevance's own logic/tests unchanged), scripts/eval/deepSolveEval.ts, scripts/eval/deepSolveCases.ts, scripts/eval/README.md, package.json (one new eval:deep-solve script entry), LOCAL_AI_MASTER_PLAN.md, LOCAL_AI_STATUS.md.
+Verdict: 0 Critical, 0 High, 0 Medium, 0 Low
+Recommendation: ship
+Findings: none — independent security-audit-agent round 4's own verdict was SAFE TO SHIP with an explicitly empty findings list, after being tasked with finding a bypass of the new allowlist architecture specifically rather than re-confirming the sessions 8/9/10 exploit list (also independently re-confirmed inert by the orchestrating session before the audit was dispatched). No separate handoff report — full detail in LOCAL_AI_STATUS.md Sessions 11-12.
+
+Context: this entry closes out the DeepSolve code-execution security question that spanned
+Sessions 6, 8, 9, 10, 11, and 12 (see LOCAL_AI_STATUS.md for the full history) — nothing from
+this feature was committed until this question was settled. The original design
+(deepSolve/pythonSandbox.ts, arbitrary model-generated Python behind a static AST denylist +
+runtime import guard) went through three independent adversarial security-audit-agent rounds,
+each closing the specifically reported hole and each finding the same vulnerability class
+reachable a different way, culminating in a live one-line RCE
+(dataclasses.inspect.os.system(...), reachable via plain attribute traversal with no import
+call at all) that is invisible to both a static linter and a runtime import chokepoint. Session
+10's orchestrating-session judgment call was to stop iterating and not ship rather than attempt
+a fourth denylist patch. LOCAL_AI_MASTER_PLAN.md §11 "Verifier isolation" (researched against
+current external sources, all consistent: in-process Python sandboxing via denylist is
+known-unwinnable, not a project-specific bug) prescribed the architectural inversion applied in
+Session 11: Tier 1 (deepSolve/restrictedEvaluator.ts) is an allowlist of AST node shapes, not a
+denylist of names — the untrusted snippet is walked and computed by a hand-written interpreter
+that never calls Python's own eval()/exec()/compile(), so there is no object graph for an
+attribute-traversal exploit to walk in the first place. pythonSandbox.ts is retired in place
+(not deleted, not revived) with a top-of-file banner; confirmed by this session (grep on the
+rebuilt dist/cli.mjs) to be genuinely dead code, tree-shaken out of the shipped bundle.
+
+Two-layer verification before this entry was written, matching this exact surface's own
+established discipline of never taking a single pass's word for it:
+
+1. Orchestrating-session direct verification (before the round-4 audit was even dispatched):
+   read restrictedEvaluator.ts in full; wrote and ran an independent 26-case empirical script
+   (not reusing the building agent's own test file) covering every historical exploit payload
+   from sessions 8/9/10 plus several new categories (lambda smuggling, list/set/dict
+   comprehensions, f-string injection, dunder subscript access, DoS-bound triggers) — 26/26
+   behaved safely; ran the real test suites directly and confirmed the reported counts matched
+   exactly; rebuilt dist/cli.mjs and confirmed pythonSandbox.ts's distinctive string markers are
+   absent while restrictedEvaluator.ts's are present; confirmed npx tsc --noEmit unchanged at
+   the established 3521-error baseline.
+2. Independent security-audit-agent, round 4, explicitly instructed not to re-run the
+   already-confirmed exploit list but to hunt for a bypass specific to the new allowlist shape:
+   function-value aliasing, reserved-name shadowing, the walrus operator, star-unpacking,
+   AugAssign/AnnAssign/tuple assignment targets, NUL bytes, fullwidth-Unicode homoglyph
+   identifiers (confirmed NFKC-normalizes consistently before both validation and evaluation —
+   not a split-brain bug), complex-valued arithmetic, and a structural proof that the
+   validator's recursion-depth limit actually bounds the evaluator's own recursion. Also
+   independently re-confirmed: -I isolation genuinely defeats a temp-dir/CWD import hijack
+   (verified empirically against the local interpreter); checkPermissions returns 'ask' for
+   deep:true on the only call path to solveDeep, immune to the acceptEdits fast-path;
+   pythonSandbox.ts's only importer is its own test file, no barrel re-export exists anywhere.
+
+The audit's four non-blocking observations (explicitly not security findings — recorded for
+completeness, as the audit itself framed them) and their disposition:
+- A bare Constant AST node bypassed the interpreter's own magnitude/finiteness bound entirely
+  (an overflowing float literal like 1e400 parses to inf without a SyntaxError, and NaN
+  specifically survives the pre-existing abs(value) > MAX_ABS_VALUE check because all NaN
+  comparisons evaluate False in Python) — could let a snippet resolve to a false
+  "code-verified true" on an undefined computation. FIXED this session: evaluate()'s Constant
+  branch now routes through the same _finalize() bound as every other production point, and
+  _finalize() explicitly rejects non-finite floats. Four new regression tests added
+  (restrictedEvaluator.test.ts, 59 -> 63 tests).
+- The Pow bound checked only the exponent's magnitude, not the resulting value — a large-int
+  base already within MAX_ABS_VALUE (from a prior bounded assignment) raised to another
+  bounded-looking exponent could still trigger CPython's eager exact int**int computation of a
+  many-million-digit integer before _finalize saw it (contained by the existing 5-10s process
+  timeout regardless, so no unbounded resource consumption, but contradicting the code's own
+  documented "checked after every operation" guarantee). FIXED this session: a log10-based
+  magnitude pre-check (correct for arbitrary-precision int bases) rejects before ** is ever
+  invoked when the estimate alone exceeds the bound.
+- A stale comment in AskMathModelTool.ts undercounted the real call sites of
+  Tool.isReadOnly() by one (a UI-label-only path in FilesystemPermissionRequest.tsx that
+  AskMathModelTool never reaches). FIXED this session: comment corrected.
+- scripts/eval/deepSolveEval.ts calls solveDeep() directly, bypassing checkPermissions — noted
+  as intentional and consistent with every other scripts/eval/* entry point (a
+  developer-invoked harness requiring shell access to run at all), not a bypass of the tool's
+  actual gate. No fix needed.
+
+All four fixes verified together after applying: restrictedEvaluator.test.ts 63/63 pass (279
+expect() calls); full src/tools/AskMathModelTool/ tree 183/183 pass (504 expect() calls,
+including a live end-to-end run against the real local Ollama model); bun run build clean; npx
+tsc --noEmit unchanged at 3521; direct empirical timing check confirmed both numeric fixes
+resolve in well under 200ms (pre-checks firing, not the 5000ms timeout masking a still-slow
+path).
+
+Deferred, not built this session (per LOCAL_AI_MASTER_PLAN.md §11's own resolution, not an
+oversight): Tier 2 (real OS/WASM isolation for the arbitrary-code subset Tier 1's grammar
+cannot express) remains parked — no case in the current eval set has demonstrated needing it.
+
 ## 2026-08-12 — Local-AI session 3/3b: DataAnalyzeTool, delegation ledger, MCP-scoping, dedicated CUDA venv + Phase 3 models
 Files audited: src/tools/DataAnalyzeTool/DataAnalyzeTool.ts, src/tools/DataAnalyzeTool/schemas.ts, src/tools/DataAnalyzeTool/predictTask.ts, src/tools/DataAnalyzeTool/prompt.ts, src/tools/DataAnalyzeTool/DataAnalyzeTool.test.ts, src/delegationLedger.ts, src/delegationLedger.test.ts, src/query.ts, src/tools.ts, src/services/mcp/config.ts, src/utils/providerProfile.ts, src/services/api/codexShim.test.ts, src/services/api/withRetry.test.ts, src/services/api/toolCallRecoveryIntegration.test.ts, scripts/eval/routingEval.ts, scripts/eval/routingCases.ts, python-bridge/server.py, python-bridge/local_models/table_qa.py, python-bridge/local_models/tabular_predict.py, python-bridge/local_models/forecast.py, python-bridge/local_models/manager.py, python-bridge/local_models/document_qa.py, python-bridge/local_models/image_caption.py, python-bridge/requirements.txt, python-bridge/start.ps1, .gitignore, package.json
 Also staged in this commit, declared rather than deep-read (test-only, no production
