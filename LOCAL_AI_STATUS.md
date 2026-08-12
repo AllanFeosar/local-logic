@@ -1118,11 +1118,558 @@ clean; `test:provider` 89/89; `test:provider-recommendation` 41/41; zero
 new `tsc` errors trace to any file touched (checked directly, not just
 totals).
 
+## Session 8 (2026-08-12, tools-execution-agent) — DeepSolve security review: all 5 findings fixed, needs independent re-audit
+
+Picked up Session 6's "security review complete, verdict not-safe-to-ship-as-is"
+handoff and fixed all five findings from that review (2 HIGH, 3 MEDIUM). Per
+the review's own process requirement, **this still needs a second,
+independent security-audit-agent dispatch to re-verify** — everything below
+is written to make that re-verification concrete and checkable, not a
+self-declared "done".
+
+### Finding 1 (HIGH, fixed) — builtin denylist bypass → RCE
+
+`pythonSandbox.ts`'s `DANGEROUS_TOKENS` substring scan (`'eval('`, `'open('`,
+etc.) is gone entirely. Replaced with real static analysis via Python's own
+`ast` module (no new dependency — ships with every Python 3 install):
+`validatePythonSnippet` now spawns the already-resolved interpreter to run a
+small, fixed, trusted linter script (embedded as `AST_LINTER_SCRIPT`, a
+string constant in `pythonSandbox.ts` — the untrusted snippet is passed on
+stdin, never interpolated into the linter's own source) that does
+`ast.parse()` + `ast.walk()`. Closes the bypass class (not just the four
+examples) by rejecting **any** `ast.Name` reference to a banned identifier
+— `eval`, `exec`, `compile`, `__import__`, `open`, `input`, `globals`,
+`locals`, `vars`, `getattr`, `setattr`, `delattr`, `breakpoint`, `exit`,
+`quit`, `help`, `copyright`, `license`, `credits`, `memoryview`,
+`attrgetter`, `methodcaller`, `__builtins__` — regardless of Load/Store/Del
+context, so `z = __import__` is *itself* a rejected reference and `z(...)`
+never gets the chance to run; `open (...)` (space before paren) is
+irrelevant to an AST walk since it's the same `Call` node either way. No
+assignment/dataflow tracking was needed for this — flagging any reference,
+not just calls, is sufficient per the review's own stated fallback.
+Verified: `pythonSandbox.test.ts`'s new "Finding 1" describe block
+(`w = open; w('x')`, `e = exec; e(...)`, `z = __import__; z(...)`,
+`open ('x')` with a space, `g = getattr; g(...)`, `v = eval; v(...)`) — all
+6 rejected with `reason` containing `disallowed identifier`.
+
+### Finding 2 (HIGH, fixed) — import allowlist regex bypass
+
+`IMPORT_LINE_RE` (line-anchored regex) is gone. The same AST walk handles
+`ast.Import`/`ast.ImportFrom` via `ast.walk()`, which finds them regardless
+of surface syntax: `import math, os` is one `Import` node with two `alias`
+entries and **every** alias is checked (not just the first); `x = 1; import
+os` and `if True: import subprocess` produce the identical AST shape a
+top-level `import os` does; a backslash-continued `import \` + `    os`
+parses to the same single-name `Import` node. Also newly rejects wildcard
+from-imports (`from math import *` — can't be statically vetted) and
+relative imports (`from . import os` — `node.level > 0`). Verified:
+`pythonSandbox.test.ts`'s "Finding 2" describe block — all 6 cases
+(comma-separated, semicolon-chained, indented-in-block, backslash-continued,
+wildcard, relative) rejected with `reason` containing `disallowed import`.
+
+### Finding 3 (MEDIUM, fixed) — `operator.attrgetter`/`methodcaller` getattr-equivalent
+
+Took option (a) from the review (narrow the allowlist entry) rather than
+removing `operator` entirely, since `operator.mul`/`operator.add`/etc. are
+genuinely used by real, live-generated verification snippets (see Session
+6's own live example, and this session's fresh live re-verification below,
+which also used `operator`-adjacent constructs). Both `attrgetter` and
+`methodcaller` are now in `BANNED_IDENTIFIERS` (closes
+`from operator import attrgetter` + bare-name use) **and** in
+`BANNED_ATTRS` (closes `operator.attrgetter`, and — because the ban is on
+the attribute *name*, not on resolving what object it's accessed on —
+closes multi-hop re-aliasing too: `op2 = operator; op2.attrgetter` is
+rejected without needing to prove `op2` traces back to the `operator`
+import). `operator.mul`/`operator.add`/etc. remain fully usable since
+`.mul`/`.add` aren't banned attribute names. Verified:
+`pythonSandbox.test.ts`'s "Finding 3" describe block — direct
+`operator.attrgetter`/`methodcaller` use, `from operator import
+attrgetter`, and the re-aliased `op2.attrgetter` case are all rejected;
+`reduce(operator.mul, [17, 23], 1) == 391` (the exact shape of Session 6's
+live example) is still accepted.
+
+### Finding 4 (MEDIUM, fixed) — unconditional allow + isReadOnly()===true → zero prompting
+
+`AskMathModelTool.ts`'s `checkPermissions` now returns `{behavior:'ask',
+message: ...}` when `input.deep === true` (once per tool invocation, not
+per-candidate — the original, still-legitimate UX goal is preserved),
+instead of unconditional `allow`. Single-shot mode (`deep` unset or
+`false`) is unchanged — still unconditional `allow`, zero side effects.
+Followed this codebase's own idiom for "usually side-effect-free, sometimes
+consequential" (`ConfigTool.ts`: unconditional allow for a read, plain
+non-rule-keyed `ask` for a write) rather than building bespoke path/rule
+matching like `BashTool`/`FileEditTool` — deep mode has no natural
+"path"/rule-content to key permission rules on. Traced through
+`src/utils/permissions/permissions.ts`'s `hasPermissionsToUseToolInner` to
+confirm this composes correctly with the rest of the permission pipeline: a
+plain `ask` (not tied to a `decisionReason.type:'rule'`) still respects
+`bypassPermissions` mode (step 2a — the existing, documented escape hatch,
+not a new bypass) and a tool-level "always allow AskMathModel" rule (step
+2b) — both of which override even a returned `ask` unless it came with
+`requiresUserInteraction()` or a rule-typed `ask`, neither of which apply
+here — so a user who approves once isn't nagged on every subsequent
+deep-mode call. In a headless/`shouldAvoidPermissionPrompts` session, `ask`
+auto-denies (fails closed), matching every other tool.
+`isReadOnly(input)` now returns `!input?.deep` instead of unconditional
+`true` — checked every real call site in the codebase first
+(`grep -rn "\.isReadOnly\("` across `src/`) before changing it: `cli/print.ts`
+only calls it for MCP-server tools with input literal `{}` (`{}.deep` is
+`undefined`, so behavior is unchanged there); `extractMemories.ts`'s
+`createAutoMemCanUseTool` only calls `tool.isReadOnly` when
+`tool.name === BASH_TOOL_NAME` (never reached for `AskMathModelTool`); the
+`FilesystemPermissionRequest.tsx` UI component only reaches its
+`isReadOnly` line for tools with a `getPath` method, which `AskMathModelTool`
+doesn't have. Confirmed no other call site is affected.
+Verified: `AskMathModelTool.test.ts`'s new `describe('checkPermissions')`
+(single-shot → `allow`, `deep:false` → `allow`, `deep:true` → `ask` with a
+non-empty message) and `describe('isReadOnly')` (single-shot/`deep:false` →
+`true`, `deep:true` → `false`).
+
+### Finding 5 (MEDIUM, fixed) — bare `print("VERIFIED")` forges "code-verified"
+
+`pythonSandbox.ts`'s AST linter already parses the snippet for security
+purposes, so it also reports two structural facts as a byproduct of the
+same walk, threaded through `PythonExecResult.snippetMeta`:
+`hasComparison` (an `ast.Compare` node where at least one operand is *not*
+a bare literal constant, so `1 == 1` doesn't count but `computed ==
+expected` does) and `hasNonPrintCall` (a `Call` node targeting anything
+other than the bare `print` builtin — e.g. a call into an allowed module
+function). `verification.ts`'s `verifyAnswer` now only classifies a
+VERIFIED-printing, exit-0 snippet as `'pass'` when at least one of those is
+true (`meta.hasComparison || meta.hasNonPrintCall`); otherwise it downgrades
+to `'inconclusive'` with an explanatory detail, using the bucket's existing
+"code couldn't adjudicate it" semantics rather than inventing a fourth
+bucket — `solveDeep.ts` needed zero changes since it already routes
+`inconclusive` into reranker scoring. Chose the "did real work" structural
+bar (task's suggestion #2, closest to a natural byproduct of the AST walk
+already being done for Findings 1-3) over trying to correlate the code's
+comparison against the candidate's separately-extracted stated answer
+(suggestion #1) — deliberately not over-engineered further, e.g. a
+tautological `1 == 1` gate is caught (both operands are `ast.Constant`) but
+a tautological `(2*2) == (2*2)` is not (neither side is a bare
+`ast.Constant` node, since `2*2` is a `BinOp`) — a real residual gap,
+documented rather than hidden, and judged acceptable against the review's
+own "meaningfully harder to forge, not perfect" bar. Verified:
+`verification.test.ts` — bare `print("VERIFIED")` → `inconclusive` with
+detail containing "too trivial"; `1 == 1`-gated VERIFIED → also
+`inconclusive`/"too trivial"; a real comparison (`abs(2*2-4) < 1e-9`) and a
+call-only check with no explicit comparison (`math.isclose(17*23, 391)`)
+both still classify `'pass'`, confirming the fix doesn't reject legitimate
+checks. `solveDeep.test.ts`'s `PASSING_SNIPPET`/`FAILING_SNIPPET` fixtures
+(previously bare `print("VERIFIED")`/`print("FAILED: wrong")`) were updated
+to include a real `computed == expected` comparison so those tests keep
+testing what they were meant to test rather than accidentally exercising
+the new trivial-print rejection.
+
+### Verification performed
+
+- `pythonSandbox.test.ts`: rewritten (validator is now async — it spawns
+  Python to run the AST linter). All prior cases preserved plus new
+  describe blocks for Findings 1/2/3 and new `snippetMeta` assertions.
+  Tests that need a real interpreter degrade gracefully (skip with a
+  console message) if none is found on PATH, matching this file's existing
+  convention — not exercised on this dev machine (Python is present).
+- `verification.test.ts`: 3 new tests for Finding 5 (see above).
+- `AskMathModelTool.test.ts`: 6 new tests for Finding 4 (see above).
+- `solveDeep.test.ts`: fixtures updated (see Finding 5), all 6 pre-existing
+  behavioral tests (early-exit, reranker fallback, self-consistency
+  fallback, bounded retry, best-effort-unverified, N-cap) still pass
+  unchanged in intent.
+- **Live end-to-end, re-run three separate times** (not just once) against
+  real Ollama + VibeThinker-3B + a real spawned `python.exe`, through the
+  new AST-based validator and the new triviality check, to confirm
+  tightening validation didn't start rejecting legitimate model-generated
+  checks: `solveDeep.live.test.ts` standalone, again inside the full scoped
+  suite, and again inside the whole `AskMathModelTool/` directory run. All
+  three produced a genuinely different, real (not templated) verification
+  snippet each time — repeated addition, an `(x+y)²−(x−y)²` algebraic
+  identity, and a nested-function repeated-addition check — and all three
+  correctly executed under the new AST validator and correctly classified
+  `code-verified`/`VERIFIED: true`.
+- `npx tsc --noEmit`: 3521 errors total, matching Session 6's own
+  post-session baseline exactly (zero new errors; grepped specifically for
+  `AskMathModelTool`/`deepSolve` — zero matches).
+- `bun test src/tools/AskMathModelTool/deepSolve/pythonSandbox.test.ts
+  src/tools/AskMathModelTool/deepSolve/verification.test.ts
+  src/tools/AskMathModelTool/deepSolve/solveDeep.test.ts
+  src/tools/AskMathModelTool/AskMathModelTool.test.ts`: 82/82 pass.
+- Scoped self-verification command (`bun test src/tools src/services/tools
+  src/bridge src/utils/promptShellExecution.test.ts
+  src/utils/ripgrep.test.ts`): **187/187 pass**, zero failures (includes
+  every live test in scope — `AskMathModelTool.live.test.ts`,
+  `solveDeep.live.test.ts`, `DocumentQATool.live.test.ts`,
+  `ImageCaptionTool.live.test.ts`, `DataAnalyzeTool.live.test.ts` — none of
+  the prior sessions' documented transient-contention flakiness reproduced
+  this run).
+- `bun run build`: clean. Confirmed the fixes are actually present in the
+  compiled bundle the CLI runs (`grep -o "too trivial to trust" dist/cli.mjs`
+  and `grep -o "Deep mode generates several candidate" dist/cli.mjs` both
+  matched), and `node bin/openclaude --version` runs cleanly post-build.
+
+### Not touched, per the task's explicit scope
+
+`python-bridge/`, `src/services/api/toolPreFilter.ts`,
+`src/memdir/embeddingClient.ts`, and the sibling `openclaude` repo — none
+were referenced by any of the five findings.
+
+### What a fresh re-audit should specifically try
+
+- Any other Python `Name`/`Attribute` reference our `BANNED_IDENTIFIERS`/
+  `BANNED_ATTRS` sets might have missed within the 17 allowed modules
+  (`math, cmath, fractions, decimal, statistics, itertools, functools,
+  operator, re, string, collections, heapq, bisect, numbers, typing,
+  dataclasses, enum`) — the fix is a fixed denylist of known-dangerous
+  names layered on an AST walk, not an exhaustive per-symbol capability
+  audit of every function in every allowed module (documented as an honest
+  limit in `pythonSandbox.ts`'s own header comment).
+- Whether the `hasComparison`/`hasNonPrintCall` bar for Finding 5 is
+  gameable in some way beyond the documented `(2*2)==(2*2)`-style residual
+  gap (e.g. a call into an allowed module that has no real effect on the
+  VERIFIED branch, satisfying `hasNonPrintCall` without genuine
+  correctness content).
+- Whether returning a non-rule-keyed `ask` from `checkPermissions` (rather
+  than a rule-content-keyed one) has any permission-pipeline edge case this
+  session's trace through `permissions.ts` missed — worth an independent
+  read of `hasPermissionsToUseToolInner`/`checkRuleBasedPermissions`
+  against the specific `{behavior:'ask', message}` shape returned here.
+
+## Session 9 (2026-08-12, tools-execution-agent) — DeepSolve security round 2: string-eval bypass of the AST validator fixed, plus a real runtime import guard added
+
+Picked up a **second independent security re-audit's** finding: Session 8's
+AST-based validator (round 1) closed the substring-matching bypasses, but a
+fresh review found the AST walk has its own remaining blind spot — it only
+inspects real syntax *nodes*, never *string literal contents*. `typing` is on
+`ALLOWED_IMPORTS`, and `typing.get_type_hints()` evaluates string/forward-
+reference annotations as real Python code internally via its own `eval()` —
+a payload hidden inside a string constant is invisible to the walk (just an
+opaque `ast.Constant`) but executes at runtime. Per this task's own
+requirement, **reproduced the exact exploit live against the pre-round-2
+code first**, then fixed both the specific hole (Part 1) and added a
+structurally different runtime enforcement layer (Part 2), then re-verified
+both parts closed it. Still needs a third independent re-audit — everything
+below is written to make that concrete and checkable, matching Session 8's
+own process.
+
+### Reproduction (confirmed live, not theoretical)
+
+The task's exact exploit —
+```python
+import typing
+def _c() -> "__import__('os').popen('whoami').read()":
+    pass
+typing.get_type_hints(_c)
+print("VERIFIED")
+```
+— passed `validatePythonSnippet` unchanged (`typing` allowed, `get_type_hints`
+an unbanned Name+Attribute) and, on execution, the resulting traceback
+leaked the payload's real `os.getcwd()`/`os.listdir()` output directly into
+its own error message — proof the import and filesystem calls actually ran,
+not a hypothetical reading of the CPython source. A `str.format` variant
+(`"{0.__class__.__init__.__globals__[k]}".format(x)`) was also reproduced,
+this time cleanly (`LEAK: __main__`, exit 0, no error at all) — attribute
+traversal driven by a format-spec *string*, same root cause, disclosure-only
+in this minimal env.
+
+**A further, more severe finding surfaced during the broader audit the task
+asked for** ("audit `typing` more broadly... and ban what you find"),
+confirmed live and reported prominently since it wasn't explicitly
+requested: several `ALLOWED_IMPORTS` modules expose the real `sys` or
+`builtins` module as a **plain attribute**, because they `import sys` /
+`import builtins as bltns` at their own module scope — `typing.sys`,
+`fractions.sys`, `statistics.sys`, `dataclasses.sys`, `enum.sys`,
+`enum.bltns`, `collections._sys`. `enum.bltns.__import__('os').popen(...)`
+is a *simpler* full RCE than the string-eval one above — no annotation
+tricks, no `eval`, just plain attribute traversal on an already-imported
+module — and was confirmed working against the pre-round-2 validator.
+`typing.TypeVar("T", bound="<payload>").__bound__.evaluate()` was also
+confirmed live: it reaches a `ForwardRef` instance and triggers the same
+eval-a-string behavior **without the payload ever naming `ForwardRef` at
+all**, closed by banning the `evaluate`/`_evaluate` attribute names rather
+than only the constructor name.
+
+### Part 1 — closing the specific holes (static, `pythonSandbox.ts`)
+
+Added to `BANNED_IDENTIFIERS` (bare-name/import forms): `get_type_hints`,
+`ForwardRef`, `_eval_type`, `sys`, `_sys`, `bltns`. Added to `BANNED_ATTRS`
+(the form these are actually reached through, e.g. `typing.get_type_hints`):
+`get_type_hints`, `ForwardRef`, `evaluate`, `_evaluate`, `_eval_type`,
+`format`, `sys`, `_sys`, `bltns`. Same mechanism as round 1's Finding 3
+(attrgetter/methodcaller) — banning the *name* regardless of what object
+it's accessed on, so re-aliasing doesn't help. `format` is banned only as an
+attribute (not identifier) since it's a common enough word that banning the
+bare name would risk rejecting a legitimate local variable named `format`;
+same reasoning kept `evaluate`/`_evaluate`/`_eval_type` attribute-only.
+Legitimate numeric formatting in a verification snippet can still use
+f-strings (compile to `JoinedStr`/`FormattedValue`, not an `Attribute`/`Call`
+node) — this bans the `.format()` *method*, not all formatting.
+
+### Part 2 — runtime import guard, the architectural fix (`RUNTIME_IMPORT_GUARD_PREFIX`, new)
+
+Investigated the most robust approach achievable in plain CPython with no
+new dependencies, verified every design decision empirically rather than
+assuming (per the task's explicit instruction), landed on: a fixed, trusted
+Python preamble now prepended to the *executed* script (never to what the
+AST linter validates — the linter still only ever sees the raw untrusted
+snippet) that runs before a single line of the untrusted snippet does:
+
+1. **Primes `sys.modules`** by really importing all 17 `ALLOWED_IMPORTS`
+   modules via the real, unguarded `__import__` first. Necessary because
+   CPython's pure-Python stdlib modules transitively need internal plumbing
+   to load at all on Windows (`_io`, `ntpath`, and — confirmed empirically —
+   `os` itself, plus `winreg`) — without priming, even a plain `import math`
+   would get blocked once the strict guard below activates.
+2. **Overrides the *shared* `builtins.__import__`** (not a per-namespace
+   copy) with a function that re-checks the same 17-module allowlist at the
+   moment any import is actually attempted, regardless of whether the
+   request came from a top-level `import` statement, a dynamically `eval`'d
+   string, or from inside an allowed module's own internal machinery.
+   Deliberately does **not** trust "already in `sys.modules`" as a reason to
+   allow a name — confirmed empirically that `os` and `winreg` end up cached
+   as legitimate priming plumbing, so a cache-based exception would have
+   silently reopened the exact hole this exists to close.
+3. **A `sys.meta_path` finder inserted at position 0**, enforcing the
+   identical allowlist as a second, independent check.
+4. **Strips a short list of other dangerous builtins** (`eval`, `exec`,
+   `compile`, `open`, `input`, `globals`, `locals`, `vars`, `getattr`,
+   `setattr`, `delattr`, `breakpoint` — **not** `__import__`, which stays
+   present but now points at the guarded function, since the script's own
+   `import` statements still need it) from the *executed script's own*
+   `__builtins__` mapping.
+
+Built from `ALLOWED_IMPORTS` via a new `pyStringSetLiteral` helper so this
+doesn't become a third hand-duplicated copy of the module list (matching the
+existing "keep AST_LINTER_SCRIPT's copy in sync" caveat, without adding to
+the duplication problem for the new script).
+
+**Empirically verified, not assumed** (per the task's explicit instruction),
+with concrete counterintuitive findings worth recording:
+
+- Investigated whether "stripping dangerous names from the script's own
+  `__builtins__`" (item 4) adds anything real, rather than assuming either
+  way. Result: **it does**, but for a narrower reason than either the
+  reject-or-accept framing suggested. CPython's `eval(code, globals=X, ...)`
+  freshly consults `X['__builtins__']` *at the moment of that specific call*
+  — confirmed by direct experiment: stripping `__import__` from the script's
+  own `__builtins__` blocked the `get_type_hints` exploit outright
+  (`NameError: name '__import__' is not defined`), because
+  `annotationlib.evaluate()`'s internal `eval()` call passes the *target
+  function's* `__globals__` — i.e. this same script's own globals dict — as
+  the `globals` argument. This does **not** protect the script's *own*
+  top-level bytecode (a frame's builtins are fixed once at frame-start,
+  before the mutation runs — confirmed by a direct top-level `eval()` call
+  still resolving fine even after stripping) — but that's already covered by
+  the static ban on directly referencing these names. It also does **not**
+  protect against reaching a dangerous *object reference* directly (see
+  next point) — only against a string being eval'd/exec'd with this
+  script's own globals, which is exactly the `get_type_hints` bug's shape.
+- Directly tested (not assumed) whether the shared-`builtins`-module patch
+  in item 2 also happens to close the `enum.bltns.__import__('os')` vector
+  found during the broader audit, since `enum.bltns` IS the same shared
+  `builtins` module object being patched. **Confirmed yes** — live tested
+  with the Part 1 static bans on `sys`/`bltns` temporarily removed, the
+  runtime guard alone still blocked it (`ImportError: sandbox runtime
+  guard: import of 'os' is not allowed`).
+- Directly tested (per the task's own suggestion) whether the runtime guard
+  alone — with the round-2 static bans temporarily bypassed via a test-only
+  export (`_runPythonSnippetBypassingStaticValidationForTests`, new) —
+  stops the original `get_type_hints` exploit. **Confirmed yes.**
+- Also directly tested the honest boundary: `typing.sys.modules['os']` (a
+  plain dict lookup on an already-populated module cache, no `__import__`
+  call anywhere in the chain) is **not** stopped by the runtime guard at
+  all, with or without static bans in place — confirmed live. This is
+  closed *only* by the static `sys`/`_sys`/`bltns` ban, which is inherently
+  non-exhaustive (same limitation this whole task is about).
+
+### Honest scope statement (also in `pythonSandbox.ts`'s own header comment, not just here)
+
+"Even if the static scan misses a payload, the payload can no longer reach a
+non-allowlisted import when it actually executes" is the bar this meets —
+confirmed for both "hidden in a string" and "reached via an allowed module's
+own attribute-then-`__import__`" cases. It is explicitly **not**
+"unbypassable": attribute traversal to an already-imported dangerous object
+that never calls `__import__` at all (the `typing.sys.modules[...]` class)
+is completely outside the runtime guard's reach by construction — no import
+chokepoint is ever hit — and depends entirely on the static denylist, which
+round 2 itself proves is not a complete enumeration. A future undiscovered
+variant of that second category remains a real, open risk this design does
+not eliminate.
+
+### Tests
+
+24 new tests in `pythonSandbox.test.ts`: a "Round 2" describe block (10
+tests — the exact task exploit, the `str.format` variant, direct
+`ForwardRef`/`.evaluate()`, `TypeVar(bound=...).__bound__.evaluate()`,
+`typing._eval_type`, the 7 `sys`/`bltns`/`_sys` attribute-exposure variants
+as a parametrized loop, and one confirming legitimate `typing`/`dataclasses`/
+`enum` usage still validates ok) plus a new top-level describe block (4
+tests) exercising `RUNTIME_IMPORT_GUARD_PREFIX` in isolation via the new
+`_runPythonSnippetBypassingStaticValidationForTests` test-only export:
+runtime guard alone stops the `get_type_hints` exploit, runtime guard alone
+stops `enum.bltns.__import__`, the honest-gap test confirming
+`typing.sys.modules[...]` is *not* stopped by the runtime guard alone, and a
+legitimate-usage-still-works test. `pythonSandbox.test.ts` total: 68/68
+pass. `runPythonSnippet`'s execution mechanics were factored into a shared
+`executeGuardedScript` helper (both the real call path and the test-only
+bypass export use it) — no behavior change to the real path.
+
+### Verification performed
+
+- `bun test src/tools/AskMathModelTool/deepSolve/pythonSandbox.test.ts`:
+  68/68 pass.
+- `bun test` across `verification.test.ts`, `solveDeep.test.ts`,
+  `generateCandidates.test.ts`, `rerankCandidates.test.ts`,
+  `AskMathModelTool.test.ts`: 44/44 pass, unchanged behavior.
+- `solveDeep.live.test.ts` run twice, real HTTP calls to VibeThinker-3B, a
+  real spawned `python.exe` running under both the AST validator and the new
+  runtime guard: both runs produced genuinely different (model-sampled)
+  verification snippets (a repeated-addition check, then a
+  `reduce`-vs-`math.prod` cross-check using `math`/`functools`/`operator`
+  together) and both correctly classified `code-verified`/`VERIFIED: true` —
+  confirms the tightened validation and the new runtime guard don't reject
+  legitimate model-generated checks.
+- Scoped self-verification command (`bun test src/tools src/services/tools
+  src/bridge src/utils/promptShellExecution.test.ts
+  src/utils/ripgrep.test.ts`): **204/204 pass** across 25 files, including
+  every live test in scope (`AskMathModelTool.live.test.ts`,
+  `solveDeep.live.test.ts`, `DocumentQATool.live.test.ts`,
+  `ImageCaptionTool.live.test.ts`, `DataAnalyzeTool.live.test.ts`).
+- `npx tsc --noEmit`: 3521 errors — exactly matching Session 8's documented
+  post-session baseline, zero new (grepped specifically for
+  `pythonSandbox`/`deepSolve` — zero matches).
+- `bun run build`: clean. Confirmed the fixes are present in the compiled
+  bundle (`grep -o "sandbox runtime guard" dist/cli.mjs` and
+  `grep -o "_install_sandbox_runtime_guard" dist/cli.mjs` both matched), and
+  `node bin/openclaude --version` runs cleanly post-build.
+
+### Not touched, per the task's explicit scope
+
+`python-bridge/`, the semantic-tool-pre-filter work
+(`src/services/api/toolPreFilter.ts`, `src/memdir/embeddingClient.ts`), and
+the sibling `openclaude` repo — none were referenced by this round.
+
+### What a fresh (third) re-audit should specifically try
+
+- Whether any other `typing`/`dataclasses`/`enum`/`functools` public API has
+  similar "evaluates a string" or "exposes a live dangerous-module
+  reference" behavior beyond what this round found — the fix is still a
+  fixed denylist layered on an AST walk plus an import-chokepoint runtime
+  guard, not an exhaustive per-symbol capability audit of the 17 allowed
+  modules (documented as an honest limit in `pythonSandbox.ts`'s own header
+  comment, same as round 1).
+- Whether there's a *third* category beyond "hidden in a string" and
+  "reached via an allowed module's own attribute" that this round hasn't
+  considered — e.g. anything that reaches a dangerous capability via a
+  *return value* of an allowed function rather than a module attribute.
+- Whether the `__builtins__`-stripping layer's frame-timing behavior (a
+  module-level frame's builtins are fixed at frame-start, function/nested-
+  eval frames created after the mutation pick it up fresh) holds identically
+  across Python versions/patch releases likely to be resolved via PATH on a
+  real user machine, not just the 3.14.2 install this round tested against.
+- An independent read of `RUNTIME_IMPORT_GUARD_PREFIX` itself for logic bugs
+  (e.g. the priming loop swallowing all exceptions via a bare
+  `except Exception: pass` — deliberate, so one failed prime doesn't break
+  the rest, but worth a second look) and of `executeGuardedScript`'s
+  refactor for behavior parity with the pre-refactor `runPythonSnippet`.
+
+## Session 10 (2026-08-12, orchestrating session) — DeepSolve code execution: NOT shipped, held back after a third round found a trivial full RCE bypassing every layer
+
+The independent re-audit Session 9 asked for happened. Verdict: **still not
+safe.** A live-reproduced, 10/10-confidence finding: `dataclasses.inspect.os`,
+`dataclasses.annotationlib.builtins`, and `statistics._random._os` are all
+live references to the real `os`/`builtins` modules, reachable by plain
+attribute traversal from two of the still-allowed modules
+(`dataclasses`, `statistics`) — no `import` statement, no `eval`, nothing
+either the AST linter or the runtime import guard is positioned to see,
+because **no import call happens at all**. `dataclasses.inspect.os.system("echo PWNED")`
+is a one-line full RCE that passes the linter (`{"ok": true}`) and runs
+under the runtime guard unmodified. Confirmed live: arbitrary command
+execution, arbitrary file write via the real (guard-strip-bypassing)
+`builtins.open`, and arbitrary `eval` via the real `builtins.eval`. Full
+detail, reproduction, and the auditor's own architectural analysis are in
+the agent's report (not reproduced verbatim here — see the conversation
+history around this session, or re-run the same audit prompt for the
+full write-up).
+
+**This is the third consecutive round where closing the reported hole left
+the same class reachable a different way** (round 1: regex bypass → AST
+rewrite; round 2: AST rewrite blind to string-literal contents
+(`typing.get_type_hints`) → runtime import guard added; round 3: guard
+blind to already-imported-module attribute access → this finding). The
+auditor's own assessment, which this session's judgment agrees with:
+**this is not a whack-a-mole problem with one more fix left in it.**
+Python's shared module cache means any already-imported module is
+reachable by attribute traversal from *some* allowed module in an
+open-ended, CPython-version-dependent way that a static denylist cannot
+exhaustively enumerate — confirmed empirically across three rounds, not
+just asserted in the abstract.
+
+**Decision: stop iterating, do not ship.** A fourth patching round would
+almost certainly repeat the pattern — the auditor's own BFS already
+surfaces more reachable dangerous objects than the one vulnerability
+class reported. Continuing to add names to a denylist against an
+open-ended reachable-object graph is not a responsible way to secure
+something that grants real code execution on the user's machine,
+especially given `deep: true` sits on an *already-visible* tool gated by
+only a single permission prompt a user could click through without
+grasping the risk. **Nothing from `src/tools/AskMathModelTool/deepSolve/`,
+the modified `AskMathModelTool.ts`/`prompt.ts`, or
+`scripts/eval/deepSolveCases.ts`/`deepSolveEval.ts` has been committed —
+everything is confirmed still local-only, uncommitted, unpushed, and will
+stay that way** until a future session makes a deliberate architectural
+choice, not another patch.
+
+**What's still real and valuable, kept in the working tree for a future
+session to build on:** the generate → verify-outcome-classify → score →
+escalate orchestration logic (`deepSolve/solveDeep.ts`,
+`generateCandidates.ts`, `rerankCandidates.ts`) is correct and
+well-tested — it's specifically the *code-execution* verification step
+that's the unresolved problem, not the pipeline shape around it.
+
+**Two concrete directions for whoever picks this up, neither implemented
+here — a deliberate decision point for the project owner, not something
+to guess at:**
+1. **Redesign verification to not execute arbitrary Python at all.**
+   Replace "the specialist writes and we run a Python check" with a much
+   narrower, provably-safe mechanism — e.g. the specialist emits a
+   structured numeric/symbolic claim (its answer plus what it should
+   equal) and verification is a fixed, hand-written comparison (safe
+   numeric equality/tolerance check, `ast.literal_eval` for simple
+   literal values, or a tiny hand-rolled arithmetic-expression evaluator
+   with no function-call or attribute-access grammar at all) instead of
+   full Python. This sidesteps the entire vulnerability class the three
+   rounds found — there is no stdlib module graph to traverse if nothing
+   resembling `import`/`Attribute`/`Call` beyond a fixed comparison
+   primitive is ever executed. Real cost: narrows what's checkable (loses
+   the ability to verify via an arbitrary independent algorithm, e.g. the
+   "two trains and a bird" case's simulate-and-compare check from Session
+   6's eval) — a genuine tradeoff, not a free lunch.
+2. **Real OS-level isolation instead of in-process denylisting.** This
+   project already has a reviewed sandbox mechanism
+   (`@anthropic-ai/sandbox-runtime`) that's unconditionally disabled on
+   native Windows (confirmed across all three rounds — bubblewrap/Seatbelt
+   don't exist there). If the project owner is willing to have a WSL2
+   distro available on this machine, that mechanism becomes genuinely
+   usable for exactly this purpose (`isSupportedPlatform()` returns true
+   for WSL2, only WSL1 is excluded) — running the verification subprocess
+   inside a real Linux sandbox boundary closes this whole class
+   structurally, the way no in-process Python trick can, by reusing
+   infrastructure this project already trusts rather than building a new
+   one. Real cost: a WSL2 dependency this project didn't previously have,
+   and cross-boundary latency/complexity this session didn't scope out.
+
+Neither direction was chosen or started — flagging both with their real
+tradeoffs is the honest deliverable here, not a recommendation forced
+under time pressure.
+
 ## Open items for next session
 
-- **Security review of the DeepSolve code-execution surface** (see list
-  immediately above) — the top-priority item, blocking nothing else but
-  itself needing to happen before this is considered fully done.
+- ~~Independent re-audit of both DeepSolve security rounds~~ **Done — see
+  Session 10 above.** Verdict: not safe, a third bypass class found
+  (attribute-reachable `os`/`builtins` via `dataclasses`/`statistics`, no
+  import call, invisible to both the linter and the runtime guard). DeepSolve
+  code execution is deliberately NOT shipped (nothing committed) pending an
+  architectural decision — see Session 10 for the two concrete directions
+  flagged for the project owner.
 - Grow `deepSolveCases.ts` toward the master plan's own ≥20-problem gate
   with genuinely harder cases (this session's two "hard" picks turned out
   to be within VibeThinker's single-shot reach) — needed to actually
@@ -1135,14 +1682,13 @@ totals).
 - The bare full-suite `bun test` fetch-mock cross-file artifact noted
   above — same category as the already-flagged `test:provider` hermeticity
   work, not investigated further this session (out of scope, pre-existing).
-- **Top priority, per the master plan's own reordering**: semantic tool
-  pre-filtering (`LOCAL_AI_MASTER_PLAN.md` §6 mitigation 3) — the
-  zero-output bug that was blocking meaningful measurement of this lever
-  is now fixed (routing eval 70.0%, clean baseline), and the remaining
-  6/20 failures are exactly the tool-count-driven wrong-tool/over-delegation
-  pattern this mitigation targets. Still the biggest/riskiest change in the
-  list (touches the shared tool-list-construction path used by every
-  provider, not just local ones) — budget real review time for it.
+- ~~Top priority: semantic tool pre-filtering~~ **Done — see Session 7
+  above.** Built, verified, committed, pushed. Confirmed a no-op at today's
+  tool count (discretionary tail already below the filter's threshold),
+  which means the remaining 6/20 routing-eval failures are confirmed to be
+  a reliability ceiling independent of tool count — the next lever needs
+  to target the actual failure modes (wrong-tool hallucination,
+  over-delegation on trivial prompts) directly, not menu trimming.
 - qwen3:4b-instruct A/B is now closed (attempted and rejected on latency/
   VRAM-fit grounds, see Session 5 above) — no need to revisit unless the
   hardware changes (a machine with more VRAM, or a smaller quantization).

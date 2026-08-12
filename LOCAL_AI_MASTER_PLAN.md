@@ -533,12 +533,41 @@ a menu the router already can't reliably pick from), so it's no longer
   VibeThinker's single-shot reach. **Gate (1) is not yet met**: the ≥20-case
   set doesn't exist yet (6 exist), and a 6-case tie isn't evidence either
   way at the scale the gate requires. Gate (2) (frontier head-to-head) not
-  attempted, by design (no paid API calls without explicit opt-in). **Not
-  wired into any default-visible path pending security review** — the
-  mechanism is reachable today since `deep` is a field on an already-visible
-  tool, not a separately gated one, so review is genuinely blocking here,
-  not a formality. See `LOCAL_AI_STATUS.md` Session 6 for the full file
-  list flagged for that review.
+  attempted, by design (no paid API calls without explicit opt-in).
+  **Update 2026-08-12 (session 10): code execution NOT shipped, after
+  three independent security-review rounds.** Round 1 found the initial
+  regex/substring validator bypassable (fixed with real AST-based static
+  analysis). Round 2 found the AST rewrite still blind to string-literal
+  *contents* — `typing.get_type_hints()` evaluates string type-annotations
+  as code, full RCE (fixed: banned the specific vector, added a runtime
+  import guard as defense-in-depth). Round 3 found a third, unrelated
+  bypass: `dataclasses.inspect.os` / `dataclasses.annotationlib.builtins` /
+  `statistics._random._os` are live references to the real `os`/`builtins`
+  modules, reachable by plain attribute traversal with **no import call at
+  all** — invisible to both the static linter and the runtime guard,
+  live-reproduced as a one-line full RCE
+  (`dataclasses.inspect.os.system(...)`). **Decision: stop iterating, do
+  not ship.** Three consecutive rounds each closing the reported hole while
+  leaving the same *class* reachable a different way is a structural
+  signal, not bad luck — Python's shared module cache makes the reachable
+  set of dangerous objects open-ended and version-dependent, which a
+  denylist cannot exhaustively enumerate (the round-3 auditor's own
+  broader search already surfaces more). **Nothing from
+  `src/tools/AskMathModelTool/deepSolve/` is committed** — the orchestration
+  pipeline (generate/classify/score/escalate) is correct and well-tested,
+  kept in the local working tree for a future session, but the
+  code-execution verification step specifically needs an architectural
+  decision, not another patch, before it ships. Two concrete directions
+  flagged (not chosen): (1) redesign verification to not execute arbitrary
+  Python at all — a fixed comparison primitive with no import/attribute/call
+  grammar sidesteps the whole vulnerability class, at the real cost of
+  losing arbitrary-algorithm verification; (2) real OS-level isolation —
+  this project's own `sandbox-runtime` is unconditionally disabled on
+  native Windows but *would* work under WSL2, reusing already-trusted
+  infrastructure instead of a new one, at the cost of a new WSL2 dependency
+  this project didn't previously have. Full detail, live reproductions,
+  and the complete three-round history in `LOCAL_AI_STATUS.md` Sessions
+  6, 8, 9, and 10.
 - **Phase 4 — Hearing**: silero-vad ONNX (re-download, ~2 MB), Whisper
   turbo on GPU, `AudioAnalyze` + `TranscribeAndSummarize`.
   *Gate: transcription spot-check vs a cloud STT on 3 real recordings.*
