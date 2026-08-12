@@ -1,15 +1,72 @@
-# OpenClaude
+# local-logic
 
-OpenClaude is an open-source coding-agent CLI that works with more than one model provider.
+A fork of [OpenClaude](https://github.com/gitlawb/openclaude) turned into an
+offline multi-model agent: a small local router model (Ollama) delegates
+narrow tasks — math, document QA, image captioning, tabular
+prediction/forecasting — to purpose-built local specialist models via
+tool-calling, instead of one generalist model doing everything.
 
-Use OpenAI-compatible APIs, Gemini, GitHub Models, Codex, Ollama, Atomic Chat, and other supported backends while keeping the same terminal-first workflow: prompts, tools, agents, MCP, slash commands, and streaming output.
+The working goal is a **Logic Engine**: on *verifiable* logical domains
+(math, code, symbolic puzzles — anything a checker can score), compose
+small local models generate→verify→search style to reach parity with, or
+beat, frontier models, fully offline and at near-zero marginal cost.
+Open-ended general reasoning with no verifier is explicitly out of scope.
+Full rationale and evidence base in
+[LOCAL_AI_MASTER_PLAN.md §11](LOCAL_AI_MASTER_PLAN.md).
 
-## Why OpenClaude
+**Start here:** [LOCAL_AI_STATUS.md](LOCAL_AI_STATUS.md) is the living
+handoff doc — current architecture, what's verified working, bugs already
+fixed (don't reintroduce them), open next steps.
+[LOCAL_AI_MASTER_PLAN.md](LOCAL_AI_MASTER_PLAN.md) is the longer-range
+roadmap (model inventory, capability tiers, memory budget, phased plan).
 
-- Use one CLI across cloud and local model providers
-- Save provider profiles inside the app with `/provider`
-- Run locally with Ollama or Atomic Chat
-- Keep core coding-agent workflows: bash, file tools, grep, glob, agents, tasks, MCP, and web tools
+---
+
+## Architecture
+
+| Role | Model | Invoked via |
+| --- | --- | --- |
+| Router | `qwen3-router:1.7b` (custom Ollama tag, 40960 ctx) | Main driver model, `.openclaude-profile.json` |
+| Math | VibeThinker-3B | `AskMathModel` tool (`src/tools/AskMathModelTool/`) |
+| Extractive QA | DistilBERT (`distilbert-base-cased-distilled-squad`) | `DocumentQA` tool → Python bridge |
+| Image captioning | BLIP (`blip-image-captioning-large`) | `ImageCaption` tool → Python bridge |
+| Tabular predict / table QA / forecast | TabPFN-v2, TAPAS, Chronos-t5-tiny | `DataAnalyze` tool → Python bridge |
+| Memory retrieval | all-minilm embeddings + Qwen3-Reranker-0.6B | Two-stage pre-filter in `src/memdir/findRelevantMemories.ts` |
+
+Specialists are never asked to route, and the router never specializes —
+small reasoning-tuned models hallucinate tool-call formats when asked to
+both. The Python bridge (`python-bridge/`, FastAPI, dedicated CUDA venv)
+runs BLIP/DistilBERT on GPU (`device="cuda", fp16=True`) and the small
+tabular/forecast models on CPU. See LOCAL_AI_STATUS.md for exact wiring,
+and the hard boundary below before changing anything.
+
+## Current status
+
+- **Routing eval** (`bun run eval:routing`, `scripts/eval/routingEval.ts`):
+  **14/20 (70%)** — up from a 35% baseline after root-causing a silent
+  zero-output-token completion bug (Ollama context truncation). Remaining
+  failures are wrong-tool hallucinations and over-delegation on trivial
+  arithmetic, tracked as the router's tool menu grows.
+- **Specialist eval** (`bun run eval:specialists`): math, DocumentQA
+  (including a correctly-low-confidence unanswerable case), and
+  image-caption cases passing live against real models.
+- **DataAnalyze eval** (`bun run eval:data-analyze`): TabPFN 3/4
+  (classification solid, regression weak only at extrapolation), TAPAS 6/8
+  (solid on direct lookups, unreliable on cross-column/aggregation),
+  Chronos 1/3 (uncertainty bounds solid, point forecast underforecasts
+  clear trends).
+- **Next priority**: semantic tool pre-filtering — the router's remaining
+  failures track tool-menu size, per `LOCAL_AI_MASTER_PLAN.md` §6.
+
+Full session-by-session detail, verification evidence, and known bugs
+already fixed live in [LOCAL_AI_STATUS.md](LOCAL_AI_STATUS.md).
+
+## Hard boundary
+
+The sibling project `openclaude` (no `-main`/`-local` suffix) is a
+separate, unrelated daily-driver checkout for cloud providers. **Never
+modify it for anything related to this local-AI work** — this repo is
+where all of it belongs.
 
 ---
 
@@ -21,181 +78,40 @@ Use OpenAI-compatible APIs, Gemini, GitHub Models, Codex, Ollama, Atomic Chat, a
 npm install -g @gitlawb/openclaude
 ```
 
-If the npm install path later reports `ripgrep not found`, install ripgrep system-wide and confirm `rg --version` works in the same terminal before starting OpenClaude.
+If the npm install path later reports `ripgrep not found`, install ripgrep
+system-wide and confirm `rg --version` works in the same terminal before
+starting.
 
-### Start
+### Run against the local router (primary path for this fork)
 
-```bash
-openclaude
-```
-
-Inside OpenClaude:
-
-- run `/provider` for guided setup of OpenAI-compatible, Gemini, Ollama, or Codex profiles
-- run `/onboard-github` for GitHub Models setup
-
-### Fastest OpenAI setup
-
-macOS / Linux:
+Requires [Ollama](https://ollama.com) running locally and the router model
+pulled/built per LOCAL_AI_STATUS.md (`qwen3-router:1.7b`, a custom tag —
+plain `qwen3:1.7b` will silently truncate the prompt, see the status doc's
+Session 5 writeup). The Python bridge (`python-bridge/start.ps1`) must also
+be running for DocumentQA/ImageCaption/DataAnalyze.
 
 ```bash
-export CLAUDE_CODE_USE_OPENAI=1
-export OPENAI_API_KEY=sk-your-key-here
-export OPENAI_MODEL=gpt-4o
-
 openclaude
 ```
 
-Windows PowerShell:
+`.openclaude-profile.json` in this repo already points the `ollama`
+profile at `qwen3-router:1.7b` and scopes non-local-AI MCP servers out of
+that profile.
 
-```powershell
-$env:CLAUDE_CODE_USE_OPENAI="1"
-$env:OPENAI_API_KEY="sk-your-key-here"
-$env:OPENAI_MODEL="gpt-4o"
+### Also supported: cloud/OpenAI-compatible providers
 
-openclaude
-```
-
-### Fastest local Ollama setup
-
-macOS / Linux:
-
-```bash
-export CLAUDE_CODE_USE_OPENAI=1
-export OPENAI_BASE_URL=http://localhost:11434/v1
-export OPENAI_MODEL=qwen2.5-coder:7b
-
-openclaude
-```
-
-Windows PowerShell:
-
-```powershell
-$env:CLAUDE_CODE_USE_OPENAI="1"
-$env:OPENAI_BASE_URL="http://localhost:11434/v1"
-$env:OPENAI_MODEL="qwen2.5-coder:7b"
-
-openclaude
-```
-
----
-
-## Setup Guides
-
-Installation (npm, source build, Android/Termux), full provider configuration,
-architecture, development workflow, and troubleshooting are all consolidated
-in [.claude/contracts/project-docs.md](.claude/contracts/project-docs.md).
-
----
-
-## Supported Providers
-
-| Provider | Setup Path | Notes |
-| --- | --- | --- |
-| OpenAI-compatible | `/provider` or env vars | Works with OpenAI, OpenRouter, DeepSeek, Groq, Mistral, LM Studio, and compatible local `/v1` servers |
-| Gemini | `/provider` or env vars | Google Gemini support through the runtime provider layer |
-| GitHub Models | `/onboard-github` | Interactive onboarding with saved credentials |
-| Codex | `/provider` | Uses existing Codex credentials when available |
-| Ollama | `/provider` or env vars | Local inference with no API key |
-| Atomic Chat | advanced setup | Local Apple Silicon backend |
-| Bedrock / Vertex / Foundry | env vars | Additional provider integrations for supported environments |
-
----
-
-## What Works
-
-- Tool-driven coding workflows
-  Bash, file read/write/edit, grep, glob, agents, tasks, MCP, and slash commands
-- Streaming responses
-  Real-time token output and tool progress
-- Tool calling
-  Multi-step tool loops with model calls, tool execution, and follow-up responses
-- Images
-  URL and base64 image inputs for providers that support vision
-- Provider profiles
-  Guided setup plus saved `.openclaude-profile.json` support
-- Local and remote model backends
-  Cloud APIs, local servers, and Apple Silicon local inference
-
----
-
-## Provider Notes
-
-OpenClaude supports multiple providers, but behavior is not identical across all of them.
-
-- Anthropic-specific features may not exist on other providers
-- Tool quality depends heavily on the selected model
-- Smaller local models can struggle with long multi-step tool flows
-- Some providers impose lower output caps than the CLI defaults, and OpenClaude adapts where possible
-
-For best results, use models with strong tool/function calling support.
-
----
-
-## Agent Routing
-
-Route different agents to different AI providers within the same session. Useful for cost optimization (cheap model for code review, powerful model for complex coding) or leveraging model strengths.
-
-### Configuration
-
-Add to `~/.claude/settings.json`:
-
-```json
-{
-  "agentModels": {
-    "deepseek-chat": {
-      "base_url": "https://api.deepseek.com/v1",
-      "api_key": "sk-your-key"
-    },
-    "gpt-4o": {
-      "base_url": "https://api.openai.com/v1",
-      "api_key": "sk-your-key"
-    }
-  },
-  "agentRouting": {
-    "Explore": "deepseek-chat",
-    "Plan": "gpt-4o",
-    "general-purpose": "gpt-4o",
-    "frontend-dev": "deepseek-chat",
-    "default": "gpt-4o"
-  }
-}
-```
-
-### How It Works
-
-- **agentModels**: Maps model names to OpenAI-compatible API endpoints
-- **agentRouting**: Maps agent types or team member names to model names
-- **Priority**: `name` > `subagent_type` > `"default"` > global provider
-- **Matching**: Case-insensitive, hyphen/underscore equivalent (`general-purpose` = `general_purpose`)
-- **Teams**: Team members are routed by their `name` — no extra config needed
-
-When no routing match is found, the global provider (env vars) is used as fallback.
-
-> **Note:** `api_key` values in `settings.json` are stored in plaintext. Keep this file private and do not commit it to version control.
-
----
-
-## Web Search and Fetch
-
-`WebFetch` works out of the box.
-
-`WebSearch` and richer JS-aware fetching work best with a Firecrawl API key:
-
-```bash
-export FIRECRAWL_API_KEY=your-key-here
-```
-
-With Firecrawl enabled:
-
-- `WebSearch` is available across more provider setups
-- `WebFetch` can handle JavaScript-rendered pages more reliably
-
-Firecrawl is optional. Without it, OpenClaude falls back to the built-in behavior.
+This fork inherits OpenClaude's full multi-provider engine (OpenAI-compatible
+APIs, Gemini, GitHub Models, Codex, Bedrock/Vertex/Foundry). Run `/provider`
+inside the app for guided setup, or see
+[.claude/contracts/project-docs.md](.claude/contracts/project-docs.md) for
+full installation, provider configuration, and troubleshooting docs.
 
 ---
 
 ## Source Build
+
+**Any change to `src/` requires a rebuild before it's visible** —
+`bin/openclaude` runs the compiled `dist/cli.mjs`, never live `src/`.
 
 ```bash
 bun install
@@ -205,43 +121,39 @@ node dist/cli.mjs
 
 Helpful commands:
 
-- `bun run dev`
-- `bun run smoke`
-- `bun run doctor:runtime`
-
----
+- `bun run dev` — build + run in one step
+- `bun run smoke` — build + `--version` sanity check
+- `bun run doctor:runtime` — environment/dependency check
+- `bun run eval:routing` / `eval:specialists` / `eval:data-analyze` — local-AI eval harnesses
 
 ## VS Code Extension
 
-The repo includes a VS Code extension in [`vscode-extension/openclaude-vscode`](vscode-extension/openclaude-vscode) for OpenClaude launch integration and theme support.
-
----
+The repo includes a VS Code extension in
+[`vscode-extension/openclaude-vscode`](vscode-extension/openclaude-vscode)
+for launch integration and theme support (inherited from upstream
+OpenClaude, not specific to the local-AI work).
 
 ## Security
 
 If you believe you found a security issue, see [SECURITY.md](SECURITY.md).
 
----
-
 ## Contributing
 
-Contributions are welcome.
-
-For larger changes, open an issue first so the scope is clear before implementation. Helpful validation commands include:
+For larger changes, open an issue first so the scope is clear before
+implementation. Helpful validation commands:
 
 - `bun run build`
 - `bun run smoke`
 - focused `bun test ...` runs for touched areas
 
----
+See [AGENTS.md](AGENTS.md) for the sub-agent orchestration rules used in
+this repo.
 
 ## Disclaimer
 
-OpenClaude is an independent community project and is not affiliated with, endorsed by, or sponsored by Anthropic.
-
-"Claude" and "Claude Code" are trademarks of Anthropic.
-
----
+This is an independent, unaffiliated fork of OpenClaude and is not
+affiliated with, endorsed by, or sponsored by Anthropic. "Claude" and
+"Claude Code" are trademarks of Anthropic.
 
 ## License
 
