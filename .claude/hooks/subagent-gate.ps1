@@ -14,11 +14,62 @@
 # check regardless of what it actually touched, and looped 7 times against
 # an identical message, burning an entire session's usage window. GateFailBudget
 # stops that: after 3 consecutive identical failures, the gate fails OPEN
-# instead of blocking again. Root cause still needs a real fix separately —
-# commit the pending diff so git status reflects only real per-subagent changes.
+# instead of blocking again.
+#
+# TSC BASELINE COMPARISON (added 2026-08-12, after this circuit breaker fired
+# repeatedly across at least 5 independent subagent dispatches — every one
+# individually diagnosed and reported the same root cause: this fork carries
+# a large pre-existing `tsc --noEmit` error baseline, documented across
+# LOCAL_AI_STATUS.md sessions 1/3/5/6/7, that has nothing to do with any
+# given subagent's own diff. `tsc --noEmit`'s exit code is nonzero for *any*
+# error count > 0, so gating on exit code alone fails unconditionally for
+# every subagent touching tui/commands-skills/provider-router/tools-execution
+# territory regardless of what they changed — every one of those 5 dispatches
+# correctly declined to "fix" thousands of unrelated errors across files they
+# don't own, exactly as their own operating rules require, then burned their
+# full GateFailBudget proving it before failing open. That's working as
+# designed but wasteful: it trains every agent to spend real reasoning
+# disproving a false positive instead of doing their actual task.
+# Get-TscErrorCount below counts total `error TS` lines instead of trusting
+# the exit code, and Test-TscRegression only fails the gate if the count
+# *increased* past $TscBaseline — i.e. only on an actual new error, which is
+# the thing this gate should have been checking all along. $TscBaseline must
+# be updated (down, ideally) whenever someone deliberately restores/fixes
+# baseline errors — see LOCAL_AI_STATUS.md's "restored 11 missing type/stub
+# files" entry for how the 4130 -> 3521 drop this number reflects happened.
+# Bumping it up to silence a real new regression instead of fixing the
+# regression defeats the whole point — only lower it after confirming a
+# genuine reduction, the same way that entry did.
 $ErrorActionPreference = 'Continue'
 $GateStatePath = Join-Path $PSScriptRoot '.subagent-gate-state.json'
 $GateFailBudget = 3
+$TscBaseline = 3521
+
+function Get-TscErrorCount([string]$tscOutput) {
+    $matches = [regex]::Matches($tscOutput, 'error TS\d+')
+    return $matches.Count
+}
+
+# Returns $null if no regression (gate should pass), or a message string if
+# there is one (gate should fail with that message). Runs tsc exactly once
+# and reports the count either way, so a passing run's real error count is
+# visible in the transcript even though it doesn't block anything.
+# NOTE: deliberately uses [Console]::Out.WriteLine, not Write-Output, for the
+# informational line below — PowerShell functions return their entire output
+# stream, not just the value passed to `return`, so a Write-Output call ahead
+# of `return $null` here would silently turn the "no regression" case into a
+# two-element array (the message, then $null) instead of a clean $null,
+# which callers' `if ($tscFail)` checks would then treat as truthy. Caught by
+# testing this function directly against the live repo before trusting it.
+function Test-TscRegression {
+    $out = cmd /c "npx tsc --noEmit 2>&1"
+    $count = Get-TscErrorCount ($out -join "`n")
+    if ($count -gt $TscBaseline) {
+        return "tsc --noEmit: $count errors, up from the documented baseline of $TscBaseline (+$($count - $TscBaseline)) — this diff introduced new type errors.`n$($out -join "`n")"
+    }
+    [Console]::Out.WriteLine("subagent-gate: tsc --noEmit: $count errors (baseline $TscBaseline) — no regression, passing.")
+    return $null
+}
 
 function Get-GateState {
     if (Test-Path $GateStatePath) {
@@ -87,8 +138,8 @@ $tuiChanged = $files | Where-Object { $_ -match '^src/(components|ink|screens|ho
 if ($tuiChanged) {
     if (-not $bunOnPath) { Fail-Open "bun not on PATH" }
     if (-not $nodeModulesPresent) { Fail-Open "node_modules missing — run bun install" }
-    $out = cmd /c "npx tsc --noEmit 2>&1"
-    if ($LASTEXITCODE -ne 0) { Fail-Gate "tui-agent: tsc --noEmit" ($out -join "`n") }
+    $tscFail = Test-TscRegression
+    if ($tscFail) { Fail-Gate "tui-agent: tsc --noEmit" $tscFail }
     $out = cmd /c "bun test src/components/**/*.test.ts* src/ink/**/*.test.ts 2>&1"
     if ($LASTEXITCODE -ne 0) { Fail-Gate "tui-agent: bun test" ($out -join "`n") }
 }
@@ -98,8 +149,8 @@ $commandsChanged = $files | Where-Object { $_ -match '^src/(commands|skills|plug
 if ($commandsChanged) {
     if (-not $bunOnPath) { Fail-Open "bun not on PATH" }
     if (-not $nodeModulesPresent) { Fail-Open "node_modules missing — run bun install" }
-    $out = cmd /c "npx tsc --noEmit 2>&1"
-    if ($LASTEXITCODE -ne 0) { Fail-Gate "commands-skills-agent: tsc --noEmit" ($out -join "`n") }
+    $tscFail = Test-TscRegression
+    if ($tscFail) { Fail-Gate "commands-skills-agent: tsc --noEmit" $tscFail }
     $out = cmd /c "bun test src/commands/**/*.test.ts* src/skills/**/*.test.ts 2>&1"
     if ($LASTEXITCODE -ne 0) { Fail-Gate "commands-skills-agent: bun test" ($out -join "`n") }
 }
@@ -111,8 +162,8 @@ if ($providerChanged) {
     if (-not $nodeModulesPresent) { Fail-Open "node_modules missing — run bun install" }
     $out = cmd /c "bun run test:provider 2>&1"
     if ($LASTEXITCODE -ne 0) { Fail-Gate "provider-router-agent: test:provider" ($out -join "`n") }
-    $out = cmd /c "npx tsc --noEmit 2>&1"
-    if ($LASTEXITCODE -ne 0) { Fail-Gate "provider-router-agent: tsc --noEmit" ($out -join "`n") }
+    $tscFail = Test-TscRegression
+    if ($tscFail) { Fail-Gate "provider-router-agent: tsc --noEmit" $tscFail }
 }
 
 # --- tools-execution-agent ---
@@ -120,8 +171,8 @@ $toolsChanged = $files | Where-Object { $_ -match '^src/(tools|tasks|bridge|remo
 if ($toolsChanged) {
     if (-not $bunOnPath) { Fail-Open "bun not on PATH" }
     if (-not $nodeModulesPresent) { Fail-Open "node_modules missing — run bun install" }
-    $out = cmd /c "npx tsc --noEmit 2>&1"
-    if ($LASTEXITCODE -ne 0) { Fail-Gate "tools-execution-agent: tsc --noEmit" ($out -join "`n") }
+    $tscFail = Test-TscRegression
+    if ($tscFail) { Fail-Gate "tools-execution-agent: tsc --noEmit" $tscFail }
     $out = cmd /c "bun test src/tools src/services/tools src/bridge src/utils/promptShellExecution.test.ts src/utils/ripgrep.test.ts 2>&1"
     if ($LASTEXITCODE -ne 0) { Fail-Gate "tools-execution-agent: bun test" ($out -join "`n") }
 }
