@@ -2625,6 +2625,40 @@ either), so no audit dispatched; verification here was code review + live
 measurement, matching what this exact class of change has always required
 in this project.
 
+### A concrete new lead on `math-3` (not chased further this session — recorded for whoever picks it up next)
+
+`math-3` (session 15's own flagged "wrong in literally every configuration"
+case) was captured in this session's own verified run with its full actual
+tool input, which no prior session had recorded: the router called `Grep`
+with `{"head_limit": 100, "path": "scripts/eval/README.md", "glob":
+"test_cases/*.ts", "output_mode": "content"}` — a hallucinated call
+referencing this *project's own* eval-tooling file paths
+(`scripts/eval/README.md` is a real file in this repo, edited earlier this
+same session), not anything related to the actual prompt (a ticket-sales
+addition word problem using comma-formatted 4-digit numbers, `3,842` /
+`2,957`). This is a different, more specific signal than "wrong tool" —
+the model isn't just misjudging which tool to use, it's producing content
+that looks like it's free-associating toward this project's own test
+infrastructure. Two live reproduction attempts this session (trying to
+capture the router's raw behavior directly via a manual CLI invocation)
+were inconclusive — not because the router failed, but because of a
+methodology gap discovered along the way: a direct `node bin/openclaude`
+invocation blocks on the *full* agentic turn (including actually executing
+whichever tool gets chosen and waiting for a possible Ollama model swap to
+the specialist), not just the router's own decision, unlike
+`routingEval.ts`'s own approach of reading the stream incrementally and
+killing the child the instant a `tool_use` block appears — so a naive
+manual reproduction is not a reliable way to observe the router's decision
+in isolation. **Not pursued further this session**: a hand-crafted few-shot
+example narrowly targeting comma-formatted numbers would risk memorizing
+this one eval case rather than demonstrating genuine generalization (the
+eval set only has one case in this exact shape), and confirming this
+properly needs either several repeated live runs of just this case to
+characterize whether the hallucination is deterministic or sampling noise,
+or a small growth of the case set with more comma-formatted-number problems
+to distinguish a real fix from overfitting — both are real next-session
+work, not something to rush.
+
 ### Not touched, per scope
 
 `python-bridge/`, the sibling `openclaude` repo, Tier 2 (DeepSolve's
