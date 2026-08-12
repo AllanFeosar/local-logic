@@ -644,23 +644,171 @@ Chronos trend-underforecast finding needs its own follow-up or whether
 leaning on the (correct) uncertainty bounds rather than the point
 forecast is an acceptable mitigation for now.
 
+## Session 5 (2026-08-12, provider-router-agent) — silent zero-token completion bug: root-caused and fixed
+
+Picked up Session 3's top open item directly. Reproduced the bug
+deterministically first (`bun run eval:routing --case routing-math-1`
+through the compiled CLI), then root-caused it by proxying the real Ollama
+traffic (a small logging reverse-proxy inserted via a temporary
+`OPENAI_BASE_URL` edit, reverted after) to capture the **exact** production
+request byte-for-byte, and replaying that captured request directly against
+Ollama's own endpoints with controlled variations — rather than guessing
+from the app layer.
+
+### Root cause
+
+The full production request (real system prompt incl. the "auto memory"
+instructions + environment block + ~13 visible tool definitions after
+MCP-scoping/deferral) is **~15,592 tokens**. Ollama's default `num_ctx` for
+`qwen3:1.7b` on this install is **4096** (confirmed via `/api/ps`'s
+`context_length` field on a freshly-loaded default model) — nowhere close
+to enough. Ollama's OpenAI-compatible `/v1/chat/completions` endpoint does
+not error on overflow; it **silently truncates** the prompt to fit
+(confirmed: `prompt_tokens` in the response came back as ~2050, roughly
+half of `num_ctx`, regardless of the true ~15.6k-token input), and the
+mangled remainder the model actually sees sometimes produces zero
+parseable output (the observed bug), sometimes a plausible-looking but
+wrong tool call (explains Session 3's `Read`/`Skill` hallucinations too —
+same root cause, different truncation luck). Directly confirmed the fix
+works by baking a larger `num_ctx` into a custom Ollama model tag and
+replaying the *exact same captured request* against it: correct native
+`AskMathModel` tool_calls, repeatably. `reasoning_effort:'none'` was tested
+and ruled out as a contributing factor (removing it, i.e. leaving thinking
+on, still produces correct output even under truncation — the *presence*
+of truncation is what matters, not the think setting); the earlier
+`/think`-suffix fix was left untouched and its regression tests still pass.
+
+### Fix
+
+Ollama's OpenAI-compat endpoint has no per-request context-length override
+(tested: neither a top-level `num_ctx` nor an `options.num_ctx` field has
+any effect on `/v1/chat/completions`) — `num_ctx` must be baked into the
+model via `ollama create`. Built `qwen3-router:1.7b` (a previously-existing
+but unused/orphaned tag from an earlier abandoned attempt, cleanly
+recreated) with `PARAMETER num_ctx 40960` (matching the base model's real
+native `context_length`) and `PARAMETER think false` (redundant with the
+per-request `think`/`reasoning_effort` fields already sent by
+`openaiShim.ts`, kept for belt-and-braces). `.openclaude-profile.json`'s
+`OPENAI_MODEL` now points at this tag instead of bare `qwen3:1.7b`.
+
+**A second, non-obvious bug surfaced and got fixed along the way**: simply
+declaring the model's now-accurate context window in
+`src/utils/model/openaiContextWindows.ts` (for the CLI's own auto-compact
+warning/threshold logic) *without* also declaring its max-output-tokens
+entry made the CLI trigger auto-compaction before every single routing
+turn — `getEffectiveContextWindowSize()`'s reservation formula
+(`contextWindow - min(getMaxOutputTokensForModel(model), 20_000)`, minus
+`AUTOCOMPACT_BUFFER_TOKENS(13_000)`) goes deeply negative when the model
+falls through to the generic 32k output-token default, so *any* token
+usage looked like it was over threshold — confirmed live (every routing-eval
+case hung on a `"compacting"` status, itself trying to reprocess the same
+oversized prompt, blowing well past reasonable turn latency; first attempt
+at fixing this by reverting the context-window declaration entirely was
+tried, then correctly overridden mid-task once the real two-part fix was
+traced through the actual formula in `autoCompact.ts`). Fixed by adding
+**both** `OPENAI_CONTEXT_WINDOWS['qwen3-router:1.7b'] = 40_960` and
+`OPENAI_MAX_OUTPUT_TOKENS['qwen3-router:1.7b'] = 4_096` together (a
+tool-dispatch router doesn't need anywhere near 32k output tokens) —
+verified live afterward, no compaction hang, correct tool calls, and the
+full routing eval run clean end to end. See that file's own comments for
+the complete math.
+
+No `src/services/api/openaiShim.ts` change was needed — the entire fix
+lives in Ollama's own model config (`ollama create`) plus this project's
+provider-profile file plus the context-window lookup table. This also
+means every existing `openaiShim.test.ts` regression test (including the
+`/think`-suffix ones) passes completely unchanged.
+
+### Result: routing eval 35.0% → 70.0%, zero silent completions remaining
+
+`reports/after-silent-completion-fix/eval-routing.{json,md}` vs
+`reports/baseline/eval-routing.md` (35.0%, 7/20) and
+`reports/final/eval-routing.md` (Session 3's end-of-session re-run, same
+35.0%). New score: **14/20 (70.0%)**. Breakdown: AskMathModel 4/5 (was
+0/5), DocumentQA 3/5 (was 0/5), ImageCaption 5/5 (unchanged), distractors
+2/5 (was 2/5, unchanged pattern but the *shape* of the failure changed —
+see below). **Zero of the 20 cases are `no-tool-called`/silent this
+time** — the exact failure mode this session targeted is fully gone.
+
+Remaining 6/20 failures are a different, already-anticipated problem, not
+a resurgence of the zero-output bug: 3 wrong-tool hallucinations
+(`routing-math-3`, `routing-docqa-3` both called `Grep`; `routing-docqa-5`
+called `DataAnalyze` instead of `DocumentQA` — a semi-plausible mixup,
+table-tool for a passage) and 3 over-delegations (`routing-distractor-1`/
+`-3`, trivial 2-digit arithmetic, now call `AskMathModel` directly instead
+of the old `Skill{skill:"math"}` hallucination — a real tool this time,
+still wrong per the eval's own "don't delegate trivial math" rule;
+`routing-distractor-5` called `ImageCaption` on a plain conversational
+question with no image). This matches `LOCAL_AI_MASTER_PLAN.md` §6's own
+prediction: a 1.7B router degrades on tool selection once the menu grows
+past ~10 (currently ~13 visible), independent of the context-truncation
+bug that's now fixed.
+
+### qwen3:4b A/B — attempted, rejected on latency (not accuracy)
+
+Pulled `qwen3:4b` (2.50GB, native `context_length` 262144) and built a
+matching `qwen3-router-4b:latest` tag (`num_ctx 40960`, `think false`,
+same reasoning as the 1.7b fix) to test §6 mitigation 5. The full
+20-case routing eval against it scored **0/20 — every case hit the
+harness's 45s timeout**, and a follow-up direct single-case test with a
+150s+ budget still produced no response at all after 3 minutes. Root
+cause: this machine's RTX 3050 has only 4GB VRAM, and the 4b model at
+40960 context has a ~9.2GB total resident footprint — only ~2.3GB of that
+fits in VRAM (confirmed via `/api/ps`'s `size_vram` field), forcing most
+of the model onto CPU inference, which is drastically slower. This is a
+hardware-fit finding, not an accuracy verdict — **not adopted**, and
+cleanly reverted (profile back to `qwen3-router:1.7b`, the temporary
+`openaiContextWindows.ts` entries for the 4b tag removed, the `qwen3:4b`
+Ollama weights left pulled/parked in case a future session with different
+hardware or a lighter context setting wants to revisit).
+
+### Verification
+
+`bun run test:provider` (89/89), `bun run test:provider-recommendation`
+(41/41), the broader test set (85/87 — the 2 failures are the
+already-documented pre-existing `remoteAgentService.test.ts`
+vitest/bun-mocking-gap failures, unrelated to this session), and
+`npx tsc --noEmit` (4130 errors — exactly the documented pre-existing
+baseline, zero new) all match the pre-session baseline with zero new
+failures. `bun run build` run after every `src/` change, verified live
+through the compiled CLI each time, per this project's own hard rule.
+
+### Genuinely ambiguous decision for the project owner
+
+`qwen3-router:1.7b`'s `num_ctx 40960` (vs. the model's max-supported 40960
+— i.e. using the model's full native window) costs real, permanent RAM:
+~6.4GB resident for the always-loaded router (confirmed via `/api/ps`,
+only ~2.4GB of which fits this machine's 4GB VRAM, the rest in system
+RAM) — a large step up from the ~1.8GB this project's own budget notes
+assumed for the router baseline (`LOCAL_AI_MASTER_PLAN.md` §3), leaving
+less headroom than planned for on-demand specialists (VibeThinker-3B
+alone is ~1.9GB). This is a necessary cost of the fix (the full request
+genuinely needs ~15.6k tokens of context, no smaller number works without
+reintroducing truncation), not a tuning choice, but it's worth the project
+owner knowing the actual number rather than the older budget estimate.
+
 ## Open items for next session
 
-- **Top priority**: root-cause the silent zero-token completion bug (see
-  Session 3 above) — the single largest routing-eval failure category, and
-  the routing eval gate (`LOCAL_AI_MASTER_PLAN.md` §8 Phase 1: ≥90%) is not
-  met (currently 35%). Likely needs direct experimentation with the exact
-  production request shape against Ollama to isolate what triggers it.
-- Semantic tool pre-filtering (§6 mitigation 3) — deliberately deferred,
-  not attempted; recommended next structural step once/if the silent-
-  completion issue is resolved and re-measured.
-- qwen3:4b-instruct A/B — deliberately not attempted; the current evidence
-  doesn't clearly point to "model too small," so this isn't the obviously
-  correct next lever (see reasoning above).
+- **Top priority, per the master plan's own reordering**: semantic tool
+  pre-filtering (`LOCAL_AI_MASTER_PLAN.md` §6 mitigation 3) — the
+  zero-output bug that was blocking meaningful measurement of this lever
+  is now fixed (routing eval 70.0%, clean baseline), and the remaining
+  6/20 failures are exactly the tool-count-driven wrong-tool/over-delegation
+  pattern this mitigation targets. Still the biggest/riskiest change in the
+  list (touches the shared tool-list-construction path used by every
+  provider, not just local ones) — budget real review time for it.
+- qwen3:4b-instruct A/B is now closed (attempted and rejected on latency/
+  VRAM-fit grounds, see Session 5 above) — no need to revisit unless the
+  hardware changes (a machine with more VRAM, or a smaller quantization).
 - A small `DataAnalyze`-specific eval set (mirroring `specialistEval.ts`)
   to properly characterize `/table-qa`'s real accuracy rather than relying
-  on ad hoc spot-checks.
+  on ad hoc spot-checks. (Session 4 above, tools-execution-agent, has since
+  built exactly this — `scripts/eval/dataAnalyzeEval.ts` — so this item is
+  effectively done; kept here only until the next full doc pass confirms
+  it can be removed.)
 - Whisper/vision phases (Phase 4/5) — GPU capacity now exists and is
   proven working (BLIP/DistilBERT on CUDA+fp16), so Phase 4 (Whisper
   turbo) is no longer blocked on platform work, only on router reliability
-  being resolved first per the phase ordering.
+  being resolved first per the phase ordering. Router reliability is
+  meaningfully better (70%) but still below the ≥90% gate, so this stays
+  blocked until semantic pre-filtering (or another lever) closes the gap.

@@ -86,13 +86,31 @@ such claim.
 
 - **CPU**: i7-11800H (8C/16T) — fine for all sub-1B models and quantized LLMs.
 - **RAM**: 15.7 GB total. Windows + apps ≈ 5–6 GB → **realistic AI budget
-  ≈ 8–9 GB RAM**.
-- **GPU**: RTX 3050 Laptop, **4 GB VRAM** — unused today (bridge torch is
-  CPU-only). Big untapped win: Whisper turbo fp16 (~1.6 GB) and BLIP fp16
-  (~1 GB) both fit; SD 1.5 fp16 with attention slicing (~2.5 GB) fits alone.
-- Baseline resident set: qwen3:1.7b (~1.8 GB with context) + all-minilm
-  (~0.1 GB) + idle Python bridge (~0.4 GB) ≈ **2.5 GB**, leaving ~5–6 GB of
-  headroom for on-demand specialists.
+  ≈ 8–9 GB RAM.**
+- **GPU**: RTX 3050 Laptop, **4 GB VRAM** — now genuinely in use (was
+  idle when this section was first written): the dedicated CUDA venv
+  (§5) runs BLIP + DistilBERT on `device="cuda", fp16=True`, and the
+  router itself (below) partially resides in VRAM too. Both draw from
+  the *same* 4 GB pool from two independent processes (Ollama and the
+  Python bridge, which don't coordinate with each other) — this is a
+  real, not yet stress-tested contention risk, not just a budgeting
+  nicety. Whisper turbo fp16 (~1.6 GB) still fits if the router/BLIP
+  aren't both resident at the same moment; SD 1.5 fp16 (~2.5 GB) needs
+  the GPU close to itself.
+- **Router footprint corrected 2026-08-12 (session 5) — this budget was
+  wrong.** The original ~1.8 GB estimate assumed a default-sized context
+  window; fixing the silent-truncation bug (`LOCAL_AI_STATUS.md` Session
+  5) required baking the router's real native context (`num_ctx=40960`)
+  into its Ollama model tag, which is unavoidable — no smaller number
+  works without reintroducing truncation. Measured actual resident cost:
+  **~6.4 GB** (~2.4 GB of which fits this machine's VRAM, the remaining
+  ~4.0 GB in system RAM). Baseline resident set is now qwen3-router:1.7b
+  (~6.4 GB, ~4.0 GB of it system RAM) + all-minilm (~0.1 GB) + idle
+  Python bridge (~0.4 GB) ≈ **~4.5 GB of system RAM**, leaving roughly
+  **~3.5–4.5 GB of system-RAM headroom for on-demand specialists** — a
+  real reduction from the ~5–6 GB this section originally claimed, on
+  top of the new GPU-contention risk above. Budget every future
+  integration against this corrected number, not the original one.
 
 Consequence: **all 25+ models can never be resident at once.** The
 architecture is lazy-load + evict, with Ollama handling its own models
@@ -219,7 +237,11 @@ routing eval before reaching for the next):
    tools + top-k semantically relevant ones. This is RAG-over-tools and
    mirrors the already-proven `embeddingPreFilter.ts` pattern — target
    keeping the visible menu under ~10, where small-model tool selection
-   stays reliable.
+   stays reliable. Once the delegation ledger (§7) has real volume, its
+   past query → tool → outcome record feeds this same ranking as a
+   similarity boost toward tools that succeeded on similar past queries —
+   an externally validated pattern (LLMRouter's KNN routers, see §7), not
+   a new invention, and it reuses the same all-minilm infra.
 4. **Fixed pipeline tools** for known multi-hop flows, so the router makes
    one call: `TranscribeAndSummarize` (VAD → Whisper → router summarizes),
    `DescribeImageFully` (caption + detect + classify → merged report).
@@ -248,13 +270,48 @@ mitigation above — otherwise "did that help" stays a guess.
 - **Image memory** (after Tier B): CLIP-embed images the agent has seen;
   "the screenshot with the red error dialog" becomes a retrieval query.
 - **Delegation ledger** — **moved up from Phase 6 to continuous, starting
-  now** (2026-08-12 revision): log every tool delegation (query → tool
-  chosen → outcome → latency). Two uses: (a) regression data for the eval
-  harness, (b) evidence for tuning routing descriptions/rules. This is the
-  cheap, honest version of "self-improvement" — no fine-tuning fantasy,
-  just measured iteration. It's cheap enough and useful enough to router
-  reliability work (§6) that there's no reason to wait for a later phase —
-  every routing decision made from here on should already be logged.
+  now** (2026-08-12 revision), and confirmed the same day by an
+  external-sources check to be a **validated, named pattern, not
+  homegrown speculation**:
+  [LLMRouter](https://github.com/ulab-uiuc/LLMRouter) ships
+  KNN/similarity routers that log (query, choice made, outcome score,
+  query embedding) per task and route new queries by embedding distance
+  to past successes — local, cheap, and the KNN variant needs no training
+  loop at all (RouteLLM, ICLR 2025, is the academic root). The
+  *tool-selection* variant specifically is validated too:
+  [ToolMem](https://arxiv.org/abs/2510.06664) and
+  [MemToolAgent](https://arxiv.org/abs/2606.07909) both build per-tool
+  experience memories from past interactions and retrieve them at
+  inference to pick tools. So: copy that shape, don't invent one.
+  - **Stage 1 — log-only (continuous from Phase 1; trivial effort).**
+    JSONL append per delegation: timestamp, user query, tool menu
+    actually shown (post-scoping/pre-filter), tool chosen, args-valid
+    flag, outcome (success / wrong-tool / hallucinated-tool /
+    empty-output / fallback — the taxonomy must cover the zero-output
+    failure mode Session 3's routing eval surfaced, not just wrong
+    picks), latency. Uses: (a) regression data for the eval harnesses,
+    (b) evidence for tuning routing descriptions/rules, (c) the
+    accumulated dataset that makes Stage 2 possible at all.
+  - **Stage 2 — similarity reuse (later; only after real volume).**
+    Embed ledger queries with all-minilm (already resident — zero new
+    models), retrieve top-k similar past delegations per new query, and
+    use them as a ranking boost inside the §6.3 semantic pre-filter plus
+    optionally a one-line "a similar past request used X successfully"
+    context hint — LLMRouter's KNN-router shape applied to tools instead
+    of models.
+  - **Scope decisions (explicit, 2026-08-12):** the ledger is the *only*
+    usage-adaptation setup this project builds. No new memory framework —
+    the Mem0-class personalization layer is already covered twice here
+    (mempalace + memdir two-stage retrieval), so nothing from that family
+    gets added. Claude-side self-learning skills
+    (claude-reflect / claude-evolve) are out of scope for this project
+    for now — the adaptation this project needs is routing adaptation,
+    nothing else.
+  This stays the cheap, honest version of "self-improvement" — no
+  fine-tuning fantasy, just measured iteration. It's cheap enough and
+  useful enough to router reliability work (§6) that there's no reason to
+  wait for a later phase — every routing decision made from here on
+  should already be logged.
 
 ## 8. Phases and gates (reordered 2026-08-12 — see revision note at top)
 
@@ -302,6 +359,32 @@ a menu the router already can't reliably pick from), so it's no longer
   first understanding it. See `LOCAL_AI_STATUS.md`'s Session 3 for full
   detail — **this is now the single most important open item in the
   entire plan.**
+  **Update 2026-08-12 (session 5): the zero-output bug is root-caused and
+  fixed.** Root cause: Ollama's default `num_ctx` for `qwen3:1.7b` on this
+  install is 4096 tokens, silently truncating the ~15.6k-token production
+  request (confirmed by direct-to-Ollama request replay outside the app),
+  and the mangled remainder sometimes generates no parseable output at
+  all, sometimes a hallucinated wrong tool. Fixed via a custom Ollama tag
+  (`qwen3-router:1.7b`, `PARAMETER num_ctx 40960` — matching the base
+  model's real native context — plus the already-shipped `think false`)
+  now used as `OPENAI_MODEL` in `.openclaude-profile.json`, paired with
+  matching `OPENAI_CONTEXT_WINDOWS`/`OPENAI_MAX_OUTPUT_TOKENS` entries in
+  `src/utils/model/openaiContextWindows.ts` (both entries are required
+  together — declaring only the context window made the CLI's own
+  auto-compact fire before every routing decision; see that file's
+  comment for the full mechanism). **Routing eval: 35.0% (7/20) → 70.0%
+  (14/20)**, zero silent/zero-token completions remaining. Remaining
+  6/20 failures are a distinct, already-anticipated problem — tool-
+  selection accuracy at ~13 visible tools (3 wrong-tool hallucinations,
+  3 over-delegation on trivial arithmetic/no-tool-needed prompts) — not
+  the zero-output bug. qwen3:4b A/B (mitigation 5) attempted and
+  rejected: on this machine's RTX 3050 4GB VRAM, `qwen3:4b` at 40960
+  context mostly falls back to CPU (~2.3GB of ~9.2GB resident footprint
+  fits in VRAM) and a single routing decision took 3+ minutes with no
+  response yet vs 15-37s for the fixed 1.7b — not viable regardless of
+  any accuracy gain. Full detail in `LOCAL_AI_STATUS.md` Session 5.
+  **Gate still not met** (70% < ~90%) — semantic pre-filtering (mitigation
+  3) remains the recommended next step, now on a clean baseline.
 - **Phase 2 — Finish the platform**: dedicated CUDA venv (confirmed
   2026-08-12 — build it; never touch the Debate venv); migrate BLIP +
   DistilBERT to real GPU device placement in `manager.py` (turning the
@@ -355,9 +438,10 @@ a menu the router already can't reliably pick from), so it's no longer
   spike → wire if transformers supports it; SD 1.5 on GPU; MusicGen last.
   *Gate: TTS round-trip (type → hear) at acceptable latency, or documented
   park decision.*
-- **Continuous, from Phase 1 onward**: delegation ledger, routing tuned
-  from logs, eval suite (both specialist and routing) grows into a real
-  regression harness.
+- **Continuous, from Phase 1 onward**: delegation ledger (§7 — Stage 1
+  log-only starts now; Stage 2 similarity reuse only once real volume
+  exists), routing tuned from logs, eval suite (both specialist and
+  routing) grows into a real regression harness.
 
 ### On fixing pre-existing bugs found along the way
 

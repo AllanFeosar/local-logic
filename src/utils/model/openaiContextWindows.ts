@@ -52,6 +52,38 @@ const OPENAI_CONTEXT_WINDOWS: Record<string, number> = {
   // Ollama local models
   // Llama 3.1+ models support 128k context natively (Meta official specs).
   // Ollama defaults to num_ctx=8192 but users can configure higher values.
+  //
+  // qwen3-router:1.7b (openclaude-main local-AI router, session 4): a custom
+  // `ollama create` tag built from qwen3:1.7b with PARAMETER num_ctx 40960
+  // baked in — matches the base model's real native context_length (see
+  // LOCAL_AI_STATUS.md session 4 for the num_ctx fix itself; confirmed via
+  // `ollama show qwen3:1.7b`). Ollama's bare qwen3:1.7b defaults to
+  // num_ctx=4096 at runtime (confirmed via /api/ps), far smaller than this
+  // project's actual production request (full shared system prompt + ~13
+  // tool defs, ~15.6k tokens), which caused silent prompt truncation and
+  // the router occasionally producing zero-output completions or
+  // hallucinated tool calls.
+  //
+  // Declaring the context window here also requires declaring this model's
+  // max-output-tokens below (OPENAI_MAX_OUTPUT_TOKENS) — leaving that one
+  // undeclared while this one is set is a trap: getModelMaxOutputTokens
+  // (context.ts) then falls through to the generic 32_000 default, and
+  // autoCompact.ts's getEffectiveContextWindowSize() reserves
+  // min(that, 20_000) = 20_000 tokens for compaction output on top of its
+  // own AUTOCOMPACT_BUFFER_TOKENS (13_000) — against a 40_960 window that
+  // leaves under 8k tokens of headroom before auto-compact fires, and
+  // against the 32_768 num_ctx this fix originally shipped with it went
+  // negative, meaning compaction triggered before the router ever got to
+  // make its first routing decision (confirmed live: every routing-eval
+  // case hung on a "compacting" call that itself has to reprocess the same
+  // oversized prompt). A router doing tool dispatch or short direct answers
+  // doesn't need anywhere near 32k output tokens, so 4_096 below is
+  // deliberately generous, not tight — with both entries set,
+  // effectiveContextWindow = 40_960 - 4_096 = 36_864 and autoCompactThreshold
+  // = 36_864 - 13_000 = 23_864, ~8.3k tokens of headroom above the ~15.6k
+  // fixed baseline. Re-verified live after this fix: routing-eval math
+  // cases produce correct native tool_calls with no compaction hang.
+  'qwen3-router:1.7b':         40_960,
   'llama3.3:70b':             128_000,
   'llama3.1:8b':              128_000,
   'llama3.2:3b':              128_000,
@@ -109,6 +141,13 @@ const OPENAI_MAX_OUTPUT_TOKENS: Record<string, number> = {
   'gemini-2.5-flash':         65_536,
 
   // Ollama local models (conservative safe defaults)
+  //
+  // qwen3-router:1.7b: see the matching OPENAI_CONTEXT_WINDOWS entry above —
+  // this entry is required alongside that one, not optional. A tool-dispatch
+  // router doesn't need anywhere near the generic 32_000 default output
+  // budget; 4_096 is deliberately generous for a short tool call or
+  // conversational reply.
+  'qwen3-router:1.7b':          4_096,
   'llama3.3:70b':               4_096,
   'llama3.1:8b':                4_096,
   'llama3.2:3b':                4_096,
