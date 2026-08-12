@@ -94,16 +94,33 @@ manually with a vision-capable frontier model if you want that comparison.
 
 A separate, narrower harness for the Phase 3.5 "Logic Engine" pipeline
 (`LOCAL_AI_MASTER_PLAN.md` §11 / §8): `scripts/eval/deepSolveEval.ts` +
-`deepSolveCases.ts`, `bun run eval:deep-solve`. For each of 6 fixed cases
-(2 easy/regression, 2 medium, 2 deliberately hard — see `deepSolveCases.ts`'s
-own header for why those two specifically), runs **both**
+`deepSolveCases.ts`, `bun run eval:deep-solve`. For each of 11 fixed cases
+(2 easy/regression, 2 medium, 5 deliberately hard — see `deepSolveCases.ts`'s
+own header/per-case description for why each one specifically), runs **both**
 `AskMathModelTool.call({ problem })` (single-shot) and
 `solveDeep(problem, signal, { n })` (the generate→verify→search pipeline)
 against the same ground-truth substrings, so the report is a genuine
-side-by-side rather than two independently-graded runs.
+side-by-side rather than two independently-graded runs. Growing this set
+toward the master plan's own ≥20-problem gate remains open — the 5 "hard"
+additions (Session 13: `deep-7-rate-with-drain`, `deep-8-committee-restriction`,
+`deep-9-collatz-forces-simulation`, and the two pre-existing hard cases) each
+have their ground-truth answer independently computed/verified before being
+written in, not taken from memory — see each case's own `description`.
+
+**`deep-9-collatz-forces-simulation` is expected to route to `'inconclusive'`,
+not `'code-verified'`, and that is the case working correctly, not a
+regression.** It exists specifically because every other "hard" case (Session
+11 found, including the pre-existing "two trains and a bird" one) turned out
+to have a closed-form check that fits Tier 1's restricted grammar, so the
+grammar's own documented "no loops/simulation" cost had never actually been
+observed happening. A Collatz step count has no closed-form formula — only
+step-by-step simulation computes it — which Tier 1's grammar cannot express
+at all, so don't read this case's `'inconclusive'`/best-effort-unverified
+result as DeepSolve failing; it's the one case in this set that's supposed to
+demonstrate the tradeoff rather than get code-verified.
 
 ```sh
-bun run scripts/eval/deepSolveEval.ts                  # n=3 (the shipped default), all 6 cases
+bun run scripts/eval/deepSolveEval.ts                  # n=3 (the shipped default), all 11 cases
 bun run scripts/eval/deepSolveEval.ts --n 2             # fewer candidates, faster run
 bun run scripts/eval/deepSolveEval.ts --case deep-5-modular-exponentiation
 ```
@@ -112,7 +129,7 @@ No `--frontier` flag exists here — the master plan's Phase 3.5 gate is
 explicitly two-part (pipeline vs single-shot locally, *then* a separate
 frontier head-to-head), and this harness only covers the first half.
 DeepSolve's own worst case is roughly N x 1-5 minutes *per case* (more if a
-candidate fails and the one bounded retry fires), so a full 6-case run can
+candidate fails and the one bounded retry fires), so a full 11-case run can
 take a while — this is expected, not a hang, matching the tool's own
 documented latency tradeoff.
 

@@ -258,6 +258,101 @@ hallucinated a call to a nonexistent `"math"` skill instead of the real
 cost** (cheapest/lowest-risk first — try each and re-measure with the
 routing eval before reaching for the next):
 
+**Highest-yield levers (added 2026-08-12, session 13 — every claim below
+verified by fetching the source papers, not just search snippets). These
+are NEW to this list and, by cost, slot in around items 0–1; try them
+before the heavier numbered items. Numbering of 0–6 is left unchanged so
+existing status notes that cite "mitigation 3/5" still resolve.**
+
+- **F. Few-shot examples in the router prompt (cheapest new lever — do
+  first).** A controlled small-model study (Meta-Tool,
+  [arxiv 2604.20148](https://arxiv.org/abs/2604.20148), Llama-3.2-3B
+  backbone across Gorilla APIBench / Spider 2.0 / WebArena / InterCode)
+  ablated the options and measured: **few-shot examples +21.5%,
+  documentation +5.0%, hypernetwork/LoRA-style adaptation +0.0%.**
+  Prompt-only, no new model, and it *beats* the fine-tuning-style approach
+  (our anti-goal anyway, §10). Add 2–3 worked examples to the router's
+  system prompt — one math delegation, one "no tool needed" (targets the
+  over-delegation failures directly), one table→DataAnalyze — and order
+  them least-similar → most-similar to the query to exploit in-context
+  recency bias. Against a 20-point gap this alone may clear the 90% gate.
+- **G. Grammar-constrained tool calls — constrain the tool-call grammar,
+  NEVER layer a response-format schema on top.** Constraining decoding to
+  the *valid tool-call grammar* (valid names + schema-valid args) makes
+  hallucinated-tool and malformed-arg calls — the exact remaining eval
+  failures — literally impossible to emit. Evidence: XGrammar-2
+  ([arxiv 2601.04426](https://arxiv.org/abs/2601.04426)) has **Llama-3.2-3B
+  *constrained* beat Llama-3.1-70B *unconstrained* on BFCL-v3**, at ~6%
+  per-token overhead and ~10 ms schema compile — the project's own "small
+  model punches up via constraints" thesis, applied to routing.
+  **Hard warning, verified against the source — this is the failure result
+  to respect, not a footnote:** do NOT implement this by passing Ollama's
+  `format` / `response_format` JSON-schema *on the same request that has
+  tools enabled*. The "Constraint Tax" study
+  ([arxiv 2606.25605](https://arxiv.org/html/2606.25605v1)) measured that
+  enabling a JSON-schema output constraint together with tools drove tool
+  invocation to **0% across every model from 20B to 397B** (100% schema
+  compliance, 0% tool calls) — the schema FSM masks the `<tool_call>`
+  opening token to −∞, so the model silently stops calling tools while
+  still looking compliant. Correct shape: constrain *within* the native
+  tool-calling path only. If a structured final answer is ever also
+  required, use the paper's two-pass fix (pass 1 = tools, unconstrained by
+  response-format; pass 2 = the schema-constrained reply). A naive
+  single-request `response_format`+tools combo in `openaiShim.ts` will
+  regress routing to zero, not improve it — re-measure after wiring.
+  **Correction (2026-08-12, session 14 — checked directly against Ollama's
+  own source/issue tracker, not just the general XGrammar-2 literature,
+  before implementing anything): "constrain within the native tool-calling
+  path" is not achievable on Ollama as it exists today.** The XGrammar-2
+  benchmark was measured on a direct XGrammar/vLLM-style inference stack,
+  not through Ollama's abstraction layer, and that result does not
+  transfer automatically. Confirmed via three live, first-party Ollama
+  sources (two opened literally days before this check —
+  [#17597](https://github.com/ollama/ollama/issues/17597), 2026-08-07,
+  open; [#17274](https://github.com/ollama/ollama/issues/17274),
+  2026-07-20, open; the original ask
+  [#6002](https://github.com/ollama/ollama/issues/6002), closed
+  2025-02-03 as "completed" but its own closing maintainer comment says
+  only "we're already doing partial JSON *parsing* on the tools output... I'll
+  open something for myself to get to after the new engine work" — i.e.
+  closed as superseded-by-future-work, not as shipped): **Ollama's `tools`
+  path renders tool schemas into the prompt as template text and samples
+  unconstrained — no GBNF/grammar is built from the `tools` array at all.**
+  A maintainer confirmed this directly on #17597 (2026-08-08): *"`tools`
+  path: ... Ollama does not currently construct a corresponding GBNF
+  grammar from the `tools` parameter array, leaving sampling
+  unconstrained,"* contrasted with *"`response_format` path: ... compiles
+  \[the schema\] into a GBNF grammar sampler \[that\] masks out
+  non-matching tokens at the logit sampling level, enforcing 100%
+  compliance"* — confirming the Constraint Tax mechanism above from
+  Ollama's own implementation, and confirming the *only* part of Ollama
+  that is genuinely grammar-constrained today is `response_format`, the
+  very thing G says never to combine with tools. There is no
+  Ollama-exposed way to get real constrained decoding on the `tools` path
+  as of this check.
+  **Revised G — reachable today: make `response_format`, not `tools`, do
+  the constraining.** Don't use Ollama's native tool-calling machinery for
+  the router's tool-*selection* decision at all. Define one JSON Schema
+  representing "which tool (a closed enum of registered tool names, or
+  null for none) with which schema-valid arguments" and send it via
+  `format` (genuinely GBNF-enforced per the maintainer confirmation
+  above), never alongside `tools` on the same request. The client parses
+  the structured JSON response and reconstructs a normal `tool_use` block
+  internally before it re-enters the existing tool-execution/permission
+  pipeline unchanged — same principle as DeepSolve's Tier 1 allowlist
+  grammar (§11): a hallucinated tool name becomes literally inexpressible
+  in the enum, not merely discouraged by a prompt, which is what directly
+  targets the routing eval's 3 wrong-tool-hallucination failures. Real
+  cost/risk, stated up front: this bypasses Ollama's own tool-call
+  template/parsing for the router's first-turn decision specifically, so
+  it needs its own encode/decode layer in `openaiShim.ts`, gated local-only
+  (same `isLocalProviderUrl` pattern as every other local-only change this
+  project has made) so cloud providers and every other model are
+  completely unaffected; needs its own test coverage and a routing-eval
+  re-measurement, not just a plausible design, before being trusted.
+  Sequencing: try F first (cheap, prompt-only); only build this if F alone
+  doesn't clear the 90% gate.
+
 0. **Scope MCP servers out of the local-AI router's profile** (do this
    *first* — zero code changes). Roughly 40 of the ~65 tools are
    mempalace/lmstudio/graphify MCP servers that are your Claude-side
@@ -290,6 +385,15 @@ routing eval before reaching for the next):
    similarity boost toward tools that succeeded on similar past queries —
    an externally validated pattern (LLMRouter's KNN routers, see §7), not
    a new invention, and it reuses the same all-minilm infra.
+   **Build it hybrid, not pure-dense (verified 2026-08-12).** On tool
+   retrieval *specifically*, dense retrievers underperform lexical BM25:
+   ToolRet ([arxiv 2503.01763](https://arxiv.org/abs/2503.01763)) measured
+   BM25 Completeness@10 ≈ 22 vs ColBERT ≈ 19, with *every* retriever under
+   ~35% — tool descriptions are short and keyword-heavy, so lexical overlap
+   matters more than embedding similarity. Combine BM25 + all-minilm
+   (hybrid), don't rely on embeddings alone, and treat pre-filtering as a
+   menu-shrinker (get the visible set under ~10) rather than a selector —
+   retrieval alone will not clear the gate.
 4. **Fixed pipeline tools** for known multi-hop flows, so the router makes
    one call: `TranscribeAndSummarize` (VAD → Whisper → router summarizes),
    `DescribeImageFully` (caption + detect + classify → merged report).
@@ -445,6 +549,60 @@ a menu the router already can't reliably pick from), so it's no longer
   failure modes directly (3 wrong-tool hallucinations, 3 over-delegation
   on trivial/no-tool-needed prompts) rather than menu trimming. Full detail
   in `LOCAL_AI_STATUS.md` Session 7.
+  **Next levers identified 2026-08-12 (session 13), evidence-verified —
+  both target the actual failure modes session 7 isolated, not tool
+  count** (see §6 "Highest-yield levers F/G"): (F) **few-shot examples in
+  the router prompt** — a "no tool needed" example targets the 3
+  over-delegation failures head-on; +21.5% in a controlled small-model
+  ablation, prompt-only, do first; (G) **grammar-constrained tool calls**
+  — makes the 3 wrong-tool hallucinations structurally impossible to emit
+  (a constrained 3B beat an unconstrained 70B on BFCL), with the verified
+  "Constraint Tax" landmine to avoid (never pass a response-format schema
+  on a tools-enabled request — it zeroes tool invocation). These are the
+  first levers that hit the failure modes directly; try F, then G,
+  re-measuring the routing eval after each.
+  **Update 2026-08-13 (session 15, built; session 16, independently
+  verified): F shipped (real gain), G built but regresses and is OFF by
+  default. Gate still not met.** F (`src/services/api/routerFewShot.ts`)
+  landed at **70% → 75-85% across five independent full-eval runs**
+  (four from session 15, one from session 16's own from-scratch
+  re-verification) — a genuine, reproducible improvement, but never
+  reliably ≥90% in any run. Per the plan's own "stop if F alone clears the
+  gate" instruction, it didn't, so G was built next
+  (`src/services/api/routerConstrainedToolSelection.ts`, corrected form —
+  see the "Correction" note directly below lever G above; skips Ollama's
+  native `tools` path entirely in favor of a `response_format`-encoded
+  closed-enum decision, decoded back into a normal `tool_use` block).
+  **G measured a reproducible regression to 35% across two independent
+  full runs** (a real missing-tool-descriptions bug was found and fixed
+  along the way, which fixed `ImageCaption` specifically but didn't move
+  the overall score) — bypassing Ollama's native tool-calling path also
+  bypasses whatever fine-tuned tool-selection judgment the base model has,
+  which grammar constraints alone don't restore (stated as a hypothesis,
+  not fully diagnosed). **Shipped OFF by default**
+  (`OPENCLAUDE_ENABLE_ROUTER_CONSTRAINED_SELECTION`, unset everywhere in
+  this repo, confirmed by session 16) rather than silently becoming the
+  new default — matches this project's own established discipline for a
+  feature that doesn't clear its own bar (see the DeepSolve code-execution
+  mechanism). Session 16 independently re-verified session 15's work start
+  to finish (read both new modules in full, confirmed the gating/fail-open
+  logic, re-ran all tests — 71/71 new + 278/278 scoped — rebuilt, confirmed
+  tsc unchanged at 3521, and ran its own from-scratch live 20-case eval:
+  **75.0% (15/20)**, independently reproducing session 15's reported range)
+  and found zero discrepancies with session 15's report. **Gate still not
+  met** (best single-run result to date: 85% with lever F; ~90% required).
+  Full detail, including an unrelated operational incident found and fixed
+  during session 16's verification (Ollama's generation pipeline had
+  gotten stuck mid-session — metadata endpoints stayed responsive while
+  actual generation hung indefinitely; root-caused and fixed by restarting
+  the Ollama process, not caused by and unrelated to any code from this
+  work), in `LOCAL_AI_STATUS.md` Sessions 15-16. Next steps per session
+  15's own flagged open items: a think-enabled variant of G showed promise
+  on one case but needs its own `stripThinkTrace`-equivalent fix and a full
+  eval run before it can be judged; `math-3` (a 4-digit word problem) has
+  been wrong in literally every configuration tried across every session,
+  suggesting a case-specific issue worth its own investigation separate
+  from the general routing-reliability work.
 - **Phase 2 — Finish the platform**: dedicated CUDA venv (confirmed
   2026-08-12 — build it; never touch the Debate venv); migrate BLIP +
   DistilBERT to real GPU device placement in `manager.py` (turning the
@@ -534,6 +692,17 @@ a menu the router already can't reliably pick from), so it's no longer
   set doesn't exist yet (6 exist), and a 6-case tie isn't evidence either
   way at the scale the gate requires. Gate (2) (frontier head-to-head) not
   attempted, by design (no paid API calls without explicit opt-in).
+  **Update 2026-08-12 (session 13): case set grown 6 → 11** (5 new "hard"
+  cases, each with its ground-truth answer independently computed before
+  being written in — see `deepSolveCases.ts`), still short of the ≥20 gate.
+  One of the 5 (`deep-9-collatz-forces-simulation`) was added specifically
+  to finally exercise Tier 1's documented "no loops/simulation" cost — every
+  prior "hard" case turned out to have a closed-form check, so that real,
+  expected tradeoff had never actually been observed; a Collatz step count
+  has no closed form, so this case is expected to route to `'inconclusive'`
+  by design, not a regression. Gate (1) still not met (11 < 20); not yet
+  re-run live against the grown set as of this note — see
+  `LOCAL_AI_STATUS.md` for whichever session actually ran it.
   **Update 2026-08-12 (session 10): code execution NOT shipped, after
   three independent security-review rounds.** Round 1 found the initial
   regex/substring validator bypassable (fixed with real AST-based static
@@ -635,6 +804,8 @@ destroyed.
 | transformers v5 API breakage (hit twice already) | Concrete model classes, pinned versions, smoke test per model at bridge startup |
 | Venv corruption (happened once) | New dedicated venv; `--no-deps` + exact pins for any addition |
 | Router degrades with tool count | **Materialized, not just a risk anymore** (~65 tools, confirmed hallucinated tool call). MCP-scoping first (free), then tool-name validation, gateways, pre-filter, 4b upgrade — all eval-measured against the new routing eval, §6/§8 |
+| **Constraint-tax tool suppression** (JSON-schema output constraint + tools on one request → 0% tool invocation across 20B–397B; verified [arxiv 2606.25605](https://arxiv.org/html/2606.25605v1)) | Constrain the tool-call grammar only (§6 lever G), never layer `response_format`/`format` on a tools-enabled request; if structured output is also needed use two-pass (tools first, format second) |
+| **Tool retrieval is weak — dense underperforms BM25** (all retrievers <35% Completeness@10; verified [arxiv 2503.01763](https://arxiv.org/abs/2503.01763)) | Build the tool pre-filter hybrid (BM25 + all-minilm), not pure-dense; treat it as a menu-shrinker, never the selector (§6 mitigation 3) |
 | OOM with multiple loaded models | Model manager budget + LRU + heavy-exclusivity before any heavy model is wired |
 | Bun 300s fetch timeout | Always `createCombinedAbortSignal` (never bare `AbortSignal.timeout`) |
 | Stale `dist/` build | `bun run build` after any `src/` change — no exceptions |

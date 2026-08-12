@@ -2217,3 +2217,415 @@ it.
 
 `python-bridge/`, semantic-tool-pre-filter work, the sibling `openclaude`
 repo — none referenced this session.
+
+## Session 15 (2026-08-13, provider-router-agent) — Lever F shipped (real gain, gate not cleared); Lever G built, measured, found to regress accuracy, shipped OFF by default
+
+Picked up `LOCAL_AI_MASTER_PLAN.md` §6's two evidence-cited levers (F, G)
+added by the project owner directly in session 13/14, per that section's own
+sequencing: try F first (cheap, prompt-only); only build G if F alone
+doesn't clear the ≥90% routing-eval gate.
+
+### Lever F — few-shot examples in the router prompt (`src/services/api/routerFewShot.ts`, new)
+
+Three illustrative prior-turn examples (table→`DataAnalyze`, math→
+`AskMathModel`, trivial-math→no-tool-needed with a real answer), shaped as
+real OpenAI-wire-format `user`/`assistant` message pairs (the assistant turn
+uses `tool_calls` for the two delegation examples, plain text for the
+no-tool example) — matching the Meta-Tool ablation's actual "few-shot
+examples" arm, not prose instructions. Ordered `DataAnalyze` → `AskMathModel`
+→ no-tool-needed, with the no-tool example placed last (closest to the real
+conversation) to weight it most via in-context recency bias, since 3 of the
+6 known baseline failures are over-delegation.
+
+Gated via `shouldApplyRouterFewShot(baseUrl, isToolCallRecoveryModel,
+hasTools)` — local-only (`isLocalProviderUrl`) AND tools actually offered
+this turn AND not a tool-call-recovery-listed model (VibeThinker). The
+`hasTools` conjunct is new relative to the existing `think`/
+`reasoning_effort` local-only gate and matters: it's what keeps this from
+firing on a non-tool-selection local call (e.g. a future compaction/
+summarization call reusing the router model) — confirmed via code reading
+that no such call exists today anyway (`AskMathModelTool`/`DocumentQATool`/
+`ImageCaptionTool`/`DataAnalyzeTool` all bypass this shim's
+`beta.messages.create()` entirely for their own specialist calls — see
+`routerFewShot.ts`'s own header comment for the full trace), so this is
+verified defense-in-depth, not a load-bearing distinction today.
+
+Wired into `openaiShim.ts`'s `_doOpenAIRequest` (inserted into `openaiMessages`
+right after the system message, before the real conversation, immediately
+before `body` is constructed — so every downstream consumer sees the same
+augmented list). 12 new tests in `routerFewShot.test.ts` plus 7 regression
+tests added to `openaiShim.test.ts` (gate wiring, insertion point, exclusion
+for recovery models/no-tools/remote URLs).
+
+**Result: 70.0% (14/20) baseline → four full 20-case eval runs at
+80.0%/85.0%/75.0%/75.0% (16, 17, 15, 15 correct)** — average 78.75%, a real,
+reproducible, substantial improvement, but **the ≥90% gate was not reliably
+cleared in any single run**. Per-run failure patterns varied (real model
+sampling variance, not a harness bug — `distractor-3`'s wrong tool changed
+across runs, `distractor-5` flipped between correct/over-delegation/
+run-error) but `math-3` (multi-step 4-digit word problem) was wrong in every
+run regardless of lever — the hardest case in the set across every
+configuration tried this session and in every prior session too (baseline:
+`Grep`; F-only: `DataAnalyze` or `Grep`; see below for G's results on it).
+Per the plan's own instruction ("if this alone reaches ≥90%: stop here"),
+this did not clear the gate, so Lever G was built next.
+
+### Lever G — grammar-constrained tool selection via `response_format` (`src/services/api/routerConstrainedToolSelection.ts`, new)
+
+Built exactly as the master plan's corrected design prescribes: never use
+Ollama's native `tools` path for the router's tool-*selection* decision
+(confirmed via the plan's own research that Ollama's `tools` path is
+genuinely unconstrained — no GBNF grammar built from it). Instead, build one
+JSON Schema — `oneOf` of one branch per registered tool
+(`{tool: <const name>, arguments: <that tool's own sanitized input_schema>}`)
+plus a `{tool: "none", answer: <string>}` branch — and send it via
+`response_format` *instead of* `tools`, never alongside it (empirically
+reconfirmed the "Constraint Tax" landmine live before writing any code: a
+`tools`+`response_format` request against `qwen3-router:1.7b` hung past 40s
+with no output). Decode the resulting JSON defensively
+(`decodeToolDecision`: malformed JSON, non-object response, a tool name
+outside the registered set — defense in depth even though the grammar
+should make this inexpressible — and missing/non-object `arguments` are all
+handled as `{kind:'invalid'}`, never thrown) back into the exact same
+`tool_use`/text content-block shape `_convertNonStreamingResponse` already
+produces, so `toolExecution.ts`/the permission pipeline need zero changes.
+
+**Research performed before writing implementation code** (per the task's
+own instruction to verify technical uncertainty directly rather than
+guess), all against this project's real `qwen3-router:1.7b` tag: confirmed
+live that Ollama's OpenAI-compat `response_format`/`json_schema` genuinely
+supports `oneOf` discriminated unions with `const` discriminators (a 3-branch
+test and a 15-branch scale test — representative of this profile's real
+~13-tool count — both compiled and responded correctly, the 15-branch case
+in 1.66s including compile); confirmed the Constraint Tax finding directly
+(above); confirmed `sideQuery`-style non-streaming callers and the main
+`claude.ts` streaming loop (`stream: true` always, confirmed by reading the
+call site) both need to be served correctly, which is why this module
+always does its own internal non-streaming Ollama call regardless of what
+the caller asked for, then either returns the plain message object or wraps
+it via a new `messageToStreamEvents()` generator (hand-built, not reusing
+`openaiStreamToAnthropic` — deliberately, to avoid touching that sensitive
+shared code path at all) depending on `effectiveParams.stream`.
+
+**Wiring**: intercepts in `OpenAIShimMessages.create()`, *before* the normal
+`_doRequest`/`_doOpenAIRequest` path is invoked — when the gate applies and
+`runRouterConstrainedToolSelection()` succeeds, it fully replaces the normal
+request for that turn (lever F's `tools`-shaped few-shot never even runs,
+since it lives inside `_doOpenAIRequest`); on any failure (network error,
+non-200, malformed JSON, invalid decision) it returns `null` and falls
+through unchanged to the normal path, where F may then apply. Confirmed via
+a dedicated regression test that the returned stream carries the
+`controller` property `claude.ts`'s own stream-vs-error-message check
+depends on (`if (!('controller' in e.value))`).
+
+**Specialist-call scope confirmed unaffected**, per the task's explicit
+request: `AskMathModelTool`/`deepSolve/generateCandidates.ts` fetch
+VibeThinker directly with their own bare completion payload, never through
+`beta.messages.create()`; `DocumentQATool`/`ImageCaptionTool`/
+`DataAnalyzeTool` call the Python bridge over plain HTTP. Neither path is
+reachable from this module. The `isToolCallRecoveryModel` exclusion is
+defense in depth on top of that, verified the same way as F's.
+
+### A real bug found and fixed during development: missing tool descriptions
+
+First live full-eval run (`reports/after-lever-g-run1/`) scored **35.0%
+(7/20) — a regression against both the untouched 70% baseline and lever F's
+~79% average.** Investigated rather than shipped blind (per this project's
+own established discipline for this exact kind of surprising result):
+captured the actual raw model output for a failing `ImageCaption` case via
+temporary debug logging and found the model fabricating a plausible-sounding
+but entirely made-up image description instead of delegating, because
+**`buildToolDecisionSchema()` only ever encoded tool *names* and *argument
+shapes* — never each tool's actual `description` text.** Native `tools`-based
+calling gets a model's fine-tuned tool-awareness "for free" via Ollama's own
+chat-template rendering of each tool's description; this module's raw JSON
+Schema has no natural place for that, so without deliberately adding it back
+the model had zero semantic information about what `ImageCaption` or
+`DataAnalyze` even do. Fixed: `buildToolCatalogText()` +
+`appendToolCatalogToSystemMessage()`, appending a plain-text "available
+tools" catalog (name + real description) to the system message. Verified
+live on the exact failing case (ImageCaption correctly delegated afterward,
+confirmed via the same debug capture) before re-running the full eval.
+
+**Second full eval run (`reports/after-lever-g-run2/`) also scored 35.0%
+(7/20)** — the catalog fix genuinely fixed `ImageCaption` (5/5 correct, up
+from 0/5) but the *docqa* category went the opposite direction (0/5, all
+mis-routed to `DataAnalyze` — up from 1/5 wrong in run 1) and the *math*
+category also went fully wrong (0/5, all self-computed "none" instead of
+delegating — up from 0/5 already-wrong-but-differently in run 1). Net score
+unchanged, failure distribution shifted. This is a genuine, reproducible
+negative result across two independent full runs, not a shallow bug —
+documented honestly rather than glossed over, matching this project's own
+established practice for surprising findings (see the DeepSolve
+code-execution sessions).
+
+**One more experiment tried, not shipped**: temporarily allowing the
+constrained-selection call to reason (`think`/`reasoning_effort` left
+unset instead of forced `none`) fixed the specific failing `docqa-5` case
+live (correct `DocumentQA` call, tool executed, correct 0.98-confidence
+answer) but at 3-4x latency cost (85.7s vs ~15-25s) and surfaced a **new**
+bug — a leaked `</think>` tag prefix in the decoded `answer` text for the
+no-tool case (this module doesn't currently reuse
+`AskMathModelTool/thinkTrace.ts`'s `stripThinkTrace`, unlike the paths that
+already need it). `math-3` was still wrong even with reasoning enabled.
+Not pursued further within this session's time budget — flagged as a
+concrete, partially-promising direction for whoever picks this up next
+(see "Open items" below), not silently dropped.
+
+**Root-cause hypothesis, stated as a hypothesis, not a proven fact**: bypassing
+Ollama's native `tools` decoding path for `response_format` also bypasses
+whatever fine-tuned "should I call a tool at all, and which one" judgment
+the base model learned specifically for native tool-calling — grammar
+constraints make an invalid tool *name* structurally inexpressible, but they
+don't restore that judgment, and a raw JSON-schema decision with
+`reasoning_effort: 'none'` gives the model no room to weigh several
+paragraph-length tool descriptions against each other before committing.
+This is a real gap in the master plan's own evidence base: the cited
+XGrammar-2 result (constrained 3B beats unconstrained 70B on BFCL) measured
+constraining *within* the native tool-calling grammar on a direct
+XGrammar/vLLM stack — a fundamentally different mechanism from replacing
+`tools` with `response_format` entirely, which is the only thing Ollama
+actually exposes. Not fully diagnosed to the last detail (a controlled
+ablation isolating "no descriptions" vs "no few-shot" vs "no reasoning" as
+independent variables would take another session), but not needed to reach
+the practical decision below.
+
+### Decision: Lever G shipped, but OFF by default
+
+Given two independent full-eval measurements both landed at 35% — a clear
+regression versus both the 70% baseline and F's ~79% average — leaving this
+wired as the default behavior for the `ollama` profile the moment it's
+built would make things *worse* than what a user already has today. Matches
+this project's own established discipline for a feature that doesn't clear
+its own bar (see the DeepSolve code-execution mechanism: "built and
+tested... does not declare itself safe... nothing wired into any
+default/always-visible path"). Concretely: `shouldApplyRouterConstrainedSelection()`
+now takes a 4th parameter, `enabled`, and requires
+`OPENCLAUDE_ENABLE_ROUTER_CONSTRAINED_SELECTION` to be explicitly truthy on
+top of every other conjunct (`openaiShim.ts`'s `create()` computes it via
+`isEnvTruthy(process.env.OPENCLAUDE_ENABLE_ROUTER_CONSTRAINED_SELECTION)`,
+matching this project's existing `OPENCLAUDE_DISABLED_MCP_SERVERS` naming
+convention). **Not set in `.openclaude-profile.json`** — left for the
+project owner to flip on deliberately if they want to keep experimenting
+(e.g. against a larger/different router model, or after finishing the
+think-enabled variant), not silently active. The module itself is fully
+built, wired, and tested — nothing was deleted or left half-working, matching
+this project's own "flag the tradeoffs honestly, don't force a decision
+under time pressure" precedent.
+
+**Final default-shipped-state re-verification** (G off, matching what
+actually ships): re-ran the full 20-case eval once more with the
+opt-in unset — **75.0% (15/20)**, squarely inside lever F's already-measured
+75-85% range, confirming G being off doesn't regress anything and the
+shipped default state is exactly "lever F alone."
+
+### Tests
+
+`routerFewShot.test.ts` (15 tests, encode/insertion logic in isolation),
+`routerConstrainedToolSelection.test.ts` (40 tests: gate function including
+the off-by-default conjunct, `buildToolDecisionSchema` encode direction —
+including the empty-tools/no-input-schema/incompatible-keyword-stripping
+edge cases, `decodeToolDecision` decode direction — including every edge
+case the task explicitly called out: malformed JSON, a JSON array/primitive
+instead of an object, a tool name outside the registered set, missing/
+non-object `arguments`, empty input, `messageToStreamEvents` for both
+`tool_use` and plain-text/empty-content messages, and
+`runRouterConstrainedToolSelection` orchestration against a mocked `fetch`
+covering success, every documented fail-open path, the tool-catalog
+regression test, and confirming `tools`/`tool_choice` are never sent
+alongside `response_format`), plus regression tests added to
+`openaiShim.test.ts` (11 new tests: F's wiring, G's off-by-default
+behavior, G's stream:true/stream:false wiring when explicitly enabled, and
+G's fail-then-fallback path with per-request body assertions).
+
+Scoped self-verification (`bun test src/tools src/services/tools src/bridge
+src/utils/promptShellExecution.test.ts src/utils/ripgrep.test.ts
+src/memdir --path-ignore-patterns='**/*.live.test.ts'`): **278/278 pass**,
+0 fail, across 24 files. Provider-router-agent's own designated check
+(`bun run test:provider` 164/164, `bun run test:provider-recommendation`
+41/41, plus the wider `bun test src/services/mcp src/services/oauth
+src/services/github src/memdir src/upstreamproxy
+src/services/remoteAgentService.test.ts src/utils/context.test.ts
+src/utils/sessionStorage.test.ts src/utils/conversationRecovery.test.ts
+src/utils/conversationRecovery.hooks.test.ts src/utils/toolResultStorage.test.ts
+src/utils/githubModelsCredentials.test.ts
+src/utils/githubModelsCredentials.hydrate.test.ts src/utils/buildConfig.test.ts
+src/utils/model/providers.test.ts`): 82/84, the exact 2 pre-existing
+`remoteAgentService.test.ts` vitest/bun-mocking-gap failures documented
+since Session 3, unrelated to this session (same file, same failure class,
+confirmed by re-reading that session's own diagnosis rather than assuming).
+`npx tsc --noEmit`: **3521 errors — exactly matching the documented
+baseline, zero new** (confirmed repeatedly through several rounds of
+edits, not just once). `bun run build`: clean every time; confirmed both
+`routerFewShot`/`routerConstrainedToolSelection` markers and the
+`OPENCLAUDE_ENABLE_ROUTER_CONSTRAINED_SELECTION` gate string are present in
+the compiled `dist/cli.mjs`.
+
+### Open items for next session
+
+- Lever G's think-enabled variant is a concrete, partially-promising
+  unfinished direction: fixed the one case it was tried on live, but needs
+  (a) `stripThinkTrace` (or equivalent) applied to the decoded `answer`
+  field before it reaches the user, (b) a full eval run to see whether the
+  latency cost (3-4x) is worth whatever accuracy gain it nets across all 20
+  cases rather than the one case tested, and (c) a decision on whether it's
+  a fixed always-on behavior for G or its own separate opt-in.
+- A controlled ablation isolating G's three additive pieces (tool
+  descriptions / few-shot examples / reasoning on-or-off) as independent
+  variables would properly diagnose why G underperforms instead of the
+  hypothesis-stated-as-hypothesis above — not done this session (time
+  budget), flagged as the honest next step rather than a guess dressed up
+  as a finding.
+- `math-3` (the 4-digit-ticket-sum word problem) was wrong in literally
+  every configuration tried across this session and prior sessions
+  (baseline, F-only ×4, G ×2) — worth a dedicated look at why this specific
+  case is so much harder than the other math cases for this model, separate
+  from the general routing-reliability work.
+- The ≥90% Phase-1 gate is still not met (best single-run result to date:
+  85% with lever F). Next levers per `LOCAL_AI_MASTER_PLAN.md` §6 that
+  haven't been tried: the qwen3:4b-instruct path is closed (Session 5,
+  hardware-rejected on this machine), but nothing rules out revisiting with
+  different hardware; the think-enabled G variant above; or a genuinely
+  different mechanism not yet in the plan.
+
+### Not touched, per scope
+
+`python-bridge/`, the sibling `openclaude` repo — neither referenced this
+session. `LOCAL_AI_MASTER_PLAN.md`'s and `scripts/eval/deepSolveCases.ts`/
+`scripts/eval/README.md`'s uncommitted working-tree changes predate this
+session (confirmed via `git diff` before starting — this session only ever
+read `LOCAL_AI_MASTER_PLAN.md`, never wrote to it) and were left exactly as
+found.
+
+## Session 16 (2026-08-13, orchestrating session) — Session 15 independently re-verified, zero discrepancies; unrelated Ollama stuck-service incident found and fixed during verification
+
+Picked up immediately after session 15's completion notification, matching
+this project's established discipline for every prior round of this kind of
+work: personally verify a building agent's report before trusting it, rather
+than relaying its claims.
+
+### Verification performed
+
+- Read both new modules in full (`routerFewShot.ts`, 169 lines;
+  `routerConstrainedToolSelection.ts`, 671 lines) and the full diff of
+  `openaiShim.ts` (90 lines changed) and confirmed directly: both gate
+  functions match the established `isLocalProviderUrl`-based,
+  gate-function-plus-apply-function shape (`toolPreFilter.ts`'s own
+  convention); G's fail-open discipline is real (every failure mode —
+  network error, non-200, malformed JSON, an invalid decision — returns
+  `null` and falls through to the unchanged normal path, never throws);
+  `decodeToolDecision` re-validates the tool name against the registered
+  set even though the grammar should already guarantee it, matching this
+  project's established "don't trust even a constrained mechanism blindly"
+  discipline (`deepSolve/restrictedEvaluator.ts`, §11); the few-shot table
+  example's argument shape (`operation: 'question'`, `table: {columns,
+  rows}`, `question`) matches `DataAnalyzeTool`'s real
+  `questionSchema` exactly, confirmed by reading `schemas.ts` directly, not
+  assumed.
+- Confirmed `OPENCLAUDE_ENABLE_ROUTER_CONSTRAINED_SELECTION` is genuinely
+  unset anywhere in this repo (`.env`, `.openclaude-profile.json`,
+  `package.json` all checked directly) and that `isEnvTruthy` (from
+  `src/utils/envUtils.ts`, the function `openaiShim.ts` actually imports —
+  confirmed by checking the import, not assuming which of this codebase's
+  three same-named helper functions was used) returns `false` for
+  `undefined`, so G is genuinely inert in the shipped state.
+- Investigated the flagged "think-trace-leak bug" specifically before
+  accepting session 15's claim that it's not currently reachable: confirmed
+  the shipped `routerConstrainedToolSelection.ts` hardcodes `think: false,
+  reasoning_effort: 'none'` unconditionally — the leak was only ever
+  produced by a temporary, unshipped experimental edit (reasoning left on)
+  that session 15 tried live and did not commit. Not reachable in the
+  actual diff being verified.
+- Re-ran the new test files directly: **71/71 pass** (`routerFewShot.test.ts`
+  + `routerConstrainedToolSelection.test.ts` + `openaiShim.test.ts`
+  together). Re-ran the scoped self-verification suite: **278/278 pass**,
+  matching session 15's own reported count exactly. Rebuilt
+  (`bun run build`: clean) and re-checked `npx tsc --noEmit`: **3521,
+  unchanged**. Spot-checked the new regression tests' actual content (not
+  just their pass/fail count) for the `controller`-property stream check
+  and the off-by-default test — both present and asserting what session
+  15's report claimed.
+
+### Independent live routing-eval re-verification — and an unrelated operational incident found along the way
+
+First live re-run (nothing else running concurrently) produced a deeply
+suspicious pattern: 11 cases succeeded normally, then the remaining 9 (every
+case from `routing-caption-2` onward) failed identically at the exact 45s
+timeout ceiling. A second immediate re-run was worse: **all 20 cases**
+timed out identically from the very first case. This did not look like a
+real accuracy signal (a genuine router failure wouldn't produce byte-
+identical 45.0xx-second timeouts case after case) — investigated rather
+than reported blind, matching this project's own standing discipline for
+a surprising result.
+
+**Root cause, confirmed step by step, not assumed:**
+1. `ollama ps`/`ollama api/tags` responded fine (Ollama's lightweight
+   metadata endpoints were healthy), but a bare `curl` directly to
+   `/api/chat` — no CLI, no tools, no few-shot, none of this session's or
+   session 15's code involved at all — hung for a full 90 seconds with zero
+   response. This conclusively ruled out anything from today's work as the
+   cause before touching any Ollama process: the generation pipeline itself
+   had gotten stuck while the HTTP server around it stayed up.
+2. Restarted Ollama (`taskkill` both `ollama.exe` and `ollama app.exe`,
+   relaunched). The GUI-wrapped `ollama app.exe` failed to bring its own
+   server subprocess up cleanly when launched from this non-interactive
+   shell ("ollama server not ready after retries") — worked around by
+   launching `ollama.exe serve` directly instead.
+3. That fresh server reported `{"models":[]}` and `"total blobs: 0"` —
+   alarming at first glance, but verified (before concluding anything about
+   data loss) that this project's models live at a **non-default path**
+   (`C:\Users\allge\AI Models`, not the default `~/.ollama/models` — per
+   this session's own persistent memory note) which the manually-launched
+   server hadn't been pointed at. Confirmed all 20 blobs and every expected
+   manifest (`qwen3-router:1.7b`, `qwen3:4b`, `qwen3:1.7b`, `all-minilm`,
+   the Qwen3-Reranker and VibeThinker GGUF pulls) were fully intact on disk
+   at that path before doing anything further — **no data was lost**, this
+   was purely a matter of which path the freshly-launched process was told
+   to scan.
+4. Relaunched with `OLLAMA_MODELS` set explicitly to the correct path — all
+   6 models reappeared immediately. A first post-restart generation request
+   still needed ~21s just for `llama-server`'s own cold-start (confirmed via
+   the server's own log, not guessed) before a 30s client timeout was long
+   enough; a second request against the now-warm runner completed correctly
+   in ~21s total with a normal, correct answer ("5 + 3 = 8").
+
+**Operational note for future sessions** (the actual, useful takeaway,
+recorded so this doesn't need re-diagnosing next time): if Ollama's
+metadata endpoints (`/api/tags`, `/api/ps`) respond but real generation
+requests hang indefinitely, this is a known failure mode on this machine —
+restart via `ollama.exe serve` directly (not the `app.exe` GUI wrapper,
+which does not reliably bring its server subprocess up when launched from
+a non-interactive/background shell) with `OLLAMA_MODELS="C:\Users\allge\AI
+Models"` set explicitly (the non-default model path this project actually
+uses), and budget ~20s for the first request after restart before
+concluding it's still broken.
+
+**With Ollama healthy again, a clean full 20-case run scored 15/20
+(75.0%)** — independently reproducing session 15's own reported 75-85%
+range almost exactly (one case, `routing-math-1`, still hit a run-error,
+plausibly residual cold-start slowness immediately after the restart,
+consistent with the ~20s-cold-start finding above; every other case behaved
+normally). This is treated as the trustworthy confirmation number, not the
+two contaminated runs before it, which are not representative of the
+router's real behavior and are disregarded rather than reported.
+
+### Verdict
+
+Zero discrepancies found between session 15's report and this session's
+independent verification, across code review, test re-execution, build/tsc,
+and a from-scratch live eval run. Session 15's work is confirmed accurate
+and safe to commit as reported: lever F shipped and active (real,
+reproducible ~5-15 point gain), lever G built, tested, and correctly gated
+off by default after a measured regression. `LOCAL_AI_MASTER_PLAN.md`
+Phase 1's status updated to match. Not a security-sensitive surface per
+`.claude/hooks/security-gate.ps1`'s own path pattern (`src/services/api/`
+isn't in it — consistent with sessions 5 and 7's earlier `openaiShim.ts`/
+`claude.ts` changes, neither of which needed a security-audit-agent pass
+either), so no audit dispatched; verification here was code review + live
+measurement, matching what this exact class of change has always required
+in this project.
+
+### Not touched, per scope
+
+`python-bridge/`, the sibling `openclaude` repo, Tier 2 (DeepSolve's
+deferred code-execution isolation) — none referenced this session.

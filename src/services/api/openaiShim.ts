@@ -38,6 +38,16 @@ import {
   resolveCodexApiCredentials,
   resolveProviderRequest,
 } from './providerConfig.js'
+import {
+  insertRouterFewShotMessages,
+  shouldApplyRouterFewShot,
+} from './routerFewShot.js'
+import {
+  messageToStreamEvents,
+  runRouterConstrainedToolSelection,
+  shouldApplyRouterConstrainedSelection,
+  type RouterToolDefinition,
+} from './routerConstrainedToolSelection.js'
 import { recoverToolCallFromText } from './toolCallRecovery.js'
 import { createCombinedAbortSignal } from '../../utils/combinedAbortSignal.js'
 
@@ -102,7 +112,7 @@ function sleepMs(ms: number): Promise<void> {
 // Message format conversion: Anthropic → OpenAI
 // ---------------------------------------------------------------------------
 
-interface OpenAIMessage {
+export interface OpenAIMessage {
   role: 'system' | 'user' | 'assistant' | 'tool'
   content?: string | Array<{ type: string; text?: string; image_url?: { url: string } }>
   tool_calls?: Array<{
@@ -190,7 +200,7 @@ function convertContentBlocks(
   return parts
 }
 
-function convertMessages(
+export function convertMessages(
   messages: Array<{ role: string; message?: { role?: string; content?: unknown }; content?: unknown }>,
   system: unknown,
 ): OpenAIMessage[] {
@@ -747,6 +757,59 @@ class OpenAIShimMessages {
         ? { ...params, stream: false }
         : params
 
+      // Grammar-constrained router tool selection (LOCAL_AI_MASTER_PLAN.md
+      // §6 lever G) — see routerConstrainedToolSelection.ts's own header
+      // comment for the full rationale, gating, and fail-open discipline.
+      // Checked before the normal tools-based request is built: when it
+      // applies and succeeds, it REPLACES that request entirely for this
+      // turn (never runs alongside `tools` — see that module's "Constraint
+      // Tax" comment for why). On any failure it returns null and this
+      // falls through to the unchanged normal path below, where lever F's
+      // few-shot addendum (routerFewShot.ts) may then apply.
+      //
+      // OFF BY DEFAULT (OPENCLAUDE_ENABLE_ROUTER_CONSTRAINED_SELECTION):
+      // live routing-eval measurement found this regresses accuracy versus
+      // both the untouched baseline and lever F alone — see
+      // routerConstrainedToolSelection.ts's own header comment ("Off by
+      // default, not just local-only") and LOCAL_AI_STATUS.md's session
+      // notes for the full numbers and root-cause discussion. Built,
+      // wired, and tested, but must not silently become the new default
+      // behavior for the local `ollama` profile.
+      const hasToolsThisTurn =
+        Array.isArray(effectiveParams.tools) && effectiveParams.tools.length > 0
+      if (
+        shouldApplyRouterConstrainedSelection(
+          request.baseUrl,
+          needsToolCallRecovery,
+          hasToolsThisTurn,
+          isEnvTruthy(process.env.OPENCLAUDE_ENABLE_ROUTER_CONSTRAINED_SELECTION),
+        )
+      ) {
+        const constrained = await runRouterConstrainedToolSelection({
+          baseUrl: request.baseUrl,
+          resolvedModel: request.resolvedModel,
+          messages: effectiveParams.messages as Array<{
+            role: string
+            message?: { role?: string; content?: unknown }
+            content?: unknown
+          }>,
+          system: effectiveParams.system,
+          tools: (effectiveParams.tools ?? []) as unknown as RouterToolDefinition[],
+          max_tokens: effectiveParams.max_tokens,
+          temperature: effectiveParams.temperature,
+          top_p: effectiveParams.top_p,
+          apiKey: self.providerOverride?.apiKey ?? process.env.OPENAI_API_KEY ?? '',
+          extraHeaders: { ...self.defaultHeaders, ...(options?.headers ?? {}) },
+          signal: options?.signal,
+        })
+        if (constrained) {
+          return effectiveParams.stream
+            ? new OpenAIShimStream(messageToStreamEvents(constrained.message))
+            : constrained.message
+        }
+        // Fails open — fall through to the normal tools-based path below.
+      }
+
       // Bun's fetch() imposes a hardcoded 300s timeout absent an explicit
       // signal (see TOOL_CALL_RECOVERY_TIMEOUT_MS above) — override it for
       // these known-slow models while still honoring the caller's own
@@ -859,7 +922,7 @@ class OpenAIShimMessages {
     params: ShimCreateParams,
     options?: { signal?: AbortSignal; headers?: Record<string, string> },
   ): Promise<Response> {
-    const openaiMessages = convertMessages(
+    let openaiMessages = convertMessages(
       params.messages as Array<{
         role: string
         message?: { role?: string; content?: unknown }
@@ -868,16 +931,29 @@ class OpenAIShimMessages {
       params.system,
     )
 
+    const isToolCallRecoveryModel = modelNeedsToolCallRecovery(
+      request.resolvedModel,
+    )
+    const hasTools = Array.isArray(params.tools) && params.tools.length > 0
+
+    // Router few-shot tool-selection examples (LOCAL_AI_MASTER_PLAN.md §6
+    // lever F) — see routerFewShot.ts's own header comment for the full
+    // rationale and gating. Applied before `body.messages` is set below so
+    // every downstream consumer of `openaiMessages` (the actual request,
+    // dumpPrompts logging, etc.) sees the same augmented list consistently.
+    if (
+      shouldApplyRouterFewShot(request.baseUrl, isToolCallRecoveryModel, hasTools)
+    ) {
+      openaiMessages = insertRouterFewShotMessages(openaiMessages)
+    }
+
     const body: Record<string, unknown> = {
       model: request.resolvedModel,
       messages: openaiMessages,
       stream: params.stream ?? false,
     }
 
-    if (
-      isLocalProviderUrl(request.baseUrl) &&
-      !modelNeedsToolCallRecovery(request.resolvedModel)
-    ) {
+    if (isLocalProviderUrl(request.baseUrl) && !isToolCallRecoveryModel) {
       // The router model (e.g. qwen3) is meant to be a fast, reliable tool
       // caller — deep reasoning belongs to delegated specialist tools
       // (AskMathModel, etc.), not the router itself. Also fixes a real bug:

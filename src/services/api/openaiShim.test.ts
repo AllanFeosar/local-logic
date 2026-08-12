@@ -6,6 +6,8 @@ type FetchType = typeof globalThis.fetch
 const originalEnv = {
   OPENAI_BASE_URL: process.env.OPENAI_BASE_URL,
   OPENAI_API_KEY: process.env.OPENAI_API_KEY,
+  OPENCLAUDE_ENABLE_ROUTER_CONSTRAINED_SELECTION:
+    process.env.OPENCLAUDE_ENABLE_ROUTER_CONSTRAINED_SELECTION,
 }
 
 const originalFetch = globalThis.fetch
@@ -57,6 +59,12 @@ beforeEach(() => {
 afterEach(() => {
   process.env.OPENAI_BASE_URL = originalEnv.OPENAI_BASE_URL
   process.env.OPENAI_API_KEY = originalEnv.OPENAI_API_KEY
+  if (originalEnv.OPENCLAUDE_ENABLE_ROUTER_CONSTRAINED_SELECTION === undefined) {
+    delete process.env.OPENCLAUDE_ENABLE_ROUTER_CONSTRAINED_SELECTION
+  } else {
+    process.env.OPENCLAUDE_ENABLE_ROUTER_CONSTRAINED_SELECTION =
+      originalEnv.OPENCLAUDE_ENABLE_ROUTER_CONSTRAINED_SELECTION
+  }
   globalThis.fetch = originalFetch
 })
 
@@ -469,4 +477,288 @@ test('does not send think/reasoning_effort for a tool-call-recovery-listed model
 
   expect(requestBody).not.toHaveProperty('think')
   expect(requestBody).not.toHaveProperty('reasoning_effort')
+})
+
+// Regression tests for the router few-shot addendum (routerFewShot.ts,
+// LOCAL_AI_MASTER_PLAN.md §6 lever F) — routerFewShot.test.ts covers the
+// module's own logic in isolation; these confirm the wiring inside
+// _doOpenAIRequest actually fires (and doesn't fire) under the right
+// conditions, matching the same local-URL/tool-call-recovery/tools-present
+// gate this test suite already uses for the think/reasoning_effort feature
+// above.
+const FEWSHOT_TOOLS = [
+  {
+    name: 'AskMathModel',
+    description: 'Delegate a math problem to a specialist model',
+    input_schema: { type: 'object', properties: { problem: { type: 'string' } } },
+  },
+]
+
+test('inserts the router few-shot examples for a local URL, non-recovery model, with tools present', async () => {
+  process.env.OPENAI_BASE_URL = 'http://localhost:11434/v1'
+  let requestBody: Record<string, unknown> | undefined
+  globalThis.fetch = mockSimpleChatCompletion(body => {
+    requestBody = body
+  })
+
+  const client = createOpenAIShimClient({}) as OpenAIShimClient
+  await client.beta.messages.create({
+    model: 'qwen3-router:1.7b',
+    system: 'test system',
+    messages: [{ role: 'user', content: '12 x 7' }],
+    tools: FEWSHOT_TOOLS,
+    max_tokens: 64,
+    stream: false,
+  })
+
+  const messages = requestBody?.messages as Array<Record<string, unknown>>
+  // system + 6 few-shot messages + the real user turn = 8
+  expect(messages).toHaveLength(8)
+  expect(messages[0]?.role).toBe('system')
+  expect(messages[1]?.role).toBe('user') // first few-shot example
+  expect(messages.at(-1)).toEqual({ role: 'user', content: '12 x 7' })
+})
+
+test('does not insert router few-shot examples when no tools are offered this turn', async () => {
+  process.env.OPENAI_BASE_URL = 'http://localhost:11434/v1'
+  let requestBody: Record<string, unknown> | undefined
+  globalThis.fetch = mockSimpleChatCompletion(body => {
+    requestBody = body
+  })
+
+  const client = createOpenAIShimClient({}) as OpenAIShimClient
+  await client.beta.messages.create({
+    model: 'qwen3-router:1.7b',
+    system: 'test system',
+    messages: [{ role: 'user', content: '12 x 7' }],
+    max_tokens: 64,
+    stream: false,
+  })
+
+  const messages = requestBody?.messages as Array<Record<string, unknown>>
+  expect(messages).toHaveLength(2) // system + the real user turn only
+})
+
+test('does not insert router few-shot examples for a remote/cloud URL even with tools present', async () => {
+  process.env.OPENAI_BASE_URL = 'https://api.openai.com/v1'
+  let requestBody: Record<string, unknown> | undefined
+  globalThis.fetch = mockSimpleChatCompletion(body => {
+    requestBody = body
+  })
+
+  const client = createOpenAIShimClient({}) as OpenAIShimClient
+  await client.beta.messages.create({
+    model: 'gpt-4o',
+    system: 'test system',
+    messages: [{ role: 'user', content: '12 x 7' }],
+    tools: FEWSHOT_TOOLS,
+    max_tokens: 64,
+    stream: false,
+  })
+
+  const messages = requestBody?.messages as Array<Record<string, unknown>>
+  expect(messages).toHaveLength(2)
+})
+
+test('does not insert router few-shot examples for a tool-call-recovery-listed model even on a local URL with tools present', async () => {
+  process.env.OPENAI_BASE_URL = 'http://localhost:11434/v1'
+  let requestBody: Record<string, unknown> | undefined
+  globalThis.fetch = mockSimpleChatCompletion(body => {
+    requestBody = body
+  })
+
+  const client = createOpenAIShimClient({}) as OpenAIShimClient
+  await client.beta.messages.create({
+    model: 'hf.co/mradermacher/VibeThinker-3B-GGUF:Q4_K_M',
+    system: 'test system',
+    messages: [{ role: 'user', content: 'solve for x' }],
+    tools: FEWSHOT_TOOLS,
+    max_tokens: 64,
+    stream: false,
+  })
+
+  const messages = requestBody?.messages as Array<Record<string, unknown>>
+  expect(messages).toHaveLength(2)
+})
+
+// Regression tests for grammar-constrained router tool selection
+// (routerConstrainedToolSelection.ts, LOCAL_AI_MASTER_PLAN.md §6 lever G) —
+// routerConstrainedToolSelection.test.ts covers the module's own
+// encode/decode/orchestration logic in isolation; these confirm the wiring
+// inside create() actually intercepts before the normal tools-based
+// request, in both shapes callers can ask for (streaming and
+// non-streaming), and that a failure genuinely falls back to the normal
+// path rather than surfacing a broken result.
+function mockRouterDecisionAwareFetch(
+  onRequest: (body: Record<string, unknown>) => void,
+): FetchType {
+  return (async (_input, init) => {
+    const body = JSON.parse(String(init?.body)) as Record<string, unknown>
+    onRequest(body)
+
+    if (body.response_format) {
+      // The lever-G constrained-selection request.
+      return new Response(
+        JSON.stringify({
+          id: 'chatcmpl-g',
+          model: 'qwen3-router:1.7b',
+          choices: [
+            {
+              message: {
+                role: 'assistant',
+                content: JSON.stringify({
+                  tool: 'AskMathModel',
+                  arguments: { problem: '734 x 851' },
+                }),
+              },
+              finish_reason: 'stop',
+            },
+          ],
+          usage: { prompt_tokens: 20, completion_tokens: 5, total_tokens: 25 },
+        }),
+        { headers: { 'Content-Type': 'application/json' } },
+      )
+    }
+
+    // The normal tools-based request (used only as a fallback in these tests).
+    return new Response(
+      JSON.stringify({
+        id: 'chatcmpl-normal',
+        model: 'qwen3-router:1.7b',
+        choices: [{ message: { role: 'assistant', content: 'fallback text' }, finish_reason: 'stop' }],
+        usage: { prompt_tokens: 5, completion_tokens: 1, total_tokens: 6 },
+      }),
+      { headers: { 'Content-Type': 'application/json' } },
+    )
+  }) as FetchType
+}
+
+test('is off by default: create() does NOT attempt constrained selection even when every other gate condition is met, without the explicit opt-in env var', async () => {
+  process.env.OPENAI_BASE_URL = 'http://localhost:11434/v1'
+  delete process.env.OPENCLAUDE_ENABLE_ROUTER_CONSTRAINED_SELECTION
+  let requestCount = 0
+  globalThis.fetch = mockRouterDecisionAwareFetch(() => {
+    requestCount++
+  })
+
+  const client = createOpenAIShimClient({}) as OpenAIShimClient
+  const result = (await client.beta.messages.create({
+    model: 'qwen3-router:1.7b',
+    system: 'test system',
+    messages: [{ role: 'user', content: 'What is 734 x 851?' }],
+    tools: FEWSHOT_TOOLS,
+    max_tokens: 64,
+    stream: false,
+  })) as { content: Array<Record<string, unknown>> }
+
+  // Went straight to the normal tools-based request (no response_format
+  // attempt first) — the mock's "no response_format" branch returns plain
+  // text, not a tool_use.
+  expect(requestCount).toBe(1)
+  expect(result.content[0]).toEqual({ type: 'text', text: 'fallback text' })
+})
+
+test('create() with stream:false returns the constrained-selection tool_use message directly, without a fallback request, when explicitly enabled', async () => {
+  process.env.OPENAI_BASE_URL = 'http://localhost:11434/v1'
+  process.env.OPENCLAUDE_ENABLE_ROUTER_CONSTRAINED_SELECTION = '1'
+  let requestCount = 0
+  globalThis.fetch = mockRouterDecisionAwareFetch(() => {
+    requestCount++
+  })
+
+  const client = createOpenAIShimClient({}) as OpenAIShimClient
+  const result = (await client.beta.messages.create({
+    model: 'qwen3-router:1.7b',
+    system: 'test system',
+    messages: [{ role: 'user', content: 'What is 734 x 851?' }],
+    tools: FEWSHOT_TOOLS,
+    max_tokens: 64,
+    stream: false,
+  })) as { content: Array<Record<string, unknown>>; stop_reason: string }
+
+  expect(requestCount).toBe(1)
+  expect(result.content[0]?.type).toBe('tool_use')
+  expect(result.content[0]?.name).toBe('AskMathModel')
+  expect(result.content[0]?.input).toEqual({ problem: '734 x 851' })
+  expect(result.stop_reason).toBe('tool_use')
+})
+
+test('create() with stream:true wraps the constrained-selection result in a proper async-iterable stream carrying the tool_use decision, when explicitly enabled', async () => {
+  process.env.OPENAI_BASE_URL = 'http://localhost:11434/v1'
+  process.env.OPENCLAUDE_ENABLE_ROUTER_CONSTRAINED_SELECTION = '1'
+  let requestCount = 0
+  globalThis.fetch = mockRouterDecisionAwareFetch(() => {
+    requestCount++
+  })
+
+  const client = createOpenAIShimClient({}) as OpenAIShimClient
+  const streamResult = (await client.beta.messages.create({
+    model: 'qwen3-router:1.7b',
+    system: 'test system',
+    messages: [{ role: 'user', content: 'What is 734 x 851?' }],
+    tools: FEWSHOT_TOOLS,
+    max_tokens: 64,
+    stream: true,
+  })) as { controller: unknown } & AsyncIterable<Record<string, unknown>>
+
+  // Must carry a `controller` property — claude.ts's own stream-vs-error-message
+  // check (`if (!('controller' in e.value))`) depends on this exact shape.
+  expect(streamResult).toHaveProperty('controller')
+
+  const events: Array<Record<string, unknown>> = []
+  for await (const event of streamResult) events.push(event)
+
+  expect(requestCount).toBe(1)
+  expect(events[0]?.type).toBe('message_start')
+  const toolStart = events.find(
+    e => e.type === 'content_block_start' && (e.content_block as { type?: string })?.type === 'tool_use',
+  )
+  expect((toolStart?.content_block as { name?: string })?.name).toBe('AskMathModel')
+  const delta = events.find(e => e.type === 'content_block_delta')
+  expect(JSON.parse((delta?.delta as { partial_json: string }).partial_json)).toEqual({
+    problem: '734 x 851',
+  })
+  expect(events.at(-1)?.type).toBe('message_stop')
+})
+
+test('falls back to the normal tools-based request when the constrained-selection call fails (fail open, not a broken result)', async () => {
+  process.env.OPENAI_BASE_URL = 'http://localhost:11434/v1'
+  process.env.OPENCLAUDE_ENABLE_ROUTER_CONSTRAINED_SELECTION = '1'
+  let requestCount = 0
+  const capturedBodies: Array<Record<string, unknown>> = []
+  // Every request (constrained AND fallback) gets the same malformed-content
+  // response, so the constrained attempt fails to decode and the code must
+  // fall through to a second, normal request rather than surfacing garbage.
+  globalThis.fetch = (async (_input, init) => {
+    requestCount++
+    const body = JSON.parse(String(init?.body)) as Record<string, unknown>
+    capturedBodies.push(body)
+    return new Response(
+      JSON.stringify({
+        id: 'chatcmpl-fallback',
+        model: 'qwen3-router:1.7b',
+        choices: [{ message: { role: 'assistant', content: 'plain final answer' }, finish_reason: 'stop' }],
+        usage: { prompt_tokens: 5, completion_tokens: 2, total_tokens: 7 },
+      }),
+      { headers: { 'Content-Type': 'application/json' } },
+    )
+  }) as FetchType
+
+  const client = createOpenAIShimClient({}) as OpenAIShimClient
+  const result = (await client.beta.messages.create({
+    model: 'qwen3-router:1.7b',
+    system: 'test system',
+    messages: [{ role: 'user', content: 'What is 734 x 851?' }],
+    tools: FEWSHOT_TOOLS,
+    max_tokens: 64,
+    stream: false,
+  })) as { content: Array<Record<string, unknown>> }
+
+  // One failed constrained attempt + one normal fallback attempt.
+  expect(requestCount).toBe(2)
+  expect(capturedBodies[0]).toHaveProperty('response_format') // first attempt: constrained
+  expect(capturedBodies[0]).not.toHaveProperty('tools')
+  expect(capturedBodies[1]).not.toHaveProperty('response_format') // second attempt: normal fallback
+  expect(capturedBodies[1]).toHaveProperty('tools')
+  expect(result.content[0]).toEqual({ type: 'text', text: 'plain final answer' })
 })
