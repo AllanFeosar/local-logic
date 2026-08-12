@@ -143,7 +143,47 @@ is user-owned, not generated or written by any agent.
 
 ---
 
-## 6. Not yet implemented / planned
+## 6. Local-AI semantic tool pre-filtering (`src/services/api/toolPreFilter.ts`, 2026-08-12)
+
+Narrows the tool list handed to the model for a single turn, but **only**
+when `shouldApplyToolPreFilter(getAPIProvider(), resolveProviderRequest().baseUrl)`
+is true — i.e. only for the OpenAI-compatible transport talking to a local
+endpoint (`localhost`/`127.0.0.1`/private-range, per `isLocalProviderUrl`),
+which today means this project's own `ollama` profile. Wired into
+`queryModel()` in `claude.ts`, immediately after the existing ToolSearch
+deferral logic computes `filteredTools` and before those tools are turned
+into API schemas — so it only ever narrows what upstream deferral already
+decided is visible, never adds anything back.
+
+Every non-local/non-`openai` request (Anthropic first-party, Bedrock,
+Vertex, Foundry, Gemini, GitHub Models, Codex, or a non-local OpenAI-
+compatible endpoint) skips the call entirely — `filteredTools` is the exact
+same object/array that upstream logic already produced, byte-for-byte
+unchanged from before this feature existed.
+
+Mechanism when it does apply: a fixed `CORE_TOOL_NAMES` set (this app's
+core built-ins — Bash/Read/Edit/Write/Glob/Grep/TodoWrite/AskUserQuestion —
+plus the local-AI specialists AskMathModel/DocumentQA/ImageCaption/
+DataAnalyze) plus `ToolSearch` always stay visible; anything else in
+`filteredTools` (the "discretionary tail") is ranked by all-minilm
+embedding similarity to the current turn's user text (`memdir/
+embeddingClient.ts`, same infra as `memdir/embeddingPreFilter.ts`) and only
+the top `TOOL_PREFILTER_TOP_K` (currently 4) survive. Fails open at every
+stage (no query text, embedding unreachable/malformed → tool list
+unchanged).
+
+**Known current behavior, worth any consuming agent knowing**: with MCP
+servers scoped out of the `ollama` profile and ToolSearch deferral already
+hiding most non-core built-ins, the profile's actual discretionary tail on
+a fresh turn is only 2 tools (Agent/`Task`, `Skill`) — below
+`TOOL_PREFILTER_TOP_K`, so this is a verified no-op in the profile's
+current tool-menu shape (confirmed via a live routing-eval run: 70.0%
+before and after, byte-identical `filteredTools` every case). It starts
+actually trimming once the discretionary tail grows past 4 — e.g. if MCP
+scoping is relaxed, more built-ins are added, or ToolSearch discovers more
+deferred tools mid-conversation.
+
+## 7. Not yet implemented / planned
 > `provider-router-agent` adds entries here as new providers/transports are
 > added.
 

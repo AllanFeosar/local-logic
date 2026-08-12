@@ -1,4 +1,4 @@
-import { createCombinedAbortSignal } from '../utils/combinedAbortSignal.js'
+import { cosineSimilarity, embedTexts } from './embeddingClient.js'
 import type { MemoryHeader } from './memoryScan.js'
 
 /**
@@ -15,61 +15,14 @@ import type { MemoryHeader } from './memoryScan.js'
  * full `memories` list unchanged rather than throwing — memory retrieval
  * must degrade gracefully, not break, when the local embedding model isn't
  * up.
+ *
+ * The actual embed-endpoint call lives in ./embeddingClient.js, shared with
+ * services/api/toolPreFilter.ts (semantic tool pre-filtering) — see that
+ * file's own comment.
  */
-
-const OLLAMA_EMBED_URL =
-  process.env.MEMORY_EMBEDDING_URL ?? 'http://127.0.0.1:11434/api/embed'
-const EMBEDDING_MODEL = process.env.MEMORY_EMBEDDING_MODEL ?? 'all-minilm'
-
-// Measured ~8.5s for a 22-text batch embed call in this project's own
-// earlier testing — generous margin over that for larger memory dirs.
-const EMBEDDING_TIMEOUT_MS = 20_000
 
 export const EMBEDDING_PREFILTER_THRESHOLD = 15
 export const EMBEDDING_PREFILTER_TOP_K = 20
-
-async function embedBatch(
-  texts: string[],
-  signal: AbortSignal,
-): Promise<number[][] | null> {
-  if (texts.length === 0) return []
-
-  const { signal: combinedSignal, cleanup } = createCombinedAbortSignal(signal, {
-    timeoutMs: EMBEDDING_TIMEOUT_MS,
-  })
-
-  try {
-    const response = await fetch(OLLAMA_EMBED_URL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model: EMBEDDING_MODEL, input: texts }),
-      signal: combinedSignal,
-    })
-    if (!response.ok) return null
-
-    const data = (await response.json()) as { embeddings?: unknown }
-    if (!Array.isArray(data.embeddings)) return null
-    return data.embeddings as number[][]
-  } catch {
-    return null
-  } finally {
-    cleanup()
-  }
-}
-
-function cosineSimilarity(a: number[], b: number[]): number {
-  let dot = 0
-  let normA = 0
-  let normB = 0
-  const len = Math.min(a.length, b.length)
-  for (let i = 0; i < len; i++) {
-    dot += a[i]! * b[i]!
-    normA += a[i]! * a[i]!
-    normB += b[i]! * b[i]!
-  }
-  if (normA === 0 || normB === 0) return 0
-  return dot / (Math.sqrt(normA) * Math.sqrt(normB))
-}
 
 // Exported so rerank.ts can score the same filename+description text it was
 // embedded with — keeping both retrieval stages' notion of "what a memory
@@ -87,7 +40,7 @@ export async function preFilterMemoriesByEmbedding(
   if (memories.length <= topK) return [...memories]
 
   const texts = [query, ...memories.map(memoryEmbeddingText)]
-  const embeddings = await embedBatch(texts, signal)
+  const embeddings = await embedTexts(texts, signal)
   if (!embeddings || embeddings.length !== texts.length) {
     // Embedding unavailable or malformed — fail open, let the caller fall
     // back to sending the full manifest to Sonnet.

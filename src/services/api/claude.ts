@@ -56,6 +56,11 @@ import {
   toolToAPISchema,
 } from '../../utils/api.js'
 import { getOauthAccountInfo } from '../../utils/auth.js'
+import { resolveProviderRequest } from './providerConfig.js'
+import {
+  applySemanticToolPreFilter,
+  shouldApplyToolPreFilter,
+} from './toolPreFilter.js'
 import {
   getBedrockExtraBodyParamsBetas,
   getMergedBetas,
@@ -76,6 +81,7 @@ import {
   createAssistantAPIErrorMessage,
   createUserMessage,
   ensureToolResultPairing,
+  getUserMessageText,
   normalizeContentFromAPI,
   normalizeMessagesForAPI,
   stripAdvisorBlocks,
@@ -1179,6 +1185,38 @@ async function* queryModel(
   } else {
     filteredTools = tools.filter(
       t => !toolMatchesName(t, TOOL_SEARCH_TOOL_NAME),
+    )
+  }
+
+  // Local-AI semantic tool pre-filtering (LOCAL_AI_MASTER_PLAN.md §6
+  // mitigation 3, services/api/toolPreFilter.ts) — provider/profile-
+  // conditional, never touches a cloud-provider request. Runs strictly
+  // after the tool-search deferral logic above so it only ever narrows
+  // what upstream already decided is visible this turn; every downstream
+  // use of filteredTools (cache markers, message normalization, schema
+  // building) sees the same narrowed set consistently.
+  if (
+    shouldApplyToolPreFilter(
+      getAPIProvider(),
+      resolveProviderRequest().baseUrl,
+    )
+  ) {
+    const lastUserMessage = messages.findLast(
+      m => m.type === 'user' && !m.isMeta,
+    )
+    const latestUserText = lastUserMessage
+      ? (getUserMessageText(lastUserMessage) ?? '')
+      : ''
+    filteredTools = await applySemanticToolPreFilter(
+      filteredTools,
+      latestUserText,
+      {
+        getToolPermissionContext: options.getToolPermissionContext,
+        tools,
+        agents: options.agents,
+        allowedAgentTypes: options.allowedAgentTypes,
+      },
+      signal,
     )
   }
 

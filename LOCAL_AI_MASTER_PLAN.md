@@ -431,8 +431,20 @@ a menu the router already can't reliably pick from), so it's no longer
   fits in VRAM) and a single routing decision took 3+ minutes with no
   response yet vs 15-37s for the fixed 1.7b — not viable regardless of
   any accuracy gain. Full detail in `LOCAL_AI_STATUS.md` Session 5.
-  **Gate still not met** (70% < ~90%) — semantic pre-filtering (mitigation
-  3) remains the recommended next step, now on a clean baseline.
+  **Gate still not met** (70% < ~90%). **Update 2026-08-12: semantic
+  pre-filtering (mitigation 3) built and verified — a confirmed no-op at
+  today's tool count**, not a failed fix: with MCP-scoping and ToolSearch
+  deferral already in effect, the discretionary tail is only 2 tools,
+  already below the filter's top-K=4 threshold, so it correctly never
+  triggers (routing eval unchanged, 70.0% before and after, byte-identical
+  tool lists confirmed). The real, valuable infrastructure is now in place
+  for when tool count grows again (Phase 4/5 gateways, relaxed MCP
+  scoping) — it just isn't what closes today's gap. **The remaining 6/20
+  failures are confirmed to be a reliability ceiling independent of tool
+  count**, not tool-list size — the next lever needs to target the actual
+  failure modes directly (3 wrong-tool hallucinations, 3 over-delegation
+  on trivial/no-tool-needed prompts) rather than menu trimming. Full detail
+  in `LOCAL_AI_STATUS.md` Session 7.
 - **Phase 2 — Finish the platform**: dedicated CUDA venv (confirmed
   2026-08-12 — build it; never touch the Debate venv); migrate BLIP +
   DistilBERT to real GPU device placement in `manager.py` (turning the
@@ -492,6 +504,41 @@ a menu the router already can't reliably pick from), so it's no longer
   set; (2) head-to-head vs one frontier model on the same set — the
   project's flagship claim, proven or killed by eval like everything
   else.*
+  **Status 2026-08-12 (tools-execution-agent): built and live-verified,
+  gate NOT yet met, security review NOT yet done.** Built out of order
+  relative to the "sequenced after the Phase-1 routing gate" note above —
+  done in parallel with continuing routing work per explicit direction this
+  session, not a silent reordering. Exposed as a zero-growth `deep: boolean`
+  field on the existing `AskMathModel` tool (better than "at most one new
+  entry" — the menu doesn't grow at all), not a separate `DeepSolve` tool.
+  All four pipeline steps built exactly as specified (generate with
+  live-confirmed per-request temperature variation, execute-and-classify
+  verification, Qwen3-Reranker reuse via a new exported `rerank.ts`
+  primitive with self-consistency as tie-break only, one bounded retry).
+  Code execution investigated and resolved: the existing sandbox-runtime is
+  unconditionally unavailable on this project's actual machine (native
+  Windows — confirmed by reading the package's own
+  `isSupportedPlatform()`), so a narrow, layered-defense dedicated Python
+  executor was built instead (`deepSolve/pythonSandbox.ts`: no shell,
+  default-deny import allowlist, dangerous-builtin denylist, `-I -S -B`
+  interpreter hardening, zero-inherited env, fresh temp dir, hard
+  timeout+treeKill — full writeup in `LOCAL_AI_STATUS.md` Session 6).
+  Live-verified end-to-end three separate times with genuinely different
+  model-generated verification code each time, all correct. Eval
+  (`scripts/eval/deepSolveEval.ts`, 6 cases): **6/6 pass on both
+  single-shot and DeepSolve** — confirms every pipeline mechanism works
+  correctly (including the multi-candidate/early-exit path engaging for
+  real on one case) but does NOT yet demonstrate "beats single-shot" since
+  both modes tied — the two cases picked as "hard" turned out to be within
+  VibeThinker's single-shot reach. **Gate (1) is not yet met**: the ≥20-case
+  set doesn't exist yet (6 exist), and a 6-case tie isn't evidence either
+  way at the scale the gate requires. Gate (2) (frontier head-to-head) not
+  attempted, by design (no paid API calls without explicit opt-in). **Not
+  wired into any default-visible path pending security review** — the
+  mechanism is reachable today since `deep` is a field on an already-visible
+  tool, not a separately gated one, so review is genuinely blocking here,
+  not a formality. See `LOCAL_AI_STATUS.md` Session 6 for the full file
+  list flagged for that review.
 - **Phase 4 — Hearing**: silero-vad ONNX (re-download, ~2 MB), Whisper
   turbo on GPU, `AudioAnalyze` + `TranscribeAndSummarize`.
   *Gate: transcription spot-check vs a cloud STT on 3 real recordings.*
