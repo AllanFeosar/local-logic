@@ -144,6 +144,26 @@ route's contract. `/status` is new and not yet consumed by any TS tool;
 if the eval harness or a future tool needs to call it from TypeScript,
 that's a `tools-execution-agent` pickup, not done here.
 
+### Planned routes (2026-08-12) — Phase 3 data/tables, behind `DataAnalyzeTool`
+
+Contract fixed in advance so `python-bridge-agent` (routes) and
+`tools-execution-agent` (the `DataAnalyze` gateway tool, see §2's routing
+plan in `LOCAL_AI_MASTER_PLAN.md` §6) can build against it in parallel.
+`python-bridge-agent`: if implementation forces a shape change, update
+this table in the same commit that changes the route — don't let it drift.
+
+| Route | Model | Request | Response |
+|---|---|---|---|
+| `POST /tabular-predict` | TabPFN-v2 (clf+reg) | `{ operation: "classify" \| "regress", train_features: number[][], train_labels: (string \| number)[], test_features: number[][] }` | `{ predictions: (string \| number)[], probabilities?: number[][] }` (`probabilities` present only for `operation: "classify"`, one row per test sample, columns aligned to the sorted unique labels seen in `train_labels`) |
+| `POST /table-qa` | tapas-mini-finetuned-wtq | `{ question: string, table: { columns: string[], rows: string[][] } }` | `{ answer: string, cells: Array<{ row: number, column: number }> }` (`cells` are 0-indexed into `table.rows`/`table.columns`, empty array if the model didn't ground an answer to specific cells) |
+| `POST /forecast` | chronos-t5-tiny | `{ series: number[], horizon: number }` | `{ forecast: number[], low?: number[], high?: number[] }` (`forecast` is the median prediction, length `horizon`; `low`/`high` are an uncertainty band if the underlying model exposes quantiles, omitted otherwise) |
+
+All three: CPU is fine (tiny models, no GPU device placement needed per
+`LOCAL_AI_MASTER_PLAN.md` §3/§4), register via `manager.py`'s `ModelSpec`
+pattern like every other route, loopback-only, no auth, fail with a
+clear 4xx (not a raw 500) on malformed input (e.g. `table.rows` rows of
+inconsistent length, empty `train_features`).
+
 Extending this table is `python-bridge-agent`'s responsibility whenever a
 new route is added — see that agent's own Architecture rules for the
 lazy-load-singleton pattern every route follows (now: register a
