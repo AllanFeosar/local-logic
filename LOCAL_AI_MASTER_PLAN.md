@@ -23,6 +23,22 @@ wasn't in the plan at all: scoping non-local-AI MCP servers out of the
 router's profile, which alone might drop the menu from ~65 back to ~25
 with zero code changes. See the revised §8 for the full reordering.
 
+**2026-08-12 revision (later the same day) — the goal itself upgraded.**
+The user set the project's true north explicitly: combine many mini
+models so the *system* rivals top frontier models at logical reasoning.
+An external-evidence check (both successes and failures, deliberately)
+found this is no longer aspirational — see the new §11 (Logic Engine):
+the exact model already wired as this project's math specialist
+(VibeThinker-3B) has a published paper hitting frontier-level
+verifiable-reasoning scores, and the generate→verify→search composition
+pattern (rStar-Math, test-time scaling) is proven to let 3B-class models
+beat 400B-class models on math. §1's calibrated claim is upgraded
+accordingly — *verifiable logical domains* are now an explicit
+rival-the-frontier target; open-ended general reasoning stays out of
+scope. The user also clarified the hardware guides: models on disk
+≤ ~5 GB, peak model RAM ≤ ~7.5 GB — soft, machine-driven, not mandatory
+(§3).
+
 ---
 
 ## 1. The honest definition of "all-purpose"
@@ -50,6 +66,17 @@ specialists (TabPFN on small tabular data, Whisper turbo on transcription)
 plausibly *beat* general-purpose frontier models at their task outright —
 those are the flagship cases, and the eval harness must prove or kill each
 such claim.
+
+**Goal upgrade (2026-08-12, evidence-backed — see §11):** on *verifiable
+logical domains* — math, code, symbolic puzzles, anything a checker can
+score — the composed system now explicitly targets **parity with or wins
+over top frontier models**, not merely "frontier-competitive per narrow
+task." This is no longer wishful thinking: VibeThinker-3B's own paper
+reports 94.3 on AIME26 (97.1 with test-time scaling), and rStar-Math
+showed two composed small models beating o1-preview on MATH (§11 has the
+full evidence base). What stays out of scope is open-ended *general*
+reasoning with no verifier — "no verifier, no claim" is the boundary
+that keeps this honest.
 
 ## 2. Design principles (earned, not aspirational)
 
@@ -111,6 +138,20 @@ such claim.
   real reduction from the ~5–6 GB this section originally claimed, on
   top of the new GPU-contention risk above. Budget every future
   integration against this corrected number, not the original one.
+- **User-set soft guides (2026-08-12):** models on disk ≤ ~5 GB and peak
+  model RAM ≤ ~7.5 GB — explicitly soft ("if possible"), driven by this
+  machine's limits, not mandatory. Disk: the active Ollama set lands at
+  **4.83 GB** once the A/B-rejected `qwen3:4b` is deleted (see §4
+  parked list); the HF library under `C:\Users\allge\AI Models` counts
+  separately as inactive/parked assets. RAM: with the corrected ~6.4 GB
+  router footprint, router + VibeThinker co-resident (~8.4 GB) would
+  breach the guide — so **serial swap is the default policy**:
+  `OLLAMA_MAX_LOADED_MODELS=1` forces one Ollama model at a time (the
+  router unloads while a specialist computes and reloads after; seconds
+  of swap latency against specialist calls that take 20s–5min anyway).
+  Longer-term, §6's mitigations 2–3 shrink the system prompt, which
+  shrinks the required `num_ctx`, which shrinks the router's KV cache —
+  the routing fix and the memory fix are the same work.
 
 Consequence: **all 25+ models can never be resident at once.** The
 architecture is lazy-load + evict, with Ollama handling its own models
@@ -169,6 +210,13 @@ the 2026-08-12 revision note above and the reordered §8.
 - **mobilenetv3-small** — ImageNet classifier; redundant once CLIP
   zero-shot classification is wired (could return as a ~10 MB fast path if
   CLIP proves too slow).
+- **qwen3:4b** (Ollama, 2.33 GB) — pulled for the §6.5 router A/B,
+  **rejected by eval 2026-08-12**: at the unavoidable 40960 context it
+  mostly falls back to CPU on 4 GB VRAM (only ~2.3 GB of a ~9.2 GB
+  footprint fits) and a single routing decision took 3+ minutes vs
+  15–37 s for the fixed 1.7b. Delete it to meet the ≤5 GB disk guide
+  (its `qwen3-router-4b` derivative is already removed); re-pull only if
+  prompt slimming ever shrinks `num_ctx` enough to justify a re-test.
 
 ## 5. Platform layer: the bridge model manager
 
@@ -428,6 +476,22 @@ a menu the router already can't reliably pick from), so it's no longer
   characterization was too generous; lean on the bounds, not the point
   forecast, until this is understood better. See `LOCAL_AI_STATUS.md`
   Session 4 for full detail.
+- **Phase 3.5 — The logic engine** (added 2026-08-12 — full design and
+  evidence in §11). Build the generate→verify→search pipeline around the
+  already-wired VibeThinker: (a) code-execution verification — a
+  generated Python check actually run locally against each candidate
+  answer; (b) best-of-N sampling (start N=3–5) with the verifier picking
+  the winner; (c) Qwen3-Reranker as a learned scorer for candidates code
+  can't check; exposed as one tool (`DeepSolve`, or an upgraded mode
+  inside `AskMathModel`) per §6's gateway principle — the router's menu
+  grows by at most one entry. Sequenced after the Phase-1 routing gate
+  (delegation must be reliable before deep mode is reachable);
+  independent of Phases 4–6.
+  *Gate (two-step, per §2's eval-gating): (1) the composed pipeline
+  beats single-shot VibeThinker on a fixed ≥20-problem math/logic eval
+  set; (2) head-to-head vs one frontier model on the same set — the
+  project's flagship claim, proven or killed by eval like everything
+  else.*
 - **Phase 4 — Hearing**: silero-vad ONNX (re-download, ~2 MB), Whisper
   turbo on GPU, `AudioAnalyze` + `TranscribeAndSummarize`.
   *Gate: transcription spot-check vs a cloud STT on 3 real recordings.*
@@ -473,13 +537,108 @@ destroyed.
 | Stale `dist/` build | `bun run build` after any `src/` change — no exceptions |
 | Qwen3-TTS / VideoMAE unknowns | Time-boxed research spikes before committing; park on failure |
 | 4 GB VRAM ceiling | fp16 + attention slicing; CPU fallback per model; never co-resident heavies |
+| Correlated-error ensembles (voting/debate amplify shared blind spots) | Heterogeneous specialists; verify-don't-vote (§11); free-form debate is an explicit anti-goal (§10) |
+| Logic-engine latency (N samples × 1–5 min each) | Deep mode is an explicit opt-in tool call, never the default path; N capped; verifier runs first and early-exits on a provably correct candidate |
 
 ## 10. Anti-goals (explicit, to keep the project honest)
 
-- **Not** trying to out-reason frontier models generally — the router stays
-  a dispatcher, and hard general reasoning remains out of scope.
+- **Not** trying to out-reason frontier models on open-ended *general*
+  reasoning — the router stays a dispatcher. The one deliberate,
+  evidence-backed exception (added 2026-08-12): *verifiable logical
+  domains* via the §11 logic engine, where composition + verification has
+  published proof of frontier parity. No verifier, no claim.
+- **Not** free-form multi-agent debate between similar models — the
+  failure literature is decisive (sycophantic conformity, consensus
+  collapse, 2–3.4× cost for accuracy no better than one model
+  self-checking; citations in §11). Verify, don't vote.
 - **Not** fine-tuning anything — zero-shot composition only; the
   "self-improvement" loop is routing/eval iteration, not training.
 - **Not** wiring models because they're downloaded — the parked list stays
   parked without a use case *and* an eval win.
 - **Not** touching `openclaude` (no "-main") — ever, for any of this.
+
+## 11. The logic engine — rivaling frontier logic by composition (added 2026-08-12)
+
+### The goal, stated plainly
+
+Combine many mini models so the *system* thinks at frontier level on
+logical reasoning — the project's true north as set by the user. This
+section records the external evidence that it's achievable, the
+mechanism to copy, and the failure modes to avoid. Both directions were
+researched deliberately: failures teach as much as successes.
+
+### Evidence it works (what we copy)
+
+- **VibeThinker-3B — already wired as this project's math specialist —
+  is itself the existence proof.** Its published paper
+  ([arxiv 2606.16140](https://arxiv.org/abs/2606.16140)) reports 94.3 on
+  AIME26 (97.1 with claim-level test-time scaling) and 80.2 Pass@1 on
+  LiveCodeBench v6: frontier-level verifiable reasoning at 3B. The
+  thesis is already on disk.
+- **rStar-Math** ([arxiv 2501.04519](https://arxiv.org/abs/2501.04519),
+  ICML 2025) is the architecture blueprint: a 7B policy SLM + a small
+  process-reward SLM + Monte Carlo Tree Search reaches 90.0% on MATH,
+  beating o1-preview — two composed small models, no distillation from a
+  bigger one.
+- **Test-time compute beats parameter count on verifiable tasks**: with
+  search + verification at inference, a 3B model outperforms a 405B
+  model on MATH/AIME
+  ([arxiv 2510.14913](https://arxiv.org/abs/2510.14913));
+  [T1 (arxiv 2504.04718)](https://arxiv.org/abs/2504.04718) shows
+  *tool-integrated* verification — running code to check answers — is
+  what makes test-time scaling work for *small* models specifically.
+- **TRM** ([arxiv 2510.04871](https://arxiv.org/abs/2510.04871)): 7M
+  params beats DeepSeek-R1, o3-mini, and Gemini 2.5 Pro on ARC-AGI —
+  with the caveat that it needs per-task training and narrow symbolic
+  domains. Lesson: breadth must come from the *system*, not one tiny
+  genius — this project's specialist-composition bet, independently
+  confirmed.
+
+### Evidence on what fails (what we avoid)
+
+- **Correlated errors kill naive ensembles**: measured error correlation
+  between distinct frontier models is ~r=0.77 — three voting models are
+  effectively ~1.3 independent opinions. Majority voting mostly
+  amplifies shared blind spots.
+- **Free-form multi-agent debate** has three documented failure modes
+  ([arxiv 2509.05396](https://arxiv.org/abs/2509.05396),
+  [arxiv 2510.20963](https://arxiv.org/abs/2510.20963)): sycophantic
+  conformity (models abandon correct answers to agree with peers, up to
+  ~85%), contextual fragility (longer debate context *destabilizes*
+  correct reasoning), and consensus collapse (the right answer is
+  generated, then discarded during consensus) — at 2.1–3.4× the token
+  cost of one model self-checking with a bigger budget
+  ([arxiv 2605.00914](https://arxiv.org/abs/2605.00914)). Debate only
+  earns its cost when the failure is a reasoning *gap*, not missing
+  knowledge.
+- Design consequences, baked in: **verify, don't vote; check, don't
+  chat.** This stack's specialists (VibeThinker, DistilBERT, TabPFN,
+  Chronos, qwen3) are different architectures with different training —
+  naturally decorrelated, which is the one property ensembles actually
+  need and same-family LLM committees lack. (The user's separate Debate
+  project sits in the debate family — the failure literature above
+  applies to it directly and is worth reading before extending it.)
+
+### The pipeline (fits §3's guides)
+
+1. **Generate**: VibeThinker-3B proposes N candidate solutions
+   (best-of-N, start N=3–5, temperature-varied).
+2. **Verify — deterministic first**: a generated Python check is
+   actually executed locally (free, exact); early-exit the moment a
+   candidate provably passes.
+3. **Score what code can't check**: Qwen3-Reranker as a cheap learned
+   scorer (the same yes/no-logprob mechanism as `rerank.ts`) over
+   surviving candidates; self-consistency vote only as a final tie-break
+   among *verified* candidates — never as the primary decision.
+4. **Escalate depth, not width**: if every candidate fails verification,
+   one bounded retry — re-prompt VibeThinker with the failed attempt +
+   verifier feedback. No open-ended agent conversations.
+
+Memory: VibeThinker (~2 GB) + reranker (0.45 GB) + Python executor
+(negligible) under §3's serial-swap policy — comfortably inside the
+7.5 GB guide, zero new models to download. The real cost is latency
+(N × 1–5 min per candidate), which is why deep mode is an explicit
+opt-in tool call (Phase 3.5), never the default path for trivial
+queries. Scope guard: mempalace/memdir already cover the memory layer
+(§7's scope decision) — the logic engine adds compute composition, not
+another memory system.
