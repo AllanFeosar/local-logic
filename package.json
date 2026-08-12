@@ -40,6 +40,7 @@
     "doctor:report": "bun run scripts/system-check.ts --out reports/doctor-runtime.json",
     "eval:specialists": "bun run scripts/eval/specialistEval.ts",
     "eval:routing": "bun run scripts/eval/routingEval.ts",
+    "eval:data-analyze": "bun run scripts/eval/dataAnalyzeEval.ts",
     "hardening:check": "bun run smoke && bun run doctor:runtime",
     "hardening:strict": "bun run typecheck && bun run hardening:check",
     "prepack": "npm run build"

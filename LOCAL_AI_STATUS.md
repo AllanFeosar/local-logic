@@ -594,6 +594,56 @@ same pattern session 2 already established, now reconfirmed). Zero of the
 23 trace to a real regression from any of this session's three parallel
 streams.
 
+## Session 4 (2026-08-12, tools-execution-agent) — DataAnalyzeTool eval: TAPAS/TabPFN/Chronos quantified for real
+
+Built `scripts/eval/dataAnalyzeEval.ts` / `dataAnalyzeCases.ts`
+(`bun run eval:data-analyze`) — turns Session 3b's anecdotal one-off
+spot-checks into real, quantified, ground-truth-checkable results. Every
+case has a locally-computable objective answer (the tables/synthetic data
+were authored for this eval), so no frontier column is needed or
+meaningful here. Run live twice against the real bridge; pass/fail counts
+identical both times.
+
+- **`"question"` (TAPAS): 6/8.** Same-column lookups 2/2 (solid).
+  Cross-column lookups 3/4 — better than the single spot-check suggested,
+  but it exactly reproduces that original failure ("revenue of Gadget"
+  still returns the wrong row). Aggregation 1/2 — the weakest category;
+  the exact "which product has the highest revenue" case from Session 3b
+  still fails. Net: TAPAS's weakness is real but uneven, not a blanket
+  failure — solid on direct lookups, unreliable on cross-column and
+  aggregation questions specifically. Sample sizes are small (n=2-4 per
+  category) — real signal, not a precise rate.
+- **`"predict"` (TabPFN): 3/4.** Both classification cases passed cleanly
+  with >99% confidence on the correct class. The regression case failed
+  specifically at extrapolation distance from the training range (in-range
+  and near-range test points were fine; far-out-of-range ones weren't) —
+  reads as a genuine, expected model characteristic, not a bug. Matches
+  Session 3b's "TabPFN looks correct" finding, now with a quantified
+  caveat about extrapolation.
+- **`"forecast"` (Chronos): 1/3 — correction to a Session 3b claim.**
+  Session 3b's spot-check said "Chronos produced sane trend
+  continuations"; this eval found that's not reliably true. Uncertainty
+  bounds are solid on all 3 cases every run (always contain the point
+  forecast, never zero-width or absurd — the plumbing/route is correct,
+  independently confirmed by reading `forecast.py` against the model's
+  documented usage). But **both linear-trend cases failed on the point
+  forecast itself** — the model tends to plateau near the last observed
+  value instead of confidently continuing an obvious trend (a series
+  ending at 20 with a clear +2/step pattern forecasts ~18-20 flat, not
+  ~22/24/26). Reproduced on both runs — not a fluke. Plausible explanation:
+  a documented characteristic of trajectory-sampling forecasts from an
+  8M-parameter checkpoint over a very short context window, not a wiring
+  bug. **This measurably narrows the "Chronos genuinely correct" claim
+  from Session 3b** — the uncertainty quantification is trustworthy, the
+  point forecast on a clear trend is not.
+
+Open questions this raises (not resolved, for the project owner):
+whether `/table-qa` should be deprioritized for aggregation-style
+questions specifically (same-column lookups are fine); whether the
+Chronos trend-underforecast finding needs its own follow-up or whether
+leaning on the (correct) uncertainty bounds rather than the point
+forecast is an acceptable mitigation for now.
+
 ## Open items for next session
 
 - **Top priority**: root-cause the silent zero-token completion bug (see

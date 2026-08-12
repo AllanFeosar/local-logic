@@ -327,15 +327,24 @@ a menu the router already can't reliably pick from), so it's no longer
   otherwise start growing again.
   *Gate: TabPFN beats a frontier-model prompt on ≥1 real small-tabular
   benchmark — the flagship "local beats frontier" demo.*
-  **Status 2026-08-12: routes wired and live-verified, gate not yet
-  formally evaluated** (a proper TabPFN-vs-frontier benchmark comparison
-  hasn't been run — only manual spot-checks, which looked correct for
-  TabPFN/Chronos). **TAPAS quality concern found**: manual spot-checks
-  show `tapas-mini-finetuned-wtq` failing basic cross-column conditional
-  lookups (e.g. "revenue of Gadget" returned a different row's value) —
-  looks like a real capability limitation of this specific tiny
-  checkpoint, not an integration bug. Worth a dedicated eval before
-  leaning on `/table-qa` for anything real.
+  **Status 2026-08-12: routes wired and live-verified; a dedicated eval
+  (`scripts/eval/dataAnalyzeEval.ts`, `bun run eval:data-analyze`,
+  superseding the earlier manual spot-checks below) quantified all three
+  models — the true frontier-vs-TabPFN benchmark for this gate still
+  hasn't been run, but per-model accuracy is now real data, not anecdote.**
+  TabPFN: 3/4 (classification solid at >99% confidence both cases;
+  regression degrades at far-out-of-range extrapolation — expected
+  behavior, not a bug). TAPAS: 6/8 — same-column lookups solid (2/2),
+  cross-column and aggregation questions unreliable (3/4, 1/2) — a real,
+  uneven capability limit, not an integration bug (confirmed: the
+  original "revenue of Gadget" spot-check failure reproduces exactly).
+  Chronos: 1/3 — **narrows an earlier claim**: uncertainty bounds are
+  reliably correct (3/3 both eval runs), but point forecasts on an
+  obvious linear trend plateau rather than continuing it (2/2 trend
+  cases failed both runs) — the earlier "looked correct" spot-check
+  characterization was too generous; lean on the bounds, not the point
+  forecast, until this is understood better. See `LOCAL_AI_STATUS.md`
+  Session 4 for full detail.
 - **Phase 4 — Hearing**: silero-vad ONNX (re-download, ~2 MB), Whisper
   turbo on GPU, `AudioAnalyze` + `TranscribeAndSummarize`.
   *Gate: transcription spot-check vs a cloud STT on 3 real recordings.*
