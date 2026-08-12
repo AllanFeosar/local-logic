@@ -17,10 +17,19 @@ resolution bug entirely.
 
 Loading/eviction is delegated to the shared `local_models.manager`
 singleton (see that module's docstring for the full pattern: budget cap +
-LRU eviction, single-flight loading, heavy-model exclusivity, device stub,
-/status support) instead of a private module-level `_model`/`_processor`
-singleton. This module only owns: where the model lives on disk, how to
-load it, and how to run inference on an already-loaded handle.
+LRU eviction, single-flight loading, heavy-model exclusivity, real device
+placement, /status support) instead of a private module-level
+`_model`/`_processor` singleton. This module only owns: where the model
+lives on disk, how to load it, and how to run inference on an
+already-loaded handle.
+
+Device placement (2026-08-12): registered device="cuda", fp16=True — the
+dedicated CUDA venv (see python-bridge/README.md) makes this a real GPU
+placement, not the old stub. `manager.py` falls back to CPU automatically
+if CUDA isn't available at runtime, so this module doesn't need its own
+fallback logic. fp16 was live-verified against fp32 CPU output on this
+model before being committed to (see README's verification notes) —
+captions were consistent, no fp16-induced degenerate/garbled output.
 """
 import asyncio
 import logging
@@ -39,19 +48,26 @@ _MODEL_PATH = os.environ.get(
 # Checkpoint is ~1.79 GB on disk (fp32 weights); ~2000 MB budgets in some
 # margin for runtime/activation overhead. See local_models/manager.py's
 # ModelSpec docstring for what this number is used for (eviction
-# bookkeeping) and isn't (a measured RSS delta).
+# bookkeeping) and isn't (a measured RSS delta). Note: fp16 on GPU roughly
+# halves the actual resident footprint, but this estimate is left as the
+# fp32 on-disk figure — it's also the CPU-fallback figure (see
+# manager.py's _resolve_device()), and erring toward the larger number is
+# the safe direction for budget/eviction bookkeeping.
 _ESTIMATED_MB = 2000.0
 
 
-def _do_load():
+def _do_load(device: str):
     from transformers import BlipForConditionalGeneration, BlipProcessor
 
-    logger.info("Loading image-caption model from %s", _MODEL_PATH)
+    logger.info("Loading image-caption model from %s (device=%s)", _MODEL_PATH, device)
     processor = BlipProcessor.from_pretrained(_MODEL_PATH)
     model = BlipForConditionalGeneration.from_pretrained(_MODEL_PATH)
     model.eval()
+    if device == "cuda":
+        model = model.to(device)
+        model = model.half()  # fp16 — see ModelSpec(fp16=True) below
     logger.info("image-caption model ready")
-    return model, processor
+    return model, processor, device
 
 
 manager.register(
@@ -60,8 +76,8 @@ manager.register(
         loader=_do_load,
         estimated_mb=_ESTIMATED_MB,
         heavy=False,
-        device="cpu",
-        fp16=False,
+        device="cuda",
+        fp16=True,
     )
 )
 
@@ -82,8 +98,15 @@ def caption(image_path: str) -> str:
     # unauthenticated local caller a free filesystem existence oracle for
     # arbitrary paths readable by this process's user.
     image = Image.open(image_path).convert("RGB")
-    with manager.use(_MODEL_NAME) as (model, processor):
+    with manager.use(_MODEL_NAME) as (model, processor, device):
         inputs = processor(images=image, return_tensors="pt")
+        if device == "cuda":
+            # pixel_values is the only tensor here (image-only input, no
+            # text prompt) and is floating point, so casting it to match
+            # the fp16 model weights is safe/expected; BatchFeature.to()
+            # would happily move an int tensor's device too, but there
+            # isn't one to worry about in this caption-from-image-only path.
+            inputs = inputs.to(device=device, dtype=torch.float16)
         with torch.no_grad():
             output_ids = model.generate(**inputs, max_new_tokens=50)
         return processor.decode(output_ids[0], skip_special_tokens=True).strip()

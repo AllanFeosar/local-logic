@@ -11,11 +11,19 @@ venv with fastapi/uvicorn/transformers/torch already installed).
 
 Extending to another downloaded model: copy local_models/document_qa.py or
 local_models/image_caption.py as a template — each one:
-  1. defines a `_do_load()` that imports its (concrete, not Auto*/pipeline())
-     model classes and returns a handle (any object — a tuple of
-     model+tokenizer/processor is typical),
+  1. defines a `_do_load(device)` that imports its (concrete, not
+     Auto*/pipeline()) model classes, places the model on `device` (a
+     resolved "cuda" or "cpu" string the manager passes in — see
+     local_models/manager.py's docstring for how "cuda" gets resolved and
+     falls back to "cpu" automatically), and returns a handle (any object —
+     a tuple of model+tokenizer/processor is typical; include the device
+     string in that tuple if the inference function needs to move input
+     tensors onto it too),
   2. registers a `local_models.manager.ModelSpec` for itself at import time
-     (name, loader, an estimated_mb footprint, heavy/device/fp16 flags),
+     (name, loader, an estimated_mb footprint, heavy/device/fp16 flags —
+     device="cuda" is only worth declaring for a model actually worth GPU
+     placement; the tiny Phase-3 tabular/table/forecast models all declare
+     device="cpu"),
   3. wraps its sync inference function's model access in
      `with manager.use(name) as handle: ...` instead of a private
      `_model`/`_tokenizer` global,
@@ -24,17 +32,20 @@ local_models/image_caption.py as a template — each one:
 Then add one route below that calls the async version. That's the whole
 pattern — no other file needs to change. The shared `local_models.manager`
 (see its own docstring) is what actually owns loading/eviction/budget
-tracking across every registered model — don't reintroduce a per-module
-lazy-singleton, it'll drift out of sync with budget/LRU/heavy-exclusivity.
+tracking/device placement across every registered model — don't
+reintroduce a per-module lazy-singleton, it'll drift out of sync with
+budget/LRU/heavy-exclusivity/device resolution.
 """
 import logging
 import os
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+from typing import Literal, Optional, Union
 
-from local_models import document_qa, image_caption
+from local_models import document_qa, image_caption, table_qa, tabular_predict
+from local_models import forecast as forecast_model
 from local_models.manager import manager
 
 logging.basicConfig(level=logging.INFO)
@@ -119,6 +130,85 @@ async def image_caption_endpoint(req: ImageCaptionRequest):
         # into the same response as "not found" (see above).
         raise HTTPException(status_code=404, detail="image not found or not readable")
     return ImageCaptionResponse(caption=result)
+
+
+# --- Phase 3: data/tables (2026-08-12) ------------------------------------
+# Contract fixed in advance in .claude/contracts/tool-contract.md's
+# "Planned routes (2026-08-12)" table so tools-execution-agent could build
+# DataAnalyzeTool against these shapes in parallel. If you change a shape
+# here, update that table in the same change — don't let it drift.
+
+
+class TabularPredictRequest(BaseModel):
+    operation: Literal["classify", "regress"]
+    train_features: list[list[float]]
+    train_labels: list[Union[str, float]]
+    test_features: list[list[float]]
+
+
+class TabularPredictResponse(BaseModel):
+    predictions: list[Union[str, float]]
+    probabilities: Optional[list[list[float]]] = None
+
+
+@app.post("/tabular-predict", response_model=TabularPredictResponse)
+async def tabular_predict_endpoint(req: TabularPredictRequest):
+    try:
+        result = await tabular_predict.predict_async(
+            req.operation, req.train_features, req.train_labels, req.test_features
+        )
+    except tabular_predict.InvalidTabularInput as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return TabularPredictResponse(**result)
+
+
+class TableSpec(BaseModel):
+    columns: list[str]
+    rows: list[list[str]]
+
+
+class TableQARequest(BaseModel):
+    question: str
+    table: TableSpec
+
+
+class TableCell(BaseModel):
+    row: int
+    column: int
+
+
+class TableQAResponse(BaseModel):
+    answer: str
+    cells: list[TableCell]
+
+
+@app.post("/table-qa", response_model=TableQAResponse)
+async def table_qa_endpoint(req: TableQARequest):
+    try:
+        result = await table_qa.answer_async(req.question, req.table.columns, req.table.rows)
+    except table_qa.InvalidTableInput as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return TableQAResponse(**result)
+
+
+class ForecastRequest(BaseModel):
+    series: list[float]
+    horizon: int = Field(gt=0)
+
+
+class ForecastResponse(BaseModel):
+    forecast: list[float]
+    low: Optional[list[float]] = None
+    high: Optional[list[float]] = None
+
+
+@app.post("/forecast", response_model=ForecastResponse)
+async def forecast_endpoint(req: ForecastRequest):
+    try:
+        result = await forecast_model.forecast_async(req.series, req.horizon)
+    except forecast_model.InvalidForecastInput as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return ForecastResponse(**result)
 
 
 if __name__ == "__main__":

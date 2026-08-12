@@ -34,11 +34,12 @@
     "test:provider-recommendation": "bun test src/utils/providerRecommendation.test.ts src/utils/providerProfile.test.ts",
     "typecheck": "tsc --noEmit",
     "smoke": "bun run build && node dist/cli.mjs --version",
-    "test:provider": "bun test src/services/api/*.test.ts src/utils/context.test.ts",
+    "test:provider": "bun test src/services/api/*.test.ts src/utils/context.test.ts --path-ignore-patterns='**/*.live.test.ts'",
     "doctor:runtime": "bun run scripts/system-check.ts",
     "doctor:runtime:json": "bun run scripts/system-check.ts --json",
     "doctor:report": "bun run scripts/system-check.ts --out reports/doctor-runtime.json",
     "eval:specialists": "bun run scripts/eval/specialistEval.ts",
+    "eval:routing": "bun run scripts/eval/routingEval.ts",
     "hardening:check": "bun run smoke && bun run doctor:runtime",
     "hardening:strict": "bun run typecheck && bun run hardening:check",
     "prepack": "npm run build"

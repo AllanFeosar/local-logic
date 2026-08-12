@@ -47,10 +47,30 @@ async function collectStreamEventTypes(responseText: string): Promise<string[]> 
 
 describe('Codex provider config', () => {
   test('resolves codexplan alias to Codex transport with reasoning', () => {
-    const resolved = resolveProviderRequest({ model: 'codexplan' })
-    expect(resolved.transport).toBe('codex_responses')
-    expect(resolved.resolvedModel).toBe('gpt-5.4')
-    expect(resolved.reasoning).toEqual({ effort: 'high' })
+    // Hermetic: resolveProviderRequest falls back to process.env.OPENAI_BASE_URL
+    // when no explicit baseUrl is passed, and this repo's root .env (auto-loaded
+    // by `bun test`) sets OPENAI_BASE_URL to a live third-party endpoint for local
+    // provider experimentation. A non-empty OPENAI_BASE_URL forces the
+    // chat_completions branch (see providerConfig.ts's "custom OPENAI_BASE_URL
+    // always wins over model-name-based Codex detection" comment), which masks
+    // this test's actual assertion (no explicit base URL -> Codex alias wins).
+    // Explicitly clear the vars this call depends on rather than relying on
+    // ambient absence.
+    const savedBaseUrl = process.env.OPENAI_BASE_URL
+    const savedApiBase = process.env.OPENAI_API_BASE
+    delete process.env.OPENAI_BASE_URL
+    delete process.env.OPENAI_API_BASE
+    try {
+      const resolved = resolveProviderRequest({ model: 'codexplan' })
+      expect(resolved.transport).toBe('codex_responses')
+      expect(resolved.resolvedModel).toBe('gpt-5.4')
+      expect(resolved.reasoning).toEqual({ effort: 'high' })
+    } finally {
+      if (savedBaseUrl === undefined) delete process.env.OPENAI_BASE_URL
+      else process.env.OPENAI_BASE_URL = savedBaseUrl
+      if (savedApiBase === undefined) delete process.env.OPENAI_API_BASE
+      else process.env.OPENAI_API_BASE = savedApiBase
+    }
   })
 
   test('loads Codex credentials from auth.json fallback', () => {

@@ -1,4 +1,4 @@
-import { describe, expect, test, afterEach } from 'bun:test'
+import { describe, expect, test, afterEach, beforeEach } from 'bun:test'
 import { getRateLimitResetDelayMs, parseOpenAIDuration } from './withRetry.js'
 import { APIError } from '@anthropic-ai/sdk'
 
@@ -63,6 +63,26 @@ describe('parseOpenAIDuration', () => {
 
 // --- getRateLimitResetDelayMs ---
 describe('getRateLimitResetDelayMs - Anthropic (firstParty)', () => {
+  // Hermetic: getAPIProvider() only returns 'firstParty' when none of these
+  // explicit-selection vars are truthy. This repo's root .env (auto-loaded by
+  // `bun test`) sets CLAUDE_CODE_USE_OPENAI=1 for local provider
+  // experimentation, which would otherwise route getRateLimitResetDelayMs
+  // through the 'openai' branch instead of 'firstParty' and mask this
+  // describe block's actual assertions. Explicitly clear rather than rely on
+  // ambient absence; the outer afterEach above already restores originals.
+  beforeEach(() => {
+    for (const key of [
+      'CLAUDE_CODE_USE_OPENAI',
+      'CLAUDE_CODE_USE_GEMINI',
+      'CLAUDE_CODE_USE_GITHUB',
+      'CLAUDE_CODE_USE_BEDROCK',
+      'CLAUDE_CODE_USE_VERTEX',
+      'CLAUDE_CODE_USE_FOUNDRY',
+    ]) {
+      delete process.env[key]
+    }
+  })
+
   test('reads anthropic-ratelimit-unified-reset Unix timestamp', () => {
     const futureUnixSec = Math.floor(Date.now() / 1000) + 60
     const error = makeError({

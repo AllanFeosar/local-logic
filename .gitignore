@@ -17,6 +17,11 @@ __pycache__/
 # either (flagged in the 2026-08-12 security review)
 python-bridge/*.log
 
+# python-bridge's dedicated CUDA venv (2026-08-12) — several GB of
+# installed packages incl. a CUDA torch build, never belongs in git; see
+# python-bridge/README.md for how to rebuild it from requirements.txt
+python-bridge/venv/
+
 # Local MCP server config — real absolute paths, machine-specific
 .mcp.json
 !.mcp.json.example

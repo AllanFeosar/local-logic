@@ -191,3 +191,84 @@ independent agents including this one): the providerConfig.ts codexplan-alias-re
 bug and the withRetry.ts Anthropic rate-limit-header-parsing bug surfaced by test failures
 during this session's work. Both are being fixed in a follow-up covered by their own
 audit-log entry when that work lands.
+
+## 2026-08-12 — Local-AI session 3/3b: DataAnalyzeTool, delegation ledger, MCP-scoping, dedicated CUDA venv + Phase 3 models
+Files audited: src/tools/DataAnalyzeTool/DataAnalyzeTool.ts, src/tools/DataAnalyzeTool/schemas.ts, src/tools/DataAnalyzeTool/predictTask.ts, src/tools/DataAnalyzeTool/prompt.ts, src/tools/DataAnalyzeTool/DataAnalyzeTool.test.ts, src/delegationLedger.ts, src/delegationLedger.test.ts, src/query.ts, src/tools.ts, src/services/mcp/config.ts, src/utils/providerProfile.ts, src/services/api/codexShim.test.ts, src/services/api/withRetry.test.ts, src/services/api/toolCallRecoveryIntegration.test.ts, scripts/eval/routingEval.ts, scripts/eval/routingCases.ts, python-bridge/server.py, python-bridge/local_models/table_qa.py, python-bridge/local_models/tabular_predict.py, python-bridge/local_models/forecast.py, python-bridge/local_models/manager.py, python-bridge/local_models/document_qa.py, python-bridge/local_models/image_caption.py, python-bridge/requirements.txt, python-bridge/start.ps1, .gitignore, package.json
+Also staged in this commit, declared rather than deep-read (test-only, no production
+surface — recorded here so every staged security-sensitive file is named per the gate's
+requirement, not folded silently into the "audited" list above): src/tools/DataAnalyzeTool/DataAnalyzeTool.live.test.ts (live-network test mirroring the already-audited .test.ts's assertions against the real bridge, no new logic), src/tools/DataAnalyzeTool/predictTask.test.ts (pure unit tests for predictTask.ts's classification heuristic, no I/O), src/services/api/toolCallRecoveryIntegration.live.test.ts (verbatim relocation of the one live test deleted from toolCallRecoveryIntegration.test.ts, which was read in full).
+Verdict: 0 Critical, 0 High, 0 Medium, 1 Low (fixed), 2 informational (no action needed)
+Recommendation: ship (Low finding fixed and re-verified live before this entry was written)
+Findings: none blocking — 1 Low finding recorded inline below, fixed same session; no separate handoff report
+
+Read-only audit performed by security-audit-agent (dispatched by the orchestrating session,
+which applied the one code fix from its findings and re-verified live before staging this
+entry — the audit agent itself has no Write/Edit tools by design).
+
+Pass/fail against every check requested (all seven passed, one with a finding):
+1. DataAnalyzeTool: input re-validated via the discriminated union in validateInput()/call()
+   before any network call; no SSRF (fixed loopback base URL, hardcoded route paths, nothing
+   request-derived reaches host/protocol/path); no auth headers; no string-templating
+   injection surface (body is JSON.stringify over schema-validated arrays). checkPermissions
+   posture matches the already-audited DocumentQATool/ImageCaptionTool pattern and is
+   strictly less exposed (no filesystem path taken at all).
+2. delegationLedger.ts: no-raw-query-text claim verified structurally (the only free-text
+   field is a SHA-256 hash, tool arguments/results are never persisted — results are read
+   only transiently for outcome classification, never written); "never throws" verified
+   structurally (the entire body, including the file writes, is inside one try/catch); file
+   path is built from fixed module constants with no input-derived segment, no traversal
+   possible; reports/ is gitignored.
+3. OPENCLAUDE_DISABLED_MCP_SERVERS: traced every consumer of isMcpServerDisabled — the new
+   branch is monotonically restrictive (can only disable, never re-enable, a server another
+   check already disabled), and no consumer uses "disabled" status to skip a permission
+   check. The one path that could matter (an MCP-hosted --permission-prompt-tool) fails
+   closed if unreachable rather than defaulting to allow. Confirmed profile-scoped in both
+   directions: cleared on every non-ollama branch, and applyProfileEnvToProcessEnv deletes
+   it before reassignment so it cannot survive a profile switch.
+4. query.ts wiring: logDelegationDecision runs strictly after the real tool result is already
+   yielded to the user, so it cannot block, reorder, or fail the actual response path.
+5. Confirmed via direct git diff/status: providerConfig.ts and withRetry.ts show zero changes
+   this session — the two pre-existing test failures were fixed via test-side env isolation
+   only, never by touching production logic.
+6. package.json: exactly the two expected script changes (new eval:routing entry,
+   --path-ignore-patterns added to test:provider), nothing else.
+7. Python bridge additions: line-by-line validation review of table_qa.py/forecast.py/
+   tabular_predict.py confirmed malformed-input handling (empty/ragged/mismatched-length
+   input) raises a mapped 400 in every case except the one Low finding below. Device
+   placement confirmed safe (device string is never request-derived, CUDA-unavailable and
+   CUDA-OOM both fail cleanly to CPU/a clean per-model-lock release with no partial state
+   entering the loaded-model registry). python-bridge/venv/ confirmed gitignored. TabPFN's
+   telemetry-disable env var confirmed to run before the only (lazy, function-local) import
+   of tabpfn anywhere in the bridge, and independently confirmed against the installed
+   package's own source that the telemetry service reads that var and short-circuits before
+   any network call — no outbound request occurs. Also checked and clear: TabPFN's checkpoint
+   load uses weights_only=True (this torch version's resolved default) — no pickle-
+   deserialization RCE surface; routingEval.ts spawns via argv array with no shell:true and
+   strips provider-selection env vars before spawning — no command injection, no risk of a
+   local eval run silently hitting a paid cloud provider.
+
+LOW (fixed) — /tabular-predict returned a raw 500, not the contracted 400, for a reachable
+edge case: an explicit operation="regress" call with non-numeric (string) train_labels.
+_validate_table() checked shape but not label type; the unchecked
+np.array(train_labels, dtype=float) conversion raised a bare ValueError that escaped the
+route's InvalidTabularInput handler. Not reachable through DataAnalyzeTool's own inference
+path (predictTask.ts always infers "classify" for any string label) but reachable if a
+caller sets task="regress" explicitly, which the flat tool schema permits. No security
+impact on its own (loopback-only, no crash, no sensitive data in the 500 body) — a
+contract-accuracy defect, not a vulnerability. Fixed same session in
+python-bridge/local_models/tabular_predict.py: an explicit label-type check ahead of the
+float conversion, raising InvalidTabularInput (mapped to 400) with a clear message pointing
+the caller at operation="classify" instead. Verified live: the same request that previously
+would have 500'd now returns 400 with the expected message; a normal all-numeric regress
+call re-verified unaffected.
+
+Informational, no action taken: TabPFN's telemetry-disable line uses os.environ.setdefault
+rather than an unconditional assignment — functionally correct in this bridge (nothing else
+sets that var), verified true by confirming no network call occurs, but the code's own
+comment reads as slightly stronger than the setdefault semantics actually guarantee; a minor
+documentation-precision note only, not a fix. Stray zero-byte debug artifacts
+(doc_qa_result.json, import_check2.pid, pip_check.pid) at the repo root, left over from
+agent-side manual verification during this session, were flagged as an ungitignored-hygiene
+item — already deleted by the orchestrating session before this entry was staged (confirmed
+absent from git status at commit time), no gitignore pattern was judged necessary for
+one-off scratch files that don't recur as a class the way the earlier *.log finding did.

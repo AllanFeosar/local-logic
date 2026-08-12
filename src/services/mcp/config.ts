@@ -1521,11 +1521,35 @@ function isDefaultDisabledBuiltin(name: string): boolean {
 }
 
 /**
+ * Profile-scoped MCP server denylist, sourced from the
+ * OPENCLAUDE_DISABLED_MCP_SERVERS env var (comma-separated server names).
+ * Populated by providerProfile.ts's buildLaunchEnv() from a provider
+ * profile's persisted env (e.g. .openclaude-profile.json), not by the user
+ * directly. Unlike disabledMcpServers in project settings (which applies
+ * regardless of which provider profile is active), this only takes effect
+ * for whichever profile set it — e.g. an `ollama` profile can exclude
+ * MCP servers that are reasonable for normal cloud-provider usage of this
+ * codebase but are not sensible delegation targets for a small local router
+ * model (see LOCAL_AI_MASTER_PLAN.md §6).
+ */
+function getProfileDisabledMcpServerNames(): string[] {
+  const raw = process.env.OPENCLAUDE_DISABLED_MCP_SERVERS
+  if (!raw) return []
+  return raw
+    .split(',')
+    .map(name => name.trim())
+    .filter(Boolean)
+}
+
+/**
  * Check if an MCP server is disabled
  * @param name The name of the server
  * @returns true if the server is disabled
  */
 export function isMcpServerDisabled(name: string): boolean {
+  if (getProfileDisabledMcpServerNames().includes(name)) {
+    return true
+  }
   const projectConfig = getCurrentProjectConfig()
   if (isDefaultDisabledBuiltin(name)) {
     const enabledServers = projectConfig.enabledMcpServers || []

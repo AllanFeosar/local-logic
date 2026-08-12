@@ -165,53 +165,7 @@ test('mocked: does not override a real native tool_calls response', async () => 
   expect(toolUseBlocks?.[0]).toMatchObject({ id: 'call_native', name: 'get_stock_price' })
 })
 
-// Note on timing: VibeThinker's visible <think> reasoning before it commits
-// to a tool call is long and variable (observed 195s-300s+ for this exact
-// prompt across runs). Earlier attempts hit Bun's hardcoded 300s fetch
-// timeout mid-generation; createCombinedAbortSignal(..., {timeoutMs:
-// TOOL_CALL_RECOVERY_TIMEOUT_MS}) in openaiShim.ts's create() removes that
-// ceiling (confirmed: a run that previously died at exactly ~300s completed
-// successfully once this was wired in). Also note the model sometimes fills
-// an argument with the JSON-schema shape instead of a concrete value (e.g.
-// {"symbol": {"type": "string"}} instead of {"symbol": "AAPL"}) — this test
-// only asserts the structural guarantee (a correctly-named, correctly-keyed
-// tool call was recovered), not that the argument value is semantically
-// correct, since that's a model-quality issue orthogonal to recovery.
-test('real Ollama + VibeThinker-3B: end-to-end tool call recovery against the live model', async () => {
-  const client = createOpenAIShimClient({}) as OpenAIShimClient
-  process.env.OPENAI_BASE_URL = 'http://127.0.0.1:11434/v1'
-  process.env.OPENAI_API_KEY = 'ollama'
-
-  const result = await client.beta.messages.create({
-    model: 'hf.co/mradermacher/VibeThinker-3B-GGUF:Q4_K_M',
-    messages: [
-      {
-        role: 'user',
-        content:
-          'Call get_stock_price for AAPL now. Respond with only the tool call, no explanation.',
-      },
-    ],
-    tools: [
-      {
-        name: 'get_stock_price',
-        description: 'Get the current live stock price for a given ticker symbol',
-        input_schema: {
-          type: 'object',
-          properties: { symbol: { type: 'string' } },
-          required: ['symbol'],
-        },
-      },
-    ],
-    max_tokens: 1024,
-    stream: true, // deliberately request streaming — recovery must still force non-streaming under the hood
-  })
-
-  const toolUse = result.content?.find(c => c.type === 'tool_use')
-  // This is a real model call. Assert on the structural guarantee (a
-  // recovered tool call was found and correctly shaped), not on the model
-  // picking exactly "AAPL" as the argument every single run.
-  expect(toolUse).toBeDefined()
-  expect(toolUse?.name).toBe('get_stock_price')
-  expect(toolUse?.input).toHaveProperty('symbol')
-  expect(result.stop_reason).toBe('tool_use')
-}, 400000)
+// The live, real-model variant of this test (self-documented nondeterministic
+// output, ~90s-300s+ runtime) lives in
+// toolCallRecoveryIntegration.live.test.ts — not run as part of the
+// deterministic test:provider gate. See that file for why.

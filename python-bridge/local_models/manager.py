@@ -27,12 +27,25 @@ What this gives every registered model for free:
   in-use model is never forcibly evicted, a warning is logged instead)
   and load this one alone. No heavy models are registered yet; this is
   the mechanism Tier C models (SD, MusicGen, TTS) will opt into.
-- **Device placement config (stub).** `ModelSpec(device=..., fp16=...)` is
-  informational only right now — surfaced in `/status`, logged on load —
-  and does NOT actually place anything on a GPU. This venv's torch build
-  is CPU-only; wiring real CUDA placement is an explicit separate decision
-  (LOCAL_AI_MASTER_PLAN.md §5: needs a new dedicated venv). Loaders should
-  keep loading onto CPU regardless of what a spec declares for now.
+- **Device placement (real, as of the dedicated CUDA venv — 2026-08-12).**
+  `ModelSpec(device=..., fp16=...)` declares where a model *wants* to run.
+  The manager resolves that declaration against actual runtime capability
+  (`_resolve_device()` below) before calling the loader: `device="cuda"`
+  resolves to `"cuda"` only if `torch` is importable AND
+  `torch.cuda.is_available()` is True; any failure along that path (no
+  CUDA build, no GPU, driver issue) is caught and logged, and resolution
+  falls back to `"cpu"` rather than raising — a model that wants the GPU
+  must never be able to crash the bridge just because the GPU isn't there
+  today. The resolved device (not just the declared one) is passed to
+  `spec.loader(resolved_device)` — **loader callables now take one
+  positional argument**, the device string to load onto, instead of being
+  zero-arg. `fp16` is only honored when the resolved device is `"cuda"`
+  (no-op on CPU); loaders decide what "honoring fp16" means for their own
+  model (typically `.half()` after `.to("cuda")`) since that's model-
+  specific. `_Entry.resolved_device` records what actually happened so
+  `/status` reports reality, not just the declared config, and eviction
+  can call `torch.cuda.empty_cache()` only for entries that actually used
+  the GPU.
 - **`/status` support.** `manager.status()` returns what's loaded, the
   declared/estimated committed MB, and a real current-process RSS reading
   (via `get_process_rss_mb()` below — stdlib-only, no `psutil`; see that
@@ -71,7 +84,11 @@ DEFAULT_BUDGET_MB = float(os.environ.get("MODEL_BRIDGE_BUDGET_MB", "4608"))
 @dataclass(frozen=True)
 class ModelSpec:
     name: str
-    loader: Callable[[], object]
+    # Takes the *resolved* device string ("cuda" or "cpu" — see
+    # _resolve_device() below) and returns a handle. Not zero-arg: every
+    # loader must accept this one positional argument even if it ignores it
+    # (e.g. a CPU-only model that never expects "cuda").
+    loader: Callable[[str], object]
     # Declared footprint estimate in MB, used for budget/eviction decisions
     # (see the registering module for how this was derived — typically
     # on-disk weight size plus a runtime-overhead margin). This is a static
@@ -82,28 +99,68 @@ class ModelSpec:
     # eviction bookkeeping.
     estimated_mb: float
     # Optional cleanup hook run with the loader's returned handle right
-    # before it's dropped. Default (None): just drop the reference and
-    # gc.collect() — sufficient for CPU tensors. A future CUDA-placed model
-    # would want this to call torch.cuda.empty_cache() too (TODO once
-    # device="cuda" is real, not a stub).
+    # before it's dropped. Default (None): just drop the reference,
+    # gc.collect(), and (for CUDA-resolved entries) torch.cuda.empty_cache()
+    # — see _evict() below, which handles the CUDA case generically so
+    # individual CUDA-placed models don't each need their own unloader just
+    # for that. Only set this for a model that needs extra cleanup beyond
+    # that (e.g. an explicit .to("cpu") first, or freeing a non-tensor
+    # native resource).
     unloader: Optional[Callable[[object], None]] = None
     # Heavy models evict everything else and load alone. No heavy models
     # are registered yet — this is the flag Tier C models opt into later.
     heavy: bool = False
-    # "cpu" | "cuda" — placement stub, see module docstring. Not enforced.
+    # "cpu" | "cuda" — declared preference. Resolved against actual runtime
+    # capability at load time (see _resolve_device()); "cuda" falls back to
+    # "cpu" automatically if CUDA isn't available for any reason.
     device: str = "cpu"
-    # TODO: honored once device="cuda" is real; no-op on cpu.
+    # Only honored when the resolved device is "cuda" (no-op on cpu). What
+    # "honoring" means is up to each loader (typically model.half()).
     fp16: bool = False
 
 
 class _Entry:
-    __slots__ = ("spec", "handle", "in_use", "loaded_at")
+    __slots__ = ("spec", "handle", "in_use", "loaded_at", "resolved_device")
 
-    def __init__(self, spec: ModelSpec, handle: object):
+    def __init__(self, spec: ModelSpec, handle: object, resolved_device: str):
         self.spec = spec
         self.handle = handle
         self.in_use = 0
         self.loaded_at = time.time()
+        # What the model actually loaded onto, which can differ from
+        # spec.device if a "cuda" request fell back to CPU — see
+        # _resolve_device(). This is what /status and eviction should
+        # trust, not the raw declared spec.device.
+        self.resolved_device = resolved_device
+
+
+def _resolve_device(spec: ModelSpec) -> str:
+    """Resolve a ModelSpec's declared device against actual runtime
+    capability. Never raises — any problem (torch not importable, no CUDA
+    build, no GPU present, driver issue) is logged and treated as "fall
+    back to CPU" rather than taking the bridge down. A model that declares
+    device="cuda" must still work (just slower) on a machine/venv without a
+    working GPU.
+    """
+    if spec.device != "cuda":
+        return "cpu"
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            return "cuda"
+        logger.warning(
+            "model %r declares device='cuda' but torch.cuda.is_available() "
+            "is False in this venv/runtime — falling back to CPU.",
+            spec.name,
+        )
+    except Exception:
+        logger.exception(
+            "model %r declares device='cuda' but checking CUDA availability "
+            "raised — falling back to CPU.",
+            spec.name,
+        )
+    return "cpu"
 
 
 class ModelManager:
@@ -150,16 +207,14 @@ class ModelManager:
 
             if entry is None:
                 self._make_room_for(spec)
-                if spec.device != "cpu":
-                    logger.warning(
-                        "model %r declares device=%r but device placement is a "
-                        "no-op stub in this venv (CPU-only torch) — loading on "
-                        "CPU regardless. See LOCAL_AI_MASTER_PLAN.md §5.",
-                        name, spec.device,
-                    )
-                logger.info("loading model %r (~%.0f MB estimated)", name, spec.estimated_mb)
-                handle = spec.loader()
-                entry = _Entry(spec, handle)
+                resolved_device = _resolve_device(spec)
+                logger.info(
+                    "loading model %r (~%.0f MB estimated, device=%s%s)",
+                    name, spec.estimated_mb, resolved_device,
+                    " fp16" if (spec.fp16 and resolved_device == "cuda") else "",
+                )
+                handle = spec.loader(resolved_device)
+                entry = _Entry(spec, handle, resolved_device)
                 with self._state_lock:
                     self._loaded[name] = entry
                     self._loaded.move_to_end(name)
@@ -211,8 +266,20 @@ class ModelManager:
                 entry.spec.unloader(entry.handle)
             except Exception:
                 logger.exception("unloader for %r raised", name)
+        resolved_device = entry.resolved_device
         del entry
         gc.collect()
+        if resolved_device == "cuda":
+            # Release cached CUDA allocator blocks back to the driver so a
+            # subsequent different model actually sees the freed VRAM
+            # (torch's caching allocator otherwise holds onto them for
+            # itself). Best-effort — never let cleanup take the bridge down.
+            try:
+                import torch
+
+                torch.cuda.empty_cache()
+            except Exception:
+                logger.exception("torch.cuda.empty_cache() failed while evicting %r", name)
 
     def status(self) -> dict:
         with self._state_lock:
@@ -221,8 +288,11 @@ class ModelManager:
                     "name": n,
                     "estimated_mb": e.spec.estimated_mb,
                     "heavy": e.spec.heavy,
-                    "device": e.spec.device,
-                    "fp16": e.spec.fp16,
+                    # Actual resolved placement, not just what the spec
+                    # asked for — see _resolve_device()'s docstring.
+                    "device": e.resolved_device,
+                    "declared_device": e.spec.device,
+                    "fp16": bool(e.spec.fp16 and e.resolved_device == "cuda"),
                     "in_use": e.in_use,
                     "loaded_at": e.loaded_at,
                     "resident_seconds": round(time.time() - e.loaded_at, 1),

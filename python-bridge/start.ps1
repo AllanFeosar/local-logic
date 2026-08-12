@@ -1,13 +1,14 @@
-# Starts the local model bridge server. Reuses the Debate project's venv by
-# default (it already has torch/transformers/fastapi installed — see
-# requirements.txt for what's needed if pointing this at a fresh venv instead
-# via $env:MODEL_BRIDGE_PYTHON before running this script).
+# Starts the local model bridge server. Defaults to the dedicated CUDA venv
+# at python-bridge/venv (built 2026-08-12 — see README.md's "The venv" for
+# exactly what's pinned in it and why). Override with $env:MODEL_BRIDGE_PYTHON
+# to point at a different interpreter instead (e.g. to fall back to the old
+# borrowed Debate venv, or a from-scratch CPU-only venv per requirements.txt).
 
-$defaultPython = "E:\Allan Project\Debate Project\Debate\backend\venv\Scripts\python.exe"
+$defaultPython = Join-Path $PSScriptRoot "venv\Scripts\python.exe"
 $python = if ($env:MODEL_BRIDGE_PYTHON) { $env:MODEL_BRIDGE_PYTHON } else { $defaultPython }
 
 if (-not (Test-Path $python)) {
-    Write-Error "Python interpreter not found at $python. Set `$env:MODEL_BRIDGE_PYTHON to a venv's python.exe (needs fastapi, uvicorn, transformers, torch — see requirements.txt)."
+    Write-Error "Python interpreter not found at $python. Either build the dedicated venv (see README.md's 'The venv' section) or set `$env:MODEL_BRIDGE_PYTHON to another venv's python.exe (needs fastapi, uvicorn, transformers, torch, tabpfn, chronos-forecasting — see README.md for the full pinned list)."
     exit 1
 }
 

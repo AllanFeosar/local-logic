@@ -320,3 +320,297 @@ See the question list relayed separately.
   Killed both, restarted cleanly through the one correct path. Not
   investigated further where the second one came from (likely a stray
   manual run during today's agent work) — worth a glance if it recurs.
+
+## Session 3 (2026-08-12, provider-router-agent) — routing eval built, measured, two mitigations tried
+
+Executed the reordered Phase 0/1 plan from `LOCAL_AI_MASTER_PLAN.md` §6/§8.
+Full detail below; summary: **the routing eval is real and reproducible
+(35.0% across three separate runs), MCP-scoping fixed latency/reliability
+but not accuracy, and the single largest failure mode turned out to be
+something the plan didn't anticipate — the router going completely silent
+(zero output tokens) on certain prompts, not just picking the wrong tool.**
+
+### Built: the routing eval (`scripts/eval/routingEval.ts`, `routingCases.ts`)
+
+20 fixed prompts (5 math / 5 DocumentQA / 5 ImageCaption / 5 no-tool-needed
+distractors), run through the real compiled CLI
+(`node bin/openclaude -p "<prompt>" --output-format stream-json --verbose`),
+scored purely on whether the router's *first* tool_use block matches the
+expected tool (or correctly calls none) — independent of whether the
+specialist would have answered correctly. Kills the child process as soon as
+the router's decision is visible in the JSONL stream (doesn't wait for the
+specialist to finish), so a 20-case run takes seconds-to-low-minutes instead
+of the 15s-5min a full AskMathModel round trip can take. `bun run
+eval:routing`.
+
+**Baseline: 7/20 correct (35.0%)**, reproduced identically (same 7 correct,
+same failure distribution) across three separate full runs at different
+points in the session. Breakdown: ImageCaption 5/5 correct; AskMathModel
+0/5 (4 silent, 1 wrong-tool); DocumentQA 0/5 (mostly silent, 2 wrong-tool
+`Read`); distractors 2/5 (2 hallucinated `Skill{skill:"math"}` calls for
+trivial arithmetic — the exact bug reported in Session 2 — plus one
+`ImageCaption` called on a plain conversational prompt).
+
+### Mitigation 1 — scope MCP servers out of the `ollama` profile (implemented)
+
+Added `OPENCLAUDE_DISABLED_MCP_SERVERS` (comma-separated server names) as a
+new field in `.openclaude-profile.json`'s `env` — profile-scoped, not
+global: `src/services/mcp/config.ts`'s `isMcpServerDisabled()` now also
+checks this env var, and `src/utils/providerProfile.ts`'s `buildLaunchEnv()`
+only carries it through for the `ollama` branch (explicitly cleared for
+every other profile). `.openclaude-profile.json`'s `ollama` profile now sets
+it to `mempalace,lmstudio,graphify`. Confirmed via the CLI's own init event:
+tool count dropped from 71 (24 built-ins + 47 MCP tools) to 23 built-ins,
+`mcp_servers` shows all three as `"status":"disabled"`, and every other
+profile (openai/codex/gemini/atomic-chat) is unaffected.
+
+**Result: score unchanged at 7/20 (35.0%)**, but per-case latency dropped
+roughly 2-3x (most cases 7-25s → 3-4s) since three MCP stdio subprocesses no
+longer spin up and tear down on every single CLI invocation — a real
+reliability win (eliminates a class of resource-contention-driven flakiness
+this session hit early on) even though it didn't move tool-selection
+accuracy. Matches the master plan's own caveat that this "may just buy
+headroom before the next steps are needed."
+
+### Mitigation 2 — tool-name validation net (found already implemented, doesn't cover the dominant failure modes)
+
+`src/services/tools/toolExecution.ts` already rejects calls to tool names
+that aren't in the registered list at all
+(`<tool_use_error>Error: No such tool available: ${toolName}</tool_use_error>`,
+confirmed by reading that code — not modified, it's tools-execution-agent's
+file, not provider-router-agent's). This satisfies item 3 as literally
+scoped, but it doesn't touch any of the four failure patterns the baseline
+actually shows: silent/empty turns, the router picking a *real* wrong tool
+(`Read`, `ToolSearch`, `Grep`), or `Skill` being called with a fabricated
+skill name (`Skill` itself is a real, registered tool — only its `skill`
+argument is hallucinated, which is validated, if at all, inside the Skill
+tool's own runtime logic, not at the tool-name layer). Concluded no further
+work was needed/appropriate here this session.
+
+### Mitigation 3 — semantic tool pre-filtering: deferred, not attempted
+
+Per the master plan's own framing ("the biggest, riskiest change in this
+list — only attempt if 2-3 didn't get the eval score high enough"), and
+given: (a) mitigations 1-2 didn't move accuracy, satisfying that trigger
+condition, but (b) this touches the shared tool-list-construction path used
+by *every* provider, not just local ones — a mistake here has a much bigger
+blast radius than anything else in this session's changes — and (c) session
+time budget didn't leave room to build and adequately verify it with the
+care that risk deserves. **Recommended next step**, not done. Deferred
+cleanly: nothing half-built, nothing landed that needs finishing.
+
+### New finding not anticipated by the plan: silent (zero-token) completions, not just wrong-tool selection
+
+8 of the 20 baseline cases (all classified `no-tool-called`) weren't the
+router picking a wrong tool — they were the router producing **zero output
+tokens** and no text either: `"result":"", "stop_reason":"end_turn",
+"usage":{"output_tokens":0,...}`, `is_error:false`, ~1-3s. Verified
+reproducible: `curl`ing Ollama directly with the same prompt but a minimal
+1-tool payload (not the full system prompt) returns a correct native
+`tool_calls` response every time; something about the *full* production
+request (real system prompt + full tool list, `reasoning_effort:"none"`)
+occasionally makes qwen3:1.7b emit nothing at all for certain
+multi-digit-math-shaped prompts specifically (not general prompts — "Say the
+word banana"/"hi" never reproduced this). Not root-caused this session (out
+of time budget; plausibly an Ollama/qwen3 quirk under this exact request
+shape, not obviously a bug in this codebase's request construction) — this
+is the single largest failure category in the eval and the top recommended
+follow-up, ahead of semantic pre-filtering, since no amount of tool-list
+trimming fixes a turn that produces no output at all.
+
+### Two "pre-existing bugs" — root-caused as one hermeticity issue, not two logic bugs
+
+Both `codexShim.test.ts`'s `codexplan` transport-resolution test and
+`withRetry.test.ts`'s `anthropic-ratelimit-unified-reset` test were
+reported as bugs in `providerConfig.ts`/`withRetry.ts`. Traced precisely:
+both pass with **zero source changes** once the root `.env` (auto-loaded by
+`bun test`, has `CLAUDE_CODE_USE_OPENAI=1`/`OPENAI_MODEL=qwen/qwq-32b`/
+`OPENAI_BASE_URL=https://integrate.api.nvidia.com/v1`) is excluded
+(`bun test ... --env-file=/dev/null`). `providerConfig.ts`'s "custom
+`OPENAI_BASE_URL` always wins over Codex-alias detection" is intentional,
+documented behavior (`#200`/`#203` comment) — the ambient `.env`'s
+`OPENAI_BASE_URL` was legitimately triggering it, not a bug. Same story for
+`withRetry.ts`'s `getRateLimitResetDelayMs`: `getAPIProvider()` correctly
+returns `'openai'` (not `'firstParty'`) once `CLAUDE_CODE_USE_OPENAI=1` is
+set — also correct, intentional behavior. **Fixed by making the two
+specific tests hermetic** (explicit env clear/restore around the assertions
+that depend on ambient absence) rather than touching either source file —
+see `src/services/api/codexShim.test.ts` and `withRetry.test.ts`. Verified:
+both pass identically with and without the polluted `.env` loaded.
+
+### `test:provider` gate hermeticity
+
+- `codexShim.test.ts` / `withRetry.test.ts`: see above.
+- `toolCallRecoveryIntegration.test.ts`'s one live, ~90s+, self-documented
+  nondeterministic VibeThinker call moved to a new
+  `toolCallRecoveryIntegration.live.test.ts`, following this repo's existing
+  `*.live.test.ts` convention (`src/memdir/rerank.live.test.ts` etc.).
+  **Important nuance found while doing this**: that naming convention is
+  documentation-only in this repo, not a mechanical exclusion — a bare `bun
+  test` (no path args) and shell-glob-based scripts like the old
+  `test:provider` (`bun test src/services/api/*.test.ts ...`) both still
+  pick up `*.live.test.ts` files, since `*.test.ts` matches any suffix
+  ending in `.test.ts`. Fixed `test:provider` in `package.json` to add
+  `--path-ignore-patterns='**/*.live.test.ts'` (quoted, so the shell doesn't
+  try to glob-expand it itself before bun sees it). Verified: `bun run
+  test:provider` now runs 11 files / 89 tests in ~10-36s (no more 90s+ live
+  call), same pass count as before.
+- **Also found and fixed, not originally in scope but the same root cause**:
+  `scripts/eval/routingEval.ts` spawns `node bin/openclaude` as a child
+  process. Since `bun run <script>.ts` (unlike a plain shell) *always*
+  auto-loads the project's own `.env` into its own `process.env` — this
+  isn't a `bun test`-only behavior — blindly forwarding `process.env` to the
+  spawned child made every eval case silently route through NVIDIA NIM
+  instead of Ollama (`hasExplicitProviderSelection()` in
+  `providerProfile.ts` sees `CLAUDE_CODE_USE_OPENAI=1` from `.env` and skips
+  applying `.openclaude-profile.json` entirely). Fixed by having
+  `routingEval.ts` explicitly clear the same provider-selection env vars
+  before spawning. **Worth flagging generally**: any future script that
+  does `bun run some-script.ts` and spawns `node bin/openclaude` (or
+  anything else that reads `OPENAI_*`/`CLAUDE_CODE_USE_*`) as a child needs
+  the same guard, or it will silently pick up this project's live NVIDIA key
+  instead of the intended local profile.
+- **Correction to a Session 2 claim**: Session 2 attributed
+  `remoteAgentService.test.ts`'s 2 failures (part of "6 are
+  applyProviderFlag/remoteAgentService tests polluted by `.env`") to `.env`
+  pollution. Re-checked this session: they fail identically with `.env`
+  fully cleared (`--env-file=/dev/null`). The real cause looks different —
+  `remoteAgentService.test.ts` imports from `vitest` (`vi.mock`,
+  `vi.clearAllMocks`), not `bun:test`, and is being executed via `bun test`
+  regardless; a vitest/bun mocking-compatibility gap is a much more likely
+  culprit than env pollution. Confirmed pre-existing either way (nothing
+  this session or last touches `remoteAgentService.ts`/`backendClient.ts`)
+  and out of scope to fix here — flagged as a more precise diagnosis for
+  whoever does pick it up, not fixed.
+
+### Delegation ledger (`src/delegationLedger.ts`, new)
+
+Passive observer wired into `query.ts` right next to the existing
+`observeToolUpdateForLearning` call (same contract: never blocks, rewrites,
+or reorders a tool call; only watches the already-yielded `tool_result`
+stream after the fact; never throws). Appends one JSON line per tool
+delegation to `reports/delegation-ledger.jsonl`:
+`{timestamp, tool, querySummary, outcome, latencyMs}`, where `querySummary`
+is a SHA-256 hash (first 16 hex chars) of the triggering human message —
+**never raw query text, and never tool arguments/results** (both can carry
+sensitive content — verified via a test that asserts the raw query text
+never appears anywhere in a logged entry). `outcome` is
+`'success' | 'error' | 'hallucinated-tool'`, where `'hallucinated-tool'` is
+detected by matching `toolExecution.ts`'s exact `"No such tool available:"`
+wording in the tool_result content. `latencyMs` is elapsed-since-batch-start
+(an approximation, documented in the code, since tools in one batch
+typically execute concurrently). Tested in `src/delegationLedger.test.ts`
+(9 tests: classification, hashing/no-raw-leak, query extraction skipping
+tool-result-only turns, no-op cases, never-throws). Note: the routing eval
+itself doesn't populate the ledger — it deliberately kills the child process
+right after the router's tool_use decision, before any tool_result exists —
+confirmed populated correctly via a real end-to-end `ImageCaption` run.
+
+### Deferred without attempting: qwen3:4b-instruct A/B (item 8)
+
+Not pulled/tested. The eval evidence this session points more toward (a) a
+genuine silent-completion issue (see above) and (b) `Skill`-tool-argument
+hallucination — neither of which is obviously "the router is too small to
+choose among N tools," the specific hypothesis a 4b A/B would test. Given
+time budget, prioritized measuring/documenting the actual failure shapes
+over speculatively trying a bigger model against them.
+
+## Session 3b (2026-08-12, python-bridge-agent + tools-execution-agent, run in parallel with the above) — CUDA venv, GPU migration, Phase 3 models, DataAnalyzeTool
+
+**Dedicated CUDA venv built and is now the default** (`python-bridge/venv`,
+never shared — the sharing risk from the old Debate-venv arrangement is
+gone entirely, not just mitigated). `torch==2.12.1+cu130` /
+`torchvision==0.27.1+cu130` (driver 610.88 reports CUDA UMD 13.3, comfortably
+covers the cu130 wheel index), confirmed `torch.cuda.is_available()` is
+`True`. `document_qa.py` and `image_caption.py` migrated to real
+`device="cuda", fp16=True` placement (the old `manager.py` stub now
+actually moves tensors, with automatic CPU fallback if CUDA is unavailable
+at runtime) — fp16 output was compared side-by-side against the previous
+fp32-CPU baseline for quality regression (not just speed) before being kept
+as the default; none found. Caught and fixed a real, non-obvious issue
+along the way: the `tabpfn` package pings an external telemetry endpoint on
+construction unless explicitly disabled — confirmed via reading its source
+and setting `TABPFN_DISABLE_TELEMETRY=1` before first import, verified live
+(construction takes ~0.03s, no network activity). Also resolved a real
+`huggingface-hub` version conflict between `tabpfn-common-utils` (wants
+`<1`) and `transformers` 5.12.1 (needs `>=1.5`) by pinning to what
+`transformers` needs and verifying (by reading `tabpfn`'s source) that its
+own runtime path never exercises the incompatible branch — documented as a
+deliberate, verified pin deviation in `requirements.txt`, not an oversight.
+
+**Phase 3 routes wired**: `/tabular-predict` (TabPFN-v2, split into
+`tabpfn-clf`/`tabpfn-reg` model specs), `/table-qa` (tapas-mini-finetuned-wtq),
+`/forecast` (chronos-t5-tiny) — all `device="cpu"` per the plan (tiny
+models, GPU reserved for BLIP/DistilBERT). All three live-verified working
+end-to-end via `DataAnalyzeTool`.
+
+**Quality spot-check finding (not a plumbing bug — flagging honestly since
+this session has been consistently skeptical of unverified claims
+throughout)**: TabPFN and Chronos both look genuinely correct on manual
+spot-checks (TabPFN correctly classified well-separated clusters with
+sensible confidence; Chronos produced sane trend continuations with
+reasonable uncertainty bands). **TAPAS's answer quality looks weak on basic
+cross-column conditional lookups** — "What is the revenue of Gadget?"
+against a 3-row table incorrectly returned row 0's value (Widget's revenue,
+not Gadget's); a same-column echo question ("which product is Gizmo") did
+work. The route itself is mechanically correct (well-formed request/response,
+matches the contract) — this looks like a real capability limitation of the
+tiny `tapas-mini-finetuned-wtq` checkpoint, not an integration bug. Doesn't
+block Phase 3's gate (which centers on TabPFN as the flagship "local beats
+frontier" demo, not TAPAS), but worth knowing before leaning on `/table-qa`
+for anything real — a small eval set for `DataAnalyze`'s `"question"`
+operation specifically (mirroring `specialistEval.ts`'s pattern) is a
+reasonable near-term follow-up.
+
+**`DataAnalyzeTool`** (`src/tools/DataAnalyzeTool/`) — the master plan's
+first real domain-gateway tool (§6 mitigation 2): one tool,
+`operation: "question" | "predict" | "forecast"`, tool-facing schema is a
+flat `ZodObject` with every per-operation field optional (not a top-level
+discriminated union — this project's MCP conversion layer can't handle a
+`oneOf`/`anyOf` JSON Schema root for `outputSchema`, and a flat schema with
+an enum field is also the better bet for a small local tool-calling model
+to generate correctly), with a discriminated union used internally only for
+precise per-operation validation errors. `predictTask.ts`'s
+classify-vs-regress inference (when the caller doesn't specify `task`
+explicitly) uses a documented "looks discrete" heuristic on the label data,
+with its own edge-case caveats written into the tool's own prompt so the
+router knows when to specify `task` explicitly instead of relying on
+inference. Live-verified end-to-end against all three real bridge routes.
+
+## Combined final verification (all three parallel streams merged)
+
+`bun run build`: clean. Full `bun test`: 371 pass / 23 fail — every one of
+the 23 individually traced: 10 `vscode-extension` (separate npm package,
+pre-existing), 4 `applyProviderFlag` (`.env` pollution, pre-existing,
+unrelated file not touched this session), 2 `remoteAgentService`
+(pre-existing, re-diagnosed this session as a vitest/bun mocking
+compatibility gap rather than `.env` pollution as previously assumed — see
+above), 2 the relocated VibeThinker live tests (expected occasional
+nondeterminism, no longer sitting inside a deterministic gate), and 5 "real
+bridge" tests that **pass cleanly when re-run in isolation** — confirmed
+transient resource contention from many live tests hitting the same single
+local Ollama/bridge instance concurrently during a full-suite run (the
+same pattern session 2 already established, now reconfirmed). Zero of the
+23 trace to a real regression from any of this session's three parallel
+streams.
+
+## Open items for next session
+
+- **Top priority**: root-cause the silent zero-token completion bug (see
+  Session 3 above) — the single largest routing-eval failure category, and
+  the routing eval gate (`LOCAL_AI_MASTER_PLAN.md` §8 Phase 1: ≥90%) is not
+  met (currently 35%). Likely needs direct experimentation with the exact
+  production request shape against Ollama to isolate what triggers it.
+- Semantic tool pre-filtering (§6 mitigation 3) — deliberately deferred,
+  not attempted; recommended next structural step once/if the silent-
+  completion issue is resolved and re-measured.
+- qwen3:4b-instruct A/B — deliberately not attempted; the current evidence
+  doesn't clearly point to "model too small," so this isn't the obviously
+  correct next lever (see reasoning above).
+- A small `DataAnalyze`-specific eval set (mirroring `specialistEval.ts`)
+  to properly characterize `/table-qa`'s real accuracy rather than relying
+  on ad hoc spot-checks.
+- Whisper/vision phases (Phase 4/5) — GPU capacity now exists and is
+  proven working (BLIP/DistilBERT on CUDA+fp16), so Phase 4 (Whisper
+  turbo) is no longer blocked on platform work, only on router reliability
+  being resolved first per the phase ordering.

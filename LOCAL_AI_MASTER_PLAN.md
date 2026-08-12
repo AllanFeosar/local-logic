@@ -284,6 +284,24 @@ a menu the router already can't reliably pick from), so it's no longer
   *Gate: routing eval ≥ ~90% AND the 4 existing specialists pass
   delegation end-to-end in the REPL — this is the original Phase-0 gate,
   now correctly sequenced after the thing that was blocking it.*
+  **Status 2026-08-12: gate NOT met.** Routing eval built and run
+  (`scripts/eval/routingEval.ts`) — baseline **35.0% (7/20)**, reproduced
+  identically across three separate runs. MCP-scoping (mitigation 0,
+  implemented and verified: `OPENCLAUDE_DISABLED_MCP_SERVERS` in the
+  `ollama` profile, 71 tools → 24) fixed per-case latency 2-3x but did
+  **not** move accuracy at all — the hypothesis that scoping alone might
+  be sufficient (as originally written above) was wrong. Tool-name
+  validation (mitigation 1) was found already present in the codebase but
+  doesn't cover the actual failure modes seen. Semantic pre-filtering
+  (mitigation 3) and the qwen3:4b A/B (mitigation 5) were deliberately
+  **not attempted** — the eval evidence points somewhere the plan didn't
+  anticipate: 8/20 failures are the router producing **zero output
+  tokens** under the full production request shape for certain
+  math-shaped prompts (not a wrong-tool selection at all), which no
+  amount of tool-list trimming or model upsizing obviously fixes without
+  first understanding it. See `LOCAL_AI_STATUS.md`'s Session 3 for full
+  detail — **this is now the single most important open item in the
+  entire plan.**
 - **Phase 2 — Finish the platform**: dedicated CUDA venv (confirmed
   2026-08-12 — build it; never touch the Debate venv); migrate BLIP +
   DistilBERT to real GPU device placement in `manager.py` (turning the
@@ -295,12 +313,29 @@ a menu the router already can't reliably pick from), so it's no longer
   blocking gate.
   *Gate: stress test — 6 specialist invocations in sequence (mixed CPU
   and GPU), no OOM, no regression on the Phase-0/1 evals.*
+  **Status 2026-08-12: done.** Dedicated CUDA venv built and is the
+  default (`python-bridge/venv`, `torch==2.12.1+cu130`); BLIP + DistilBERT
+  on real `device="cuda", fp16=True` placement, fp16 output verified
+  against the fp32-CPU baseline for quality regression (none found);
+  `test:provider` hermetic (env-isolated + the live VibeThinker test
+  actually excluded via `--path-ignore-patterns`, not just renamed —
+  the `*.live.test.ts` convention turned out to be documentation-only,
+  not mechanically enforced, until this fix).
 - **Phase 3 — Data & tables** (cheapest wins in the library, confirmed
   green-lit 2026-08-12): TabPFN, TAPAS, Chronos behind `DataAnalyze` — the
   first real gateway tool, arriving exactly when tool count would
   otherwise start growing again.
   *Gate: TabPFN beats a frontier-model prompt on ≥1 real small-tabular
   benchmark — the flagship "local beats frontier" demo.*
+  **Status 2026-08-12: routes wired and live-verified, gate not yet
+  formally evaluated** (a proper TabPFN-vs-frontier benchmark comparison
+  hasn't been run — only manual spot-checks, which looked correct for
+  TabPFN/Chronos). **TAPAS quality concern found**: manual spot-checks
+  show `tapas-mini-finetuned-wtq` failing basic cross-column conditional
+  lookups (e.g. "revenue of Gadget" returned a different row's value) —
+  looks like a real capability limitation of this specific tiny
+  checkpoint, not an integration bug. Worth a dedicated eval before
+  leaning on `/table-qa` for anything real.
 - **Phase 4 — Hearing**: silero-vad ONNX (re-download, ~2 MB), Whisper
   turbo on GPU, `AudioAnalyze` + `TranscribeAndSummarize`.
   *Gate: transcription spot-check vs a cloud STT on 3 real recordings.*

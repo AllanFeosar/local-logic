@@ -92,6 +92,7 @@ import { SLEEP_TOOL_NAME } from './tools/SleepTool/prompt.js'
 import { executePostSamplingHooks } from './utils/hooks/postSamplingHooks.js'
 import { executeStopFailureHooks } from './utils/hooks.js'
 import type { QuerySource } from './constants/querySource.js'
+import { logDelegationDecision } from './delegationLedger.js'
 import { createDumpPromptsFetch } from './services/api/dumpPrompts.js'
 import { StreamingToolExecutor } from './services/tools/StreamingToolExecutor.js'
 import { observeToolUpdateForLearning } from './services/tools/learning/toolOutcomeTracker.js'
@@ -1389,6 +1390,8 @@ async function* queryLoop(
       ? streamingToolExecutor.getRemainingResults()
       : runTools(toolUseBlocks, assistantMessages, canUseTool, toolUseContext)
 
+    const toolBatchStartedAtMs = Date.now()
+
     for await (const update of toolUpdates) {
       if (update.message) {
         yield update.message
@@ -1397,6 +1400,17 @@ async function* queryLoop(
         // adaptive tool selector's bandit learning. Never affects what was
         // just yielded above or the control flow below.
         observeToolUpdateForLearning(update.message, toolUseBlocks)
+
+        // Passive observer: appends a delegation-ledger line (tool, hashed
+        // query summary, outcome, latency) — see delegationLedger.ts and
+        // LOCAL_AI_MASTER_PLAN.md §7. Same never-blocks/never-throws
+        // contract as observeToolUpdateForLearning above.
+        logDelegationDecision(
+          update.message,
+          toolUseBlocks,
+          messagesForQuery,
+          toolBatchStartedAtMs,
+        )
 
         if (
           update.message.type === 'attachment' &&

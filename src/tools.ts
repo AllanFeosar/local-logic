@@ -14,6 +14,7 @@ import { BriefTool } from './tools/BriefTool/BriefTool.js'
 import { AskMathModelTool } from './tools/AskMathModelTool/AskMathModelTool.js'
 import { DocumentQATool } from './tools/DocumentQATool/DocumentQATool.js'
 import { ImageCaptionTool } from './tools/ImageCaptionTool/ImageCaptionTool.js'
+import { DataAnalyzeTool } from './tools/DataAnalyzeTool/DataAnalyzeTool.js'
 // Dead code elimination: conditional import for ant-only tools
 /* eslint-disable custom-rules/no-process-env-top-level, @typescript-eslint/no-require-imports */
 const REPLTool =
@@ -213,6 +214,7 @@ export function getAllBaseTools(): Tools {
     AskMathModelTool,
     DocumentQATool,
     ImageCaptionTool,
+    DataAnalyzeTool,
     TaskStopTool,
     AskUserQuestionTool,
     SkillTool,

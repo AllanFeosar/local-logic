@@ -35,6 +35,7 @@ const PROFILE_ENV_KEYS = [
   'GEMINI_MODEL',
   'GEMINI_BASE_URL',
   'GOOGLE_API_KEY',
+  'OPENCLAUDE_DISABLED_MCP_SERVERS',
 ] as const
 
 const SECRET_ENV_KEYS = [
@@ -56,6 +57,18 @@ export type ProfileEnv = {
   GEMINI_API_KEY?: string
   GEMINI_MODEL?: string
   GEMINI_BASE_URL?: string
+  /**
+   * Comma-separated MCP server names to disable for this profile only (see
+   * isMcpServerDisabled in services/mcp/config.ts). Config/profile-scoped
+   * alternative to disabledMcpServers in project settings (which would apply
+   * regardless of active profile) — lets e.g. the `ollama` profile exclude
+   * MCP servers that are sensible for normal (cloud-provider) usage of this
+   * codebase but not sensible delegation targets for a small local router
+   * model (see LOCAL_AI_MASTER_PLAN.md §6). Not set by any of the
+   * build*ProfileEnv() helpers below — this is deliberately opt-in,
+   * hand-configured per profile file, not inferred.
+   */
+  OPENCLAUDE_DISABLED_MCP_SERVERS?: string
 }
 
 export type ProfileFile = {
@@ -498,6 +511,7 @@ export async function buildLaunchEnv(options: {
     delete env.CODEX_API_KEY
     delete env.CHATGPT_ACCOUNT_ID
     delete env.CODEX_ACCOUNT_ID
+    delete env.OPENCLAUDE_DISABLED_MCP_SERVERS
 
     return env
   }
@@ -513,6 +527,10 @@ export async function buildLaunchEnv(options: {
   delete env.GEMINI_MODEL
   delete env.GEMINI_BASE_URL
   delete env.GOOGLE_API_KEY
+  // Cleared by default; only the ollama branch below opts back in from the
+  // persisted profile file. Prevents this from leaking into openai/codex/
+  // atomic-chat launches if it were ever present in the ambient process env.
+  delete env.OPENCLAUDE_DISABLED_MCP_SERVERS
 
   if (options.profile === 'ollama') {
     const getOllamaBaseUrl =
@@ -529,6 +547,16 @@ export async function buildLaunchEnv(options: {
     delete env.CODEX_API_KEY
     delete env.CHATGPT_ACCOUNT_ID
     delete env.CODEX_ACCOUNT_ID
+
+    const persistedDisabledMcpServers = sanitizeProviderConfigValue(
+      persistedEnv.OPENCLAUDE_DISABLED_MCP_SERVERS,
+      persistedEnv,
+    )
+    if (persistedDisabledMcpServers) {
+      env.OPENCLAUDE_DISABLED_MCP_SERVERS = persistedDisabledMcpServers
+    } else {
+      delete env.OPENCLAUDE_DISABLED_MCP_SERVERS
+    }
 
     return env
   }

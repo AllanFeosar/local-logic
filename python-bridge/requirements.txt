@@ -1,10 +1,113 @@
-# Reference only — start.ps1 defaults to reusing an already-populated venv
-# (Debate/backend/venv) that has these installed, so nothing needs to be
-# pip-installed to get started. Use this file if setting up a fresh venv
-# instead (e.g. `python -m venv venv && venv\Scripts\pip install -r requirements.txt`).
-fastapi>=0.115.0
-uvicorn[standard]>=0.30.0
-pydantic>=2.10.0
-transformers>=4.40.0
-torch>=2.3.0
-pillow>=10.0.0
+# Exact pin list for python-bridge/venv (Python 3.11, CUDA-enabled — see
+# README.md's "The venv" section for the full story of how this was
+# resolved/verified). start.ps1 defaults to this venv; nothing here needs
+# to be installed to just run the bridge if venv/ already exists.
+#
+# To rebuild the venv from scratch:
+#   py -3.11 -m venv venv
+#   venv\Scripts\python.exe -m pip install --no-deps --index-url https://download.pytorch.org/whl/cu130 torch==2.12.1+cu130 torchvision==0.27.1+cu130
+#   venv\Scripts\python.exe -m pip install --no-deps -r requirements.txt
+#
+# Every install uses --no-deps with an exact version pinned here — this
+# venv is dedicated to the bridge (not shared with another project like the
+# old borrowed Debate venv was), so the corruption risk that discipline
+# originally guarded against doesn't apply the same way here, but the
+# hygiene is kept anyway: it's what makes this file a reliable, reproducible
+# "this exact set of versions is known to work together" record rather than
+# whatever pip's resolver picks on a given day. These versions were resolved
+# once with normal (dependency-following) pip in a throwaway venv, verified
+# working live against every model in local_models/, then transcribed here
+# and reinstalled with --no-deps into the real venv — see README.md.
+#
+# torch/torchvision (installed separately above, from the CUDA wheel index,
+# not plain PyPI):
+#   torch==2.12.1+cu130
+#   torchvision==0.27.1+cu130
+
+# --- core bridge ---
+fastapi==0.115.6
+uvicorn==0.34.0
+pydantic==2.13.4
+pydantic_core==2.46.4
+annotated-types==0.8.0
+starlette==0.41.3
+anyio==4.14.2
+h11==0.16.0
+httpcore==1.0.9
+httpx==0.28.1
+idna==3.18
+certifi==2026.7.22
+click==8.4.2
+colorama==0.4.6
+python-dotenv==1.2.2
+PyYAML==6.0.3
+watchfiles==1.2.0
+websockets==17.0.1
+httptools==0.8.0
+Jinja2==3.1.6
+MarkupSafe==3.0.3
+
+# --- transformers stack (BLIP, DistilBERT, TAPAS) ---
+transformers==5.12.1
+tokenizers==0.22.2
+huggingface_hub==1.27.0
+safetensors==0.8.0
+hf-xet==1.6.0
+regex==2026.7.19
+tqdm==4.70.0
+pillow==12.3.0
+filelock==3.29.0
+packaging==26.3
+fsspec==2026.4.0
+typing_extensions==4.15.0
+typing-inspection==0.4.3
+typer==0.27.1
+shellingham==1.5.4
+rich==15.0.0
+Pygments==2.20.0
+markdown-it-py==4.2.0
+mdurl==0.1.2
+annotated-doc==0.0.5
+sympy==1.14.0
+mpmath==1.3.0
+networkx==3.6.1
+numpy==2.4.4
+
+# --- TabPFN-v2 (tabular predict) ---
+# See README.md's TabPFN section: TABPFN_DISABLE_TELEMETRY=1 is set by
+# local_models/tabular_predict.py itself before tabpfn is imported, so no
+# telemetry network call happens even though the package supports it.
+# Deliberate deviation: tabpfn-common-utils declares huggingface-hub<1,
+# transformers 5.12.1 needs huggingface-hub>=1.5 — resolved in favor of the
+# newer huggingface_hub pin above; verified live that tabpfn's own runtime
+# usage of huggingface_hub is confined to a hub-download path this bridge
+# never exercises (model_path always points at an already-downloaded local
+# .ckpt file). `pip check` will report this as a conflict; that's expected
+# and was a conscious call, not an oversight — see README.md.
+tabpfn==2.2.1
+tabpfn-common-utils==0.2.23
+scikit-learn==1.6.1
+scipy==1.17.1
+pandas==2.3.3
+einops==0.8.2
+joblib==1.5.3
+threadpoolctl==3.6.0
+python-dateutil==2.9.0.post0
+pytz==2026.3.post1
+tzdata==2026.3
+six==1.17.0
+pydantic-settings==2.15.0
+eval_type_backport==0.4.0
+platformdirs==4.11.2
+posthog==7.38.4
+backoff==2.2.1
+distro==1.9.0
+nvidia-ml-py==13.610.43
+requests==2.34.2
+urllib3==2.7.0
+charset-normalizer==3.4.9
+
+# --- Chronos (forecast) ---
+chronos-forecasting==2.3.1
+accelerate==1.14.0
+psutil==7.2.2

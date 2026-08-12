@@ -116,6 +116,7 @@ most agents will touch:
 | `MCP` (dynamic) | `src/tools/MCPTool/` | One tool instance per MCP server capability, name-prefixed `mcp__server__tool` |
 | `AskMathModel` | `src/tools/AskMathModelTool/` | Calls a local Ollama math specialist — raw completion, not native tool-calling |
 | `DocumentQA` / `ImageCaption` | `src/tools/{DocumentQA,ImageCaption}Tool/` | Call the Python bridge (`python-bridge/`) over local HTTP |
+| `DataAnalyze` | `src/tools/DataAnalyzeTool/` | First domain **gateway tool** per `LOCAL_AI_MASTER_PLAN.md` §6 mitigation 2 — one tool, `operation: "question" \| "predict" \| "forecast"`, dispatching deterministically (no model choice below the gateway) to `/table-qa`, `/tabular-predict`, `/forecast` on the Python bridge. Tool-facing `inputSchema`/`outputSchema` are deliberately flat `ZodObject`s with every per-operation field optional, not a top-level `z.discriminatedUnion` — see `DataAnalyzeTool/schemas.ts`'s comment (mirrors the existing `LSPTool/schemas.ts` pattern: a discriminated union is used internally, in `validateInput()`/`call()`, purely for precise per-operation error messages). Future Vision/Audio gateway tools (§6) should follow this same shape. |
 | `TeamCreate` / `TeamDelete` / `SendMessage` | `src/tools/Team*Tool/`, `SendMessageTool/` | Swarm/teammate orchestration |
 | `EnterPlanMode` / `ExitPlanMode` | `src/tools/*PlanModeTool/` | Permission-mode transitions |
 
@@ -133,24 +134,34 @@ over local HTTP (loopback only, no auth — not internet-facing by design).
 |---|---|---|---|
 | `POST /document-qa` (exact path: see `python-bridge/server.py`) | `DocumentQATool` | `{ question: string, context: string }` | `{ answer: string, score: number }` |
 | `POST /image-caption` | `ImageCaptionTool` | `{ image_path: string }` (corrected 2026-08-12 — was documented as `image`, actual field has always been `image_path`; see `ImageCaptionRequest` in `server.py`) | `{ caption: string }` |
-| `GET /status` | none yet — debugging/eval-harness only | (no body) | `{ budget_mb: number, committed_mb_estimated: number, process_rss_mb: number \| null, rss_source: "windows_working_set" \| "posix_rusage" \| "unavailable", loaded: Array<{ name, estimated_mb, heavy, device, fp16, in_use, loaded_at, resident_seconds }>, registered: string[] }` |
+| `GET /status` | none yet — debugging/eval-harness only | (no body) | `{ budget_mb: number, committed_mb_estimated: number, process_rss_mb: number \| null, rss_source: "windows_working_set" \| "posix_rusage" \| "unavailable", loaded: Array<{ name, estimated_mb, heavy, device, declared_device, fp16, in_use, loaded_at, resident_seconds }>, registered: string[] }` (updated 2026-08-12: `device`/`fp16` now report the *actual resolved* placement, not a declared-only stub — see below; `declared_device` is the new field holding what a model's `ModelSpec` asked for, in case the two differ, e.g. a CUDA request that fell back to CPU) |
 
 `/document-qa` and `/image-caption`'s request/response shapes are
-unchanged by the 2026-08-12 model-manager work (budget cap + LRU eviction,
-single-flight loading, heavy-model exclusivity flag, device-placement
-stub — see `python-bridge/local_models/manager.py`) — that work is purely
-internal to the bridge (what's resident and when), not part of either
-route's contract. `/status` is new and not yet consumed by any TS tool;
-if the eval harness or a future tool needs to call it from TypeScript,
-that's a `tools-execution-agent` pickup, not done here.
+unchanged by the 2026-08-12 model-manager work — both the original budget
+cap/LRU/single-flight/heavy-exclusivity work and the same-day dedicated-
+CUDA-venv follow-up that turned `device`/`fp16` from an informational stub
+into real GPU placement (`document_qa.py`/`image_caption.py` now register
+`device="cuda", fp16=True`, live-verified: correct output unchanged,
+~4x-6x faster than the prior CPU baseline; falls back to CPU automatically
+if CUDA isn't available — see `python-bridge/local_models/manager.py` and
+`python-bridge/README.md`). All of that is purely internal to the bridge
+(what's resident, where, and how fast), not part of either route's
+contract. `/status` is new and not yet consumed by any TS tool; if the
+eval harness or a future tool needs to call it from TypeScript, that's a
+`tools-execution-agent` pickup, not done here.
 
-### Planned routes (2026-08-12) — Phase 3 data/tables, behind `DataAnalyzeTool`
+### Phase 3 data/tables routes, behind `DataAnalyzeTool` — implemented and live-verified 2026-08-12
 
-Contract fixed in advance so `python-bridge-agent` (routes) and
-`tools-execution-agent` (the `DataAnalyze` gateway tool, see §2's routing
-plan in `LOCAL_AI_MASTER_PLAN.md` §6) can build against it in parallel.
-`python-bridge-agent`: if implementation forces a shape change, update
-this table in the same commit that changes the route — don't let it drift.
+All three routes below are now live in the bridge (`python-bridge-agent`,
+2026-08-12), request/response shapes exactly as originally planned —
+**no shape changes**, so no tool-side updates should be needed. Live-
+verified against the real bridge (not just unit-tested): correct
+classify/regress predictions with `probabilities` columns aligned to
+sorted labels, correct table-QA cell grounding, correct forecast shape
+with `low`/`high` always present (chronos-t5-tiny always exposes
+quantiles via sampling, so these are never omitted in practice); malformed
+input (empty/ragged tables, non-positive/excessive horizon, empty series)
+confirmed to return 400/422, never a raw 500.
 
 | Route | Model | Request | Response |
 |---|---|---|---|
@@ -158,11 +169,28 @@ this table in the same commit that changes the route — don't let it drift.
 | `POST /table-qa` | tapas-mini-finetuned-wtq | `{ question: string, table: { columns: string[], rows: string[][] } }` | `{ answer: string, cells: Array<{ row: number, column: number }> }` (`cells` are 0-indexed into `table.rows`/`table.columns`, empty array if the model didn't ground an answer to specific cells) |
 | `POST /forecast` | chronos-t5-tiny | `{ series: number[], horizon: number }` | `{ forecast: number[], low?: number[], high?: number[] }` (`forecast` is the median prediction, length `horizon`; `low`/`high` are an uncertainty band if the underlying model exposes quantiles, omitted otherwise) |
 
-All three: CPU is fine (tiny models, no GPU device placement needed per
-`LOCAL_AI_MASTER_PLAN.md` §3/§4), register via `manager.py`'s `ModelSpec`
-pattern like every other route, loopback-only, no auth, fail with a
-clear 4xx (not a raw 500) on malformed input (e.g. `table.rows` rows of
-inconsistent length, empty `train_features`).
+All three: CPU (tiny models, no GPU device placement needed per
+`LOCAL_AI_MASTER_PLAN.md` §3/§4 — that capacity is reserved for BLIP/
+DistilBERT and future bigger models), register via `manager.py`'s
+`ModelSpec` pattern like every other route, loopback-only, no auth, fail
+with a clear 4xx (not a raw 500) on malformed input (confirmed live:
+empty/ragged `table.rows`, empty `train_features`/`test_features`,
+mismatched `train_features`/`train_labels` length, non-positive or
+excessive `horizon`, too-short `series`).
+
+**Consumer side status (2026-08-12, tools-execution-agent):** `DataAnalyzeTool`
+is built and registered against this exact contract (request/response
+shapes above, verbatim — including sending `train_labels`' classify/regress
+choice through as the bridge's own `operation` field, distinct from the
+tool's own top-level `operation` field which selects question/predict/
+forecast). Mocked tests cover all three operations plus error handling.
+`DataAnalyzeTool.live.test.ts` was written per this repo's
+`*.live.test.ts` convention before these routes went live — **the routes
+are live now** (this update); running that file against the real bridge to
+confirm is still `tools-execution-agent`'s/the orchestrator's pickup (out
+of `python-bridge-agent`'s `src/`-free surface), not done as part of this
+change. No tool-side code changes are expected — no route shape changed
+from what's documented above.
 
 Extending this table is `python-bridge-agent`'s responsibility whenever a
 new route is added — see that agent's own Architecture rules for the
