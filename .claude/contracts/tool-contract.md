@@ -119,6 +119,7 @@ most agents will touch:
 | `DataAnalyze` | `src/tools/DataAnalyzeTool/` | First domain **gateway tool** per `LOCAL_AI_MASTER_PLAN.md` §6 mitigation 2 — one tool, `operation: "question" \| "predict" \| "forecast"`, dispatching deterministically (no model choice below the gateway) to `/table-qa`, `/tabular-predict`, `/forecast` on the Python bridge. Tool-facing `inputSchema`/`outputSchema` are deliberately flat `ZodObject`s with every per-operation field optional, not a top-level `z.discriminatedUnion` — see `DataAnalyzeTool/schemas.ts`'s comment (mirrors the existing `LSPTool/schemas.ts` pattern: a discriminated union is used internally, in `validateInput()`/`call()`, purely for precise per-operation error messages). Future Vision/Audio gateway tools (§6) should follow this same shape. |
 | `AudioAnalyze` | `src/tools/AudioAnalyzeTool/` | Phase 4 "Hearing" gateway tool (added 2026-08-13, `tools-execution-agent`) — one tool, `operation: "transcribe" \| "vad"`, dispatching to `/transcribe`/`/vad` on the Python bridge (§3 below). Same flat-`ZodObject`-tool-facing-schema / internal-`z.discriminatedUnion`-for-validation shape as `DataAnalyzeTool` (`AudioAnalyzeTool/schemas.ts`). Unlike `DataAnalyzeTool`, `audio_path` is required by both operations, so the internal union's main job is rejecting operation-mismatched fields (e.g. `threshold` supplied with `operation: "transcribe"`) rather than a missing shared field. |
 | `TranscribeAndSummarize` | `src/tools/TranscribeAndSummarizeTool/` | Phase 4's named **fixed pipeline tool** (`LOCAL_AI_MASTER_PLAN.md` §6 mitigation 4 / §8 Phase 4) — one call runs `/vad` then `/transcribe` and returns the raw transcript + speech-segment metadata; does not call any LLM itself ("router summarizes" happens in the calling model's own next turn, same "return facts, not prose" posture as `DocumentQA`/`DataAnalyze`). Does not physically trim the audio to VAD's detected ranges before transcribing — see the tool's own `call()` comment for why (avoids duplicating `audio_utils.py`'s WAV parsing in TypeScript; Whisper's long-form generation already handles surrounding silence correctly). VAD's real payoff here: if it detects zero speech, transcription is skipped entirely (`had_speech: false`, empty transcript) rather than paying for a wasted Whisper pass. |
+| `VisionAnalyze` | `src/tools/VisionAnalyzeTool/` | Phase 5 "Vision suite" gateway tool (added 2026-08-13, `tools-execution-agent`) — one tool, `operation: "caption" \| "classify" \| "embed" \| "embed-dinov2" \| "segment" \| "detect" \| "pose"`, dispatching to `/image-caption`, `/clip-classify`, `/clip-embed`, `/dinov2-embed`, `/clipseg-segment`, `/owlv2-detect`, `/vitpose-pose` respectively on the Python bridge (§3 below). Same flat-`ZodObject`-tool-facing-schema / internal-`z.discriminatedUnion`-for-validation shape as `DataAnalyzeTool`/`AudioAnalyzeTool` (`VisionAnalyzeTool/schemas.ts`); `image_path` is required by every operation, same pattern as `AudioAnalyzeTool`'s universally-required `audio_path`. **`ImageCaptionTool` fold-in decision (per the task's own explicit request to make a real call): option (b), not (a)** — `ImageCaptionTool` stays exactly as-is (unchanged file, name, and shape) as a lightweight standalone convenience tool, and `VisionAnalyzeTool`'s `"caption"` operation *also* independently calls `/image-caption` (via the new shared `src/tools/shared/visionBridge.ts` client, not by invoking `ImageCaptionTool` itself — mirrors how `AudioAnalyzeTool`/`TranscribeAndSummarizeTool` each call `/transcribe`/`/vad` directly rather than composing tool calls). Reason: `ImageCaptionTool` is load-bearing by *name* in several places outside `src/tools/` — `src/services/api/toolPreFilter.ts`'s `CORE_TOOL_NAMES` (always-visible core tool set), `scripts/eval/routingCases.ts`'s routing-eval cases (`expectedTool: 'ImageCaption'`, both tuning and holdout splits), and `src/services/api/routerFewShot.ts`'s few-shot examples — removing or renaming it would invalidate all three without a coordinated update, for zero benefit (a few dozen duplicated lines of a thin fetch wrapper) over real risk (regressing the routing eval mid-work on an already-fragile metric, per `LOCAL_AI_MASTER_PLAN.md` §6/§8's own current status). `"embed"` (CLIP, 768-dim) vs `"embed-dinov2"` (DINOv2, 384-dim) are two separate top-level operations rather than one `"embed"` operation with a `model` sub-parameter — see `VisionAnalyzeTool/schemas.ts`'s comment for the reasoning (the two embedding spaces are not interchangeable settings of the same computation the way `DataAnalyzeTool`'s classify/regress `task` sub-parameter is; each needs its own distinct operation-enum description so a small tool-calling model picks the right one for "text-alignable" vs. "pure-visual" similarity). |
 | `TeamCreate` / `TeamDelete` / `SendMessage` | `src/tools/Team*Tool/`, `SendMessageTool/` | Swarm/teammate orchestration |
 | `EnterPlanMode` / `ExitPlanMode` | `src/tools/*PlanModeTool/` | Permission-mode transitions |
 
@@ -251,13 +252,14 @@ hand-rolled silent-WAV writer for the no-speech case) rather than depending
 on a checked-in binary fixture — see `LOCAL_AI_STATUS.md`'s Phase 4
 tool-side session entry for live-verification results.
 
-### Phase 5 vision-suite routes, backing a future `VisionAnalyze` gateway tool — bridge side live, no consumer tool built yet
+### Phase 5 vision-suite routes, backing `VisionAnalyze` — bridge side and tool both built and live-verified
 
 All six routes below went live in the bridge (`python-bridge-agent`,
-2026-08-13) per `LOCAL_AI_MASTER_PLAN.md` §8 Phase 5. **No TypeScript tool
-calls these yet** — `VisionAnalyze` (or per-capability tools) is a separate,
-later `tools-execution-agent` dispatch; this section exists so that dispatch
-can build against exact, live-verified shapes rather than guessing.
+2026-08-13) per `LOCAL_AI_MASTER_PLAN.md` §8 Phase 5, then `VisionAnalyzeTool`
+was built against this exact contract (`tools-execution-agent`, 2026-08-13,
+same day). No route shape changed between the bridge-side session and the
+tool-side session; everything documented below is exactly what the tool
+calls.
 
 | Route | Model | Request | Response |
 |---|---|---|---|
@@ -308,14 +310,35 @@ lazy-load-singleton pattern every route follows (now: register a
 per-module singleton — see `python-bridge/README.md`'s "Adding another
 model" section).
 
+**Consumer side status (2026-08-13, tools-execution-agent):**
+`VisionAnalyzeTool` (`src/tools/VisionAnalyzeTool/`) is built and registered
+against this exact contract (request/response shapes above, verbatim,
+including forwarding `threshold` as `undefined` when the caller omits it so
+the bridge's own per-route defaults apply). A shared HTTP client + 404/400
+error-mapping helper (`src/tools/shared/visionBridge.ts`) backs all seven of
+its operations (the six routes above plus the pre-existing `/image-caption`,
+folded in as the `"caption"` operation — see §2's table entry for the
+fold-in decision and reasoning), mirroring `audioBridge.ts`'s exact shape so
+the `{"detail": "..."}` FastAPI error-body parsing and the 404→"not
+found/unsupported format" / 400→"rejected the request: `<detail>`" mapping
+live in exactly one place. Mocked tests cover all seven operations plus
+error handling (`VisionAnalyzeTool.test.ts`); `VisionAnalyzeTool.live.test.ts`
+synthesizes its own test images at run time via the bridge's own venv
+Python + PIL (a shapes image using the exact same shapes/coordinates
+session 23/24 used bridge-side, for classify/segment/detect; a real Windows
+wallpaper for embed/embed-dinov2; a synthesized stick-figure drawing for
+pose, honestly caveated the same way `vitpose.py`'s own docstring is, since
+no real human photo exists on this machine) rather than depending on a
+checked-in binary fixture — see `LOCAL_AI_STATUS.md`'s Phase 5 tool-side
+session entry for live-verification results per operation.
+
 ---
 
 ## 4. Not yet implemented / planned
 > `tools-execution-agent` adds entries here as new tools are built.
 
 `AudioAnalyze`/`TranscribeAndSummarize` (Phase 4) shipped 2026-08-13; see
-§2's table and §3's "Consumer side status" note above. **Phase 5's vision
-routes are now live on the bridge (§3 above, 2026-08-13) but have no
-TypeScript consumer yet** — a `VisionAnalyze` gateway tool (or per-capability
-tools) against the exact shapes documented above is the next candidate per
-`LOCAL_AI_MASTER_PLAN.md` §8, not yet started.
+§2's table and §3's "Consumer side status" note above. `VisionAnalyze`
+(Phase 5) shipped 2026-08-13; see §2's table and §3's Phase 5 "Consumer side
+status" note above — nothing outstanding for Phase 5. Nothing currently
+outstanding in this section.

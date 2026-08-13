@@ -454,3 +454,81 @@ automatically, no change needed. No new dependency in this diff (`onnxruntime`,
 `flatbuffers`, `protobuf` — see requirements.txt) is invoked with any request-derived data
 beyond the already-covered `audio_path`. No credentials, no outbound network calls beyond the
 loopback bridge itself.
+
+## 2026-08-13 — Phase 5 "Vision suite" tool side: VisionAnalyzeTool + shared visionBridge.ts
+Files audited: src/tools/shared/visionBridge.ts, src/tools/VisionAnalyzeTool/VisionAnalyzeTool.ts, src/tools/VisionAnalyzeTool/schemas.ts, src/tools/VisionAnalyzeTool/prompt.ts
+Also staged in this commit, declared rather than deep-read (test-only, no production surface — named here per this log's own convention): src/tools/VisionAnalyzeTool/VisionAnalyzeTool.test.ts, src/tools/VisionAnalyzeTool/VisionAnalyzeTool.live.test.ts. One spot-check made anyway: the live test adds execFileSync(VENV_PYTHON, ['-c', script]) for PIL fixture synthesis (VisionAnalyzeTool.live.test.ts:39) — argv-form, no shell:true, developer-authored literal script over an mkdtempSync path, unreachable from production. Not a finding. The mocked test replaces globalThis.fetch and restores originalFetch in teardown — test-local only.
+Read for data-flow tracing, not modified in this diff: src/tools/shared/localModelBridge.ts, src/tools/shared/audioBridge.ts (baseline), src/tools/ImageCaptionTool/ImageCaptionTool.ts (duplicate-drift comparison), src/tools/AudioAnalyzeTool/AudioAnalyzeTool.ts (posture comparison), src/utils/permissions/filesystem.ts (getPath consumers), python-bridge/server.py (Phase 5 routes), python-bridge/local_models/image_utils.py, python-bridge/local_models/vitpose.py (pose()). Also staged, non-code: .claude/contracts/tool-contract.md, LOCAL_AI_STATUS.md, src/tools.ts (registration only, two lines).
+Verdict: 0 Critical, 0 High, 0 Medium, 0 Low (4 informational, no action taken)
+Recommendation: ship
+Findings: none — no separate handoff report.
+
+Context: third tool of this exact shape audited in one session (DataAnalyzeTool established the
+pattern; AudioAnalyzeTool/TranscribeAndSummarizeTool/audioBridge.ts is the immediately preceding
+round, same architecture). VisionAnalyzeTool is the same architecture again — one gateway tool,
+now 7 operations (caption/classify/embed/embed-dinov2/segment/detect/pose) calling 7 bridge routes
+instead of 2 — audited proportionately given the pattern is not new, but each of the 7 operations
+verified individually, not inferred from the first.
+
+Pass/fail against every check requested (all seven passed, no findings):
+1. Path/injection across all 7 operations: image_path is a JSON string field only, built at
+   visionBridge.ts:108/123-124/138/151/166-170/185-188/202-205 and serialized by postJson's
+   JSON.stringify (:40-45) — never URL-interpolated, never path-concatenated. This TS layer does
+   zero filesystem access (no node:fs/node:path/require import in any of the four production
+   files). Server side: the path reaches only os.path.isfile()/Image.open() (image_utils.py:38-39);
+   no subprocess/shell on any Phase 5 route.
+2. No SSRF: fetch target is `${MODEL_BRIDGE_BASE_URL}${path}` with path one of exactly 7 hardcoded
+   literals; base is localModelBridge.ts:8-9 (env-overridable loopback default, trusted per
+   established precedent). Nothing request-derived reaches host/protocol/path.
+3. checkPermissions: unconditional allow confirmed at VisionAnalyzeTool.ts:223-231, effect-identical
+   to AudioAnalyzeTool.ts:165-172 and ImageCaptionTool.ts:61-63, no more permissive — same getPath
+   shape, same isReadOnly()===true, same maxResultSizeChars: 20_000. validateInput re-validates
+   against the discriminated union; call() re-validates again before any network call.
+   validateInput -> checkPermissions -> call ordering intact; no unawaited check, no bypass path.
+4. Error handling across all 7 call functions: throwForErrorResponse (visionBridge.ts:82-101)
+   surfaces only the caller's own image_path (404 branch) plus the bridge's detail. Every detail
+   producer traced: 404s are fixed literals (server.py, multiple lines, all "image not found or not
+   readable" — the path-bearing FileNotFoundError message never reaches the response); 400s are
+   static literals (clip.py/clipseg.py/owlv2.py/vitpose.py) with no paths, stack traces, or secrets.
+   readDetail is JSON.parse in try/catch with no reviver; non-JSON/non-object bodies fall through to
+   raw text. Worst case from a hostile bridge response is a thrown Error or a contained TypeError —
+   no eval, no new Function, no branch keyed on response content. No auth headers sent; nothing in
+   the four production files logs anything.
+5. "pose" boxes (new surface): flows straight to a JSON body, never indexed or used for TS-side
+   allocation/arithmetic. Zod bounds shape only (length-4 array) — stricter than the bridge's own
+   len(b)!=4 check, which is what actually bounds the value server-side. Omitted boxes forwards
+   undefined, dropped by JSON.stringify, so the bridge's full-image default applies as contracted.
+6. "classify" labels / "detect" queries (new surface): required non-empty string arrays, no upper
+   bound, JSON-serialized only. Worst case is a large-but-bounded request to a same-user loopback
+   service, bounded further by MODEL_BRIDGE_TIMEOUT_MS (120s) and maxResultSizeChars — DoS-flavored
+   at most, consistent with existing DataAnalyzeTool/AskMathModelTool handling of unbounded array
+   inputs, excluded from findings per the DoS/resource-exhaustion exclusion.
+7. ImageCaptionTool fold-in duplicate: callImageCaption is a genuine duplicate of ImageCaptionTool's
+   inline /image-caption fetch, and a strict superset of it (adds detail extraction and 400 mapping
+   the original lacks; broadens rather than narrows the 404 text) — does not reintroduce a
+   missing-vs-unloadable distinction, so the existence-oracle collapse the original /image-caption
+   review established stays intact. Nothing dropped in the copy.
+
+Contract-as-data check: the staged tool-contract.md diff is documentation only (§2 table row, §3
+Phase 5 route table and consumer-status prose, §4 emptied) — no embedded directive addressed to an
+agent, nothing instructing an audit to be skipped or marked complete.
+
+Informational, no action taken:
+- Response bodies are cast, not schema-parsed (visionBridge.ts, multiple lines) — a malformed
+  bridge response surfaces as a contained TypeError (VisionAnalyzeTool.ts:345's optional chain
+  guards people[0] but not .keypoints; :315/:336's .toFixed(3) on a non-number score). Identical to
+  ImageCaptionTool.ts:96's existing `as Output` and the same note in the audioBridge.ts entry; peer
+  is a trusted loopback service.
+- postJson's catch funnels AbortError (user cancel / 120s timeout) into modelBridgeUnavailableMessage,
+  so a cancelled call reports "Is it running?". Same shape as audioBridge.ts/ImageCaptionTool.ts —
+  message accuracy only.
+- Unconditional allow means deny: Read(...) rules do not gate these reads — getPath is only
+  consumed by opt-in callers (filesystem.ts, permissionLogging.ts, FilesystemPermissionRequest.tsx),
+  not applied automatically. Owner-confirmed posture recorded in this log's 2026-08-12 entry;
+  exposure bounded to PIL-loadable image content with the 404 collapse intact.
+- Box *value* range is unbounded on both sides (Zod enforces length-4, vitpose.py enforces length-4,
+  neither bounds magnitude/sign). No security impact (no path/shell/TS-side-allocation surface —
+  see check 5); whether an extreme value (e.g. [0,0,1e18,1e18]) maps to a clean 400 or escapes as a
+  raw 500 bridge-side was not verified in this read-only pass. Flagged as a contract-accuracy
+  question for python-bridge-agent (same class as the earlier /tabular-predict Low), not a
+  vulnerability, outside this diff.

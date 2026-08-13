@@ -4132,3 +4132,294 @@ Confirmed no `src/` changes (bridge-only dispatch, as scoped) — tsc/build
 not re-run for that reason. No discrepancies found between session 23's
 report and this verification. Committing sessions 23-24's combined work
 together; proceeding next to the `VisionAnalyze` TypeScript tool layer.
+
+## Session 25 (2026-08-13, tools-execution-agent) — Phase 5 "Vision suite" TypeScript tool: `VisionAnalyzeTool` built, registered, live-verified against all seven operations
+
+### What was checked before writing any code
+
+Read `LOCAL_AI_MASTER_PLAN.md` §8 Phase 5 and `.claude/contracts/tool-contract.md`
+§3's Phase 5 section (exact, live-verified request/response shapes for all
+six new bridge routes, already committed by sessions 23-24) end to end
+before writing anything, per this dispatch's own instruction. Read
+`AudioAnalyzeTool.ts`/`schemas.ts`/`prompt.ts`/`.test.ts`/`.live.test.ts`
+(the primary template — same "gateway tool, `operation` discriminator"
+shape), `DataAnalyzeTool.ts`/`schemas.ts` (the flat-tool-facing-schema /
+internal-discriminated-union pattern origin), and `ImageCaptionTool.ts`/
+`.test.ts`/`.live.test.ts` (the BLIP route this dispatch needed to decide
+whether to fold in) all in full before designing anything, per the task's
+own explicit instruction.
+
+### The `ImageCaptionTool` fold-in decision — option (b), with the evidence that made it not a coin flip
+
+The task's own text flagged this as a real decision with two defensible
+answers and asked for one, documented, not left ambiguous. Before deciding,
+grepped the codebase for every place `'ImageCaption'` (the literal tool
+name, not just the module) is referenced outside `src/tools/`, and found
+three load-bearing dependents:
+- `src/services/api/toolPreFilter.ts`'s `CORE_TOOL_NAMES` — the semantic
+  tool-pre-filter's always-visible core set explicitly lists `'ImageCaption'`
+  by string.
+- `scripts/eval/routingCases.ts` — the routing eval's `ExpectedTool` union
+  includes `'ImageCaption'` literally, and roughly 18 tuning + holdout cases
+  assert `expectedTool: 'ImageCaption'` by that exact name.
+- `src/services/api/routerFewShot.ts` — the router's few-shot prompt
+  examples reference `ImageCaption` by name.
+
+Renaming or removing `ImageCaptionTool` would invalidate all three without a
+coordinated cross-cutting update, for a benefit (avoiding ~25 lines of
+duplicated thin-fetch-wrapper code) that doesn't come close to the cost —
+especially against `LOCAL_AI_MASTER_PLAN.md` §6/§8's own current status: the
+routing eval is already sitting below its 90% gate (64.4% mean on the
+honest holdout split) and under a standing project policy that explicitly
+defers further routing-reliability churn until after breadth is complete.
+Regressing or invalidating that eval's own fixture set mid-breadth-work
+would be exactly backwards. **Decision: option (b)** —
+`ImageCaptionTool` is untouched (same file, same name, same shape;
+zero diff), and `VisionAnalyzeTool`'s `"caption"` operation independently
+calls `/image-caption` via the new shared `visionBridge.ts` client (not by
+invoking `ImageCaptionTool` itself, mirroring how `AudioAnalyzeTool`/
+`TranscribeAndSummarizeTool` each call `/transcribe`/`/vad` directly rather
+than composing tool calls). This matches the task's own stated default and
+is recorded in `.claude/contracts/tool-contract.md` §2's `VisionAnalyze` row.
+
+### The `"embed"` vs `"embed-dinov2"` decision — two operations, not one with a sub-parameter
+
+Also flagged as an open call in the task. Decided: two separate top-level
+`operation` values, not one `"embed"` operation with a `model: "clip" |
+"dinov2"` sub-parameter (the shape `DataAnalyzeTool`'s `"predict"` uses for
+its analogous `task: "classify" | "regress"` sub-parameter). Reasoning,
+recorded in `VisionAnalyzeTool/schemas.ts`'s own comment: classify/regress
+are two settings of genuinely the *same* computation (one model, one
+prediction call, output shape differs only in whether probabilities are
+attached) — CLIP-embed and DINOv2-embed are not that; they're two different
+models producing non-comparable vectors in different-dimensioned spaces
+(768 vs. 384) that must never be mixed in the same similarity computation.
+Collapsing them behind one sub-parameter invites exactly that mistake.
+Keeping them as separate operations lets each carry its own distinct
+description in the `operation` enum itself ("general-purpose, text-alignable
+embedding" vs. "purely visual, no text alignment") — the actual decision a
+caller needs to make — rather than a generic "which embedder" the model has
+to already know to ask a follow-up about.
+
+### Built
+
+- **`src/tools/shared/visionBridge.ts`** (new) — shared HTTP client for all
+  seven bridge routes `VisionAnalyzeTool` calls (`/image-caption` plus the
+  six Phase 5 routes), mirroring `audioBridge.ts`'s exact shape: one
+  `postJson` helper, a `readDetail`/`throwForErrorResponse` pair mapping the
+  bridge's `{"detail": "..."}` 404/400 convention to caller-actionable
+  errors (404 → "not found, unreadable, or not a supported format", 400 →
+  "`<route>` rejected the request: `<detail>`"), and one typed `call*`
+  function per route (`callImageCaption`, `callClipClassify`,
+  `callClipEmbed`, `callDinov2Embed`, `callClipSegSegment`,
+  `callOwlv2Detect`, `callVitPosePose`).
+- **`src/tools/VisionAnalyzeTool/`** (new: `VisionAnalyzeTool.ts`,
+  `schemas.ts`, `prompt.ts`, `VisionAnalyzeTool.test.ts`,
+  `VisionAnalyzeTool.live.test.ts`) — the gateway tool, seven operations
+  (`"caption" | "classify" | "embed" | "embed-dinov2" | "segment" | "detect"
+  | "pose"`), same flat-`ZodObject`-tool-facing / internal-
+  `z.discriminatedUnion`-for-validation shape as `DataAnalyzeTool`/
+  `AudioAnalyzeTool`. `image_path` required by every operation (like
+  `AudioAnalyzeTool`'s universally-required `audio_path`, unlike
+  `DataAnalyzeTool`'s per-operation shared field). `isReadOnly()`/
+  `checkPermissions()` match the established posture for this whole tool
+  family exactly (pure local computation against a loopback-only bridge,
+  reading a caller-named path — allow unconditionally, no write, no code
+  execution). `threshold` is forwarded as `undefined` when the caller omits
+  it (for both `"segment"` and `"detect"`) so the bridge's own per-route
+  defaults (0.5 / 0.1 respectively) apply rather than the tool silently
+  picking a value.
+- **`src/tools.ts`**: `VisionAnalyzeTool` imported and registered in
+  `getAllBaseTools()`, immediately after `TranscribeAndSummarizeTool` (end
+  of the local-AI tool cluster).
+- **`.claude/contracts/tool-contract.md`**: §2's table gained a
+  `VisionAnalyze` row (full fold-in-decision reasoning inline, so a future
+  reader doesn't have to dig through session history for it); §3's Phase 5
+  heading updated from "bridge side live, no consumer tool built yet" to
+  "bridge side and tool both built and live-verified", plus a "Consumer
+  side status" paragraph added (mirroring the existing Phase 3/4 pattern);
+  §4 ("planned") now has nothing outstanding for Phase 5 or Phase 4.
+
+### Not touched, flagged instead (out of this agent's ownership) — same finding Phase 4 already established
+
+`src/services/api/toolPreFilter.ts`'s `CORE_TOOL_NAMES` set still lists only
+`AskMathModel`/`DocumentQA`/`ImageCaption`/`DataAnalyze` — neither
+`AudioAnalyze`/`TranscribeAndSummarize` (flagged by session 21, still
+unaddressed) nor the new `VisionAnalyze` were added. Same reasoning as
+session 21's identical note: `src/services/api/` is `provider-router-agent`'s
+directory, not this agent's `src/tools/`/`src/tools.ts`; the master plan's
+own §8 Phase 1 status confirms the pre-filter is a no-op at today's tool
+count anyway (discretionary tail below the top-K=4 threshold); and the
+project owner's standing sequencing policy explicitly defers
+routing-reliability tuning until after breadth is complete. Flagging for
+whoever next touches router tuning — now three tools deep
+(`AudioAnalyze`/`TranscribeAndSummarize`/`VisionAnalyze`) that
+`CORE_TOOL_NAMES` hasn't caught up with, worth a single batched pass rather
+than three separate ones.
+
+### Live verification — real bridge, all seven operations, cross-validated against sessions 23/24's own independently-recorded bridge-side numbers
+
+Checked for the documented stray-wrong-interpreter-`server.py` process issue
+*before* starting (per standing instruction, not re-diagnosed): no stray
+process found pre-start (`Get-CimInstance Win32_Process -Filter
+"name='python.exe'"` showed only the unrelated `lmstudio_mcp.py`/
+`graphify.serve` processes). Started the bridge via `python-bridge/start.ps1`.
+`/status` came up clean (`registered` included all seven routes' backing
+models: `clip`, `clipseg`, `dinov2`, `image-caption`, `owlv2`, `vitpose`,
+plus the pre-existing ones). Confirmed which process actually bound port
+8756 before trusting any result (`Get-NetTCPConnection -LocalPort 8756`):
+the child, system-Python-3.11 process (PID 22228, parent PID 22700 = the
+venv python) — the same already-diagnosed parent-child pattern sessions
+19/21/23 all hit and documented as environmental/expected, not re-diagnosed
+per standing instruction.
+
+No pre-existing test image with people, or a checked-in shapes fixture,
+exists in this repo (same finding session 23 already made) — this session's
+`VisionAnalyzeTool.live.test.ts` synthesizes its own fixtures at run time by
+shelling out to the bridge's own venv Python + PIL (the same mechanism
+session 23/24 both used for their own independent verification images): a
+640x480 shapes image using the *exact same shapes and coordinates* session
+23/24 used (red circle 50,50–200,200; blue rectangle 400,300–600,450) for
+classify/segment/detect, a real Windows wallpaper
+(`C:/Windows/Web/4K/Wallpaper/Windows/img0_1920x1200.jpg`, also used by
+`ImageCaptionTool.live.test.ts`) for embed/embed-dinov2, and a synthesized
+stick-figure drawing for pose — honestly caveated in the test file's own
+header comment, matching `vitpose.py`'s own docstring, since no real human
+photo exists on this machine.
+
+**Result: 9/9 pass**, and every score/box this session's independently-
+synthesized shapes image produced landed within normal floating-point/
+sampling variance of sessions 23/24's own independently-recorded numbers —
+a genuine third independent cross-validation of the bridge routes
+themselves, not just of this session's own tool-layer code:
+- **`"caption"`** on the real wallpaper: `"there is a blue paper sculpture
+  that looks like a wave"` — a plausible caption for an abstract Windows
+  wallpaper. First call needed a cold BLIP load; the test's timeout was
+  bumped from the repo's typical 60000ms to 150000ms after hitting exactly
+  the same cold-load-vs-60s-timeout issue session 21 already documented for
+  `AudioAnalyzeTool.live.test.ts`'s `"transcribe"` test (same fix applied
+  here, and to every other test in this file for consistent headroom, not
+  just the one that failed once).
+- **`"classify"`**: `["a red circle","a blue rectangle","a photo of a
+  cat","a green triangle"]` against the shapes image scored 0.947 / 0.051 /
+  0.0018 / 0.00003 — matches session 23's own 0.949/0.051 (and session 24's
+  independent re-verification, 0.947/0.051) almost to the decimal.
+- **`"embed"`**: 768-dim vector, L2 norm confirmed in [0.99, 1.01].
+- **`"embed-dinov2"`**: 384-dim vector (confirmed distinct dimensionality
+  from CLIP's), L2 norm confirmed in [0.99, 1.01].
+- **`"segment"`**: prompt "a red circle" recovered box `{47,54,198,202}`
+  (true extents 50,50,200,200) at confidence 0.6965 — matches session 23's
+  `{47,54,198,202}`/0.70 almost exactly. Prompt "a green triangle" (absent)
+  at `threshold: 0.7` correctly returned `found: false` — reproduces the
+  documented default-threshold false-positive caveat's *mitigation*
+  (session 23/24 both showed the *default* 0.5 threshold false-positives on
+  this exact absent case; this session confirms raising to 0.7, exactly the
+  guidance this tool's own `prompt.ts` gives callers, fixes it).
+- **`"detect"`**: queries `["a red circle","a blue rectangle","a green
+  triangle"]` scored 0.938 / 0.706 (+ a second low-score 0.106 duplicate
+  "blue rectangle" detection) / not detected — matches session 23's
+  0.938/0.706/0.106 to three decimal places.
+- **`"pose"`**: default full-image box on the synthesized stick figure
+  returned 17 COCO keypoints per person, 1 person, at low confidence
+  (0.07–0.40) — same expected-low-confidence-on-non-photographic-input
+  behavior sessions 23/24 documented, reported honestly rather than treated
+  as a real pose reading.
+- **Error path**: a missing file on `"caption"` correctly mapped to the
+  tool's own "not found, unreadable, or not a supported format" error, not
+  a raw status.
+
+Bridge stopped cleanly afterward (`Stop-Process` on both the parent venv and
+child system-Python PIDs), port 8756 confirmed free via a failed TCP
+connection attempt immediately after.
+
+### Verification
+
+- `bun run build`: clean.
+- `npx tsc --noEmit`: **3521 errors — exactly matching the documented
+  baseline**, independently re-run and re-confirmed by this session. Zero
+  errors trace to any file touched this session (grepped the full error
+  list for `VisionAnalyze`/`visionBridge` — no matches).
+- Scoped self-verification (`bun test src/tools src/services/tools
+  src/bridge src/utils/promptShellExecution.test.ts
+  src/utils/ripgrep.test.ts --path-ignore-patterns='**/*.live.test.ts'`):
+  **302/302 pass** across 24 files (up from session 21's 281/23 — the new
+  mocked test file, 21 tests across `VisionAnalyzeTool.test.ts`, is included
+  and passing).
+- `VisionAnalyzeTool.live.test.ts`: **9/9 pass** against the real bridge —
+  see Live verification above.
+
+### Files touched
+
+New: `src/tools/shared/visionBridge.ts`,
+`src/tools/VisionAnalyzeTool/{VisionAnalyzeTool.ts,schemas.ts,prompt.ts,
+VisionAnalyzeTool.test.ts,VisionAnalyzeTool.live.test.ts}`. Modified:
+`src/tools.ts`, `.claude/contracts/tool-contract.md`, this file. Not
+touched: `ImageCaptionTool.ts` or any of its sibling files (see the fold-in
+decision above — genuinely zero diff, not just "no edits needed"), anything
+under `python-bridge/` (bridge side already built/verified by sessions
+23/24; the stray-process finding above is diagnostic only, matching
+established precedent, no fix attempted, out of ownership),
+`src/services/api/` (`toolPreFilter.ts`'s `CORE_TOOL_NAMES` flagged above,
+not edited), the sibling `openclaude` repo.
+
+**Not committed**, per this project's established process — reporting back
+for the orchestrating session to personally verify, dispatch an independent
+security-audit-agent review (required before commit, since this touches
+`src/tools/`, same as every prior `src/tools/`-touching round), and commit.
+
+### Addendum — hit session 21's exact same Stop-hook-gate-needs-the-bridge-running issue; fixed the same way
+
+Initially stopped the bridge cleanly after live verification (as described
+above). The Stop hook's own self-verification gate then failed: it runs the
+**unscoped** `bun test src/tools src/services/tools src/bridge
+src/utils/promptShellExecution.test.ts src/utils/ripgrep.test.ts` (no
+`--path-ignore-patterns` exclusion — that flag belongs to a *different*
+script, `test:provider`, per session 21's own addendum, which this session's
+own task instructions had already flagged as a known fact going in), so it
+picks up every `*.live.test.ts` file under `src/tools` including this
+session's new `VisionAnalyzeTool.live.test.ts` plus every pre-existing one,
+all of which need the bridge. 21 failures, every one traced to "could not
+reach the local model bridge" (`VisionAnalyzeTool.live.test.ts`'s own tests
+plus the pre-existing `DataAnalyzeTool`/`DocumentQATool`/`ImageCaptionTool`/
+`AudioAnalyzeTool`/`TranscribeAndSummarizeTool` live files) — confirming
+this is the same standing property of the gate command session 21 already
+documented, not a defect in this session's work. Fixed identically:
+restarted the bridge via `start.ps1` only (confirmed no stray process
+first; confirmed via `Get-NetTCPConnection` that the same already-diagnosed
+child system-Python-3.11 process, PID 15952 this time, bound the port,
+parent PID 32776 the venv python), reran the exact unscoped gate command:
+**325 pass / 0 fail across 32 files**. `npx tsc --noEmit` reconfirmed at
+3521 a further time (identical). `bun run build` reconfirmed clean. The
+bridge is **intentionally left running** at the end of this session (the
+same deliberate deviation session 21 recorded, for the same reason — so the
+gate stays green for whoever/whatever runs it next); a transient false
+"port free" reading from one ad hoc `System.Net.Sockets.TcpClient` probe
+during this addendum did not reproduce on a second check or via `curl`/
+`Get-NetTCPConnection`, and is noted here only so it isn't mistaken for a
+real bridge crash by a future reader diffing this file. Whether this gate
+command should get the same `--path-ignore-patterns` hermeticity treatment
+`test:provider` has is, per session 21's own framing, a real process
+decision for whoever owns the gate config, not something to change
+unilaterally from inside a tool-building dispatch — flagging again, not
+fixing, now confirmed twice.
+
+## Session 26 (2026-08-13, orchestrating session) — Session 25 independently verified; Phase 5 TypeScript layer complete pending security audit
+
+Read `visionBridge.ts`, `VisionAnalyzeTool.ts`, `schemas.ts` in full;
+confirmed `ImageCaptionTool.ts` genuinely has zero diff (`git diff --stat`
+empty), matching the reported fold-in decision exactly. The
+`ImageCaptionTool`-fold-in and `embed`/`embed-dinov2`-split reasoning both
+hold up on direct reading — the three-dependent grep evidence
+(`toolPreFilter.ts`, `routingCases.ts`, `routerFewShot.ts`) is a genuinely
+strong justification, not a rationalization after the fact.
+
+Re-ran `VisionAnalyzeTool`'s dedicated tests directly: **30/30 pass**,
+including live output visibly showing correct detect scores
+(0.938/0.706/0.106, matching sessions 23/24/25's own numbers) and plausible
+pose keypoints. Full scoped hermetic suite: **302/302 pass**, matching the
+reported count exactly. `bun run build`: clean. `npx tsc --noEmit`:
+**3521**, unchanged.
+
+Dispatching the required independent security-audit-agent review next
+(this touches `src/tools/`, same gate requirement as every prior
+`src/tools/` addition) before committing sessions 25-26's combined work.
