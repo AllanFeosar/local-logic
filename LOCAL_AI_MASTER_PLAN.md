@@ -1005,9 +1005,10 @@ a menu the router already can't reliably pick from), so it's no longer
 - **Phase 5 — Full vision suite**: CLIP, OWLv2, CLIPSeg, DINOv2, ViTPose
   behind `VisionAnalyze`; fold BLIP in; CLIP image memory.
   *Gate: vision eval set (classification, detection, "find X in image").*
-  **Status 2026-08-13 (sessions 23-24): bridge side built, live-verified,
-  independently re-confirmed; `VisionAnalyze` TypeScript tool not yet
-  built.** All five models wired into `python-bridge/` following the
+  **Status 2026-08-13 (sessions 23-26): bridge side AND `VisionAnalyze`
+  TypeScript tool both built, live-verified, independently re-confirmed,
+  and security-audited (SHIP, 0 Critical/High/Medium/Low).** All five
+  models wired into `python-bridge/` following the
   established `ModelSpec`/`manager.py` pattern: `POST /clip-classify`,
   `/clip-embed`, `/clipseg-segment`, `/dinov2-embed`, `/owlv2-detect`,
   `/vitpose-pose`. Device placement live-benchmarked per model, not
@@ -1028,8 +1029,21 @@ a menu the router already can't reliably pick from), so it's no longer
   under multiple realistic scenarios including a deliberate worst case (all
   5 new + 3 existing GPU models requested at once) — confirmed the existing
   LRU eviction handles oversubscription correctly with zero code changes,
-  same finding Phase 4 already established. Full history in
-  `LOCAL_AI_STATUS.md` Sessions 23-24.
+  same finding Phase 4 already established. **`VisionAnalyzeTool`**
+  (session 25): seven operations (`caption`/`classify`/`embed`/
+  `embed-dinov2`/`segment`/`detect`/`pose`) behind one gateway tool.
+  `ImageCaptionTool` deliberately kept separate rather than folded away
+  (three load-bearing dependents on its literal name found by grep —
+  `toolPreFilter.ts`, `routingCases.ts`, `routerFewShot.ts` — a rename
+  would have invalidated all three for a benefit not worth the cost, and
+  the routing eval is already below its own gate under the standing
+  breadth-first policy); `"caption"` independently calls `/image-caption`
+  instead. `"embed"`/`"embed-dinov2"` kept as two separate operations, not
+  one with a sub-parameter, since the two vector spaces are non-comparable
+  and collapsing them invites mixing them. Gate itself (a dedicated vision
+  eval set) not attempted, flagged rather than skipped silently — same
+  posture as Phase 4's own gate. Full history in `LOCAL_AI_STATUS.md`
+  Sessions 23-26.
 - **Phase 6 — Voice out & generation** (optional): Qwen3-TTS feasibility
   spike → wire if transformers supports it; SD 1.5 on GPU; MusicGen last.
   *Gate: TTS round-trip (type → hear) at acceptable latency, or documented
