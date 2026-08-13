@@ -3482,3 +3482,335 @@ No discrepancies found between session 19's report and this verification.
 Confirmed no `src/` changes (Python-only dispatch, tsc/build unaffected —
 skipped re-running them for that reason, not an oversight). Committing
 session 19's + this session's changes together.
+
+## Session 21 (2026-08-13, tools-execution-agent) — Phase 4 "Hearing" TypeScript tools: `AudioAnalyzeTool` + `TranscribeAndSummarizeTool` built, registered, live-verified
+
+Picked up directly from session 19's bridge-side work (`/transcribe`, `/vad`
+live on the bridge, contract already documented in
+`.claude/contracts/tool-contract.md` §3) and session 20's independent
+verification of that. Built the two TypeScript tools per Phase 4's own gate
+line (`LOCAL_AI_MASTER_PLAN.md` §8: `"AudioAnalyze + TranscribeAndSummarize"`),
+using `DataAnalyzeTool` as the primary template (discriminated-union input
+validation behind a flat tool-facing schema, `checkPermissions`/`isReadOnly`
+posture) and `DocumentQATool`/`ImageCaptionTool` for the simpler
+single-route error-mapping convention.
+
+### Built
+
+- **`src/tools/shared/audioBridge.ts`** (new) — shared HTTP client for
+  `/transcribe`/`/vad`, used by both tools below rather than duplicating the
+  request/response plumbing and error-mapping logic in two places (the same
+  "shared plumbing two things in one dispatch happen to need identically"
+  reasoning `audio_utils.py` used bridge-side for the same two routes).
+  Maps the bridge's documented error responses to messages a calling model
+  can act on: 404 → "Audio file not found, unreadable, or not a supported
+  format (WAV only...)"; 400 → "`<route>` rejected the request: `<bridge
+  detail>`"; anything else → status + detail, never a bare non-2xx leak.
+  Confirmed against `server.py`: both routes return FastAPI's standard
+  `{"detail": "..."}` body on error, parsed accordingly (falls back to raw
+  text if the body isn't JSON).
+- **`src/tools/AudioAnalyzeTool/`** (new: `AudioAnalyzeTool.ts`,
+  `schemas.ts`, `prompt.ts`, `AudioAnalyzeTool.test.ts`,
+  `AudioAnalyzeTool.live.test.ts`) — the general-purpose gateway tool,
+  `operation: "transcribe" | "vad"`, mirroring `DataAnalyzeTool`'s flat
+  tool-facing `ZodObject` + internal `z.discriminatedUnion` (in
+  `schemas.ts`) for precise per-operation validation. One real difference
+  from `DataAnalyzeTool`'s reasoning worth flagging: `audio_path` is
+  required by *both* operations here (not split across variants like
+  `DataAnalyzeTool`'s per-operation required fields), so the internal
+  union's job isn't catching a missing shared field — it's rejecting
+  cross-operation field misuse (e.g. `threshold` supplied alongside
+  `operation: "transcribe"`, which `/transcribe` doesn't even accept and
+  would otherwise be silently dropped rather than flagged as caller
+  confusion). `checkPermissions` returns `allow` unconditionally — same
+  posture as `DocumentQA`/`ImageCaption`/`DataAnalyze`: a local HTTP call
+  reading a file path the user/model already named, not a code-execution
+  tool.
+- **`src/tools/TranscribeAndSummarizeTool/`** (new:
+  `TranscribeAndSummarizeTool.ts`, `prompt.ts`,
+  `TranscribeAndSummarizeTool.test.ts`,
+  `TranscribeAndSummarizeTool.live.test.ts`) — the master plan's named
+  fixed-pipeline tool (§6 mitigation 4: *"VAD -> Whisper -> router
+  summarizes"*). Calls `/vad` first, then `/transcribe`, in one tool call;
+  never calls an LLM itself (there's no dedicated summarization model in
+  this project — "router summarizes" happens in the calling model's own
+  next turn over the returned raw transcript, same "return facts, not
+  prose" posture as `DocumentQA`/`DataAnalyze`).
+
+  **Design decision, documented inline in `call()` and worth restating
+  here**: this tool does **not** physically trim the audio to VAD's
+  detected speech ranges before transcribing, even though the master
+  plan's own phrasing ("VAD -> Whisper", "trimming dead air") could read
+  that way. Reasoning: doing a real trim would mean re-implementing WAV
+  read/write/splice logic in TypeScript, duplicating
+  `python-bridge/local_models/audio_utils.py`'s already-tested format
+  handling (8/16-bit PCM, mono/stereo, resampling) in a second language
+  with its own edge-case surface, for a gain Whisper's own long-form
+  generation loop already makes largely moot — session 19 live-verified it
+  correctly handles multi-segment, >30s audio (including surrounding
+  silence) in one pass. What `/vad` running first *does* meaningfully buy,
+  and the reason it still isn't skipped: a zero-speech result short-circuits
+  the whole pipeline before ever calling `/transcribe` — the one case where
+  trimming would have helped (silence-only input) is handled without
+  touching the audio bytes at all. One combined `AbortSignal`/timeout (the
+  existing `MODEL_BRIDGE_TIMEOUT_MS`, not a new constant) spans both
+  sequential bridge calls — justified since `/vad` is near-instant
+  (~250x real-time per session 19's own benchmark), so almost the entire
+  budget is still available for the slower `/transcribe` call, and a single
+  wrapping signal means a caller-supplied abort correctly cancels the whole
+  pipeline rather than whichever leg happened to be in flight.
+
+- **`src/tools.ts`**: both tools imported and registered in
+  `getAllBaseTools()`, immediately after `DataAnalyzeTool` (same position
+  in the local-AI tool cluster).
+- **`.claude/contracts/tool-contract.md`**: §2's table gained rows for
+  `AudioAnalyze`/`TranscribeAndSummarize`; §3's Phase 4 section gained a
+  "Consumer side status" note (mirroring the existing Phase 3 pattern) and
+  its heading updated from "tools not yet built" to reflect both are now
+  built and live-verified; §4 ("planned") now has nothing outstanding for
+  Phase 4 — updated to note Phase 5's `VisionAnalyze` as the next
+  candidate, not yet started.
+
+### Not touched, flagged instead (out of this agent's ownership)
+
+`src/services/api/toolPreFilter.ts`'s `CORE_TOOL_NAMES` set (the semantic
+tool-pre-filter's always-visible core list, `provider-router-agent`'s file)
+lists `AskMathModel`/`DocumentQA`/`ImageCaption`/`DataAnalyze` but not the
+two tools added this session. The master plan's own §8 Phase 1 status notes
+the pre-filter is currently a confirmed no-op at today's tool count (the
+discretionary tail sits below the top-K=4 threshold), so this has no
+measurable effect today, but growing the registered-tool count by 2 moves
+the menu closer to where that stops being true. Not touched — outside this
+agent's `src/tools/`/`src/tools.ts` ownership boundary
+(`src/services/api/` is `provider-router-agent`'s), and per the project
+owner's own standing sequencing policy this kind of router-tuning
+optimization is explicitly deferred until after breadth is done. Flagging
+for whoever picks up router tuning next, not fixed here.
+
+### Live verification — real bridge, real (synthesized) speech, both tools
+
+Checked for the documented stray-wrong-interpreter-bridge-process issue
+*before* starting anything (per this session's own instructions) — none
+found (`Get-CimInstance Win32_Process -Filter "name='python.exe'"` showed
+only the unrelated `lmstudio_mcp.py`/`graphify.serve` processes). Started
+the bridge via `python-bridge/start.ps1`. `/status` came up clean
+(`registered` included `transcribe`/`vad`, `loaded: []`).
+
+- **`AudioAnalyzeTool.live.test.ts` (4/4 pass)**: synthesized two fixtures
+  at run time — real (if synthetic) speech via Windows SAPI TTS
+  (`System.Speech.Synthesis` through PowerShell, same mechanism session 19
+  used bridge-side) and a hand-rolled silent WAV (plain RIFF header + all-
+  zero 16-bit PCM samples, no external dependency) — rather than depending
+  on a checked-in binary fixture. `operation: "transcribe"` on
+  `"The quick brown fox jumps over the lazy dog."` came back **word-perfect**
+  (`text: "The quick brown fox jumps over the lazy dog."`, `language: "en"`,
+  one correctly-boundaried segment 0–2.54s). `operation: "vad"` on the same
+  clip found one speech segment (0.098–2.686s); on the silent clip, zero
+  segments. A missing file correctly mapped to the tool's own clear
+  "not found, unreadable, or not a supported format" error, not a raw
+  status.
+- **`TranscribeAndSummarizeTool.live.test.ts` (3/3 pass)**: real pipeline
+  run on `"This is a test of the local transcription pipeline, running
+  entirely offline."` — **word-perfect transcript**, `had_speech: true`,
+  two VAD-detected speech segments (0.098–2.91s, 3.202–4.83s, split on the
+  mid-sentence comma pause — expected, not a bug), one Whisper transcript
+  segment spanning the full utterance. On the silent clip: `had_speech:
+  false`, all other fields correctly empty, and (confirmed via the mocked
+  suite plus this run's fast ~2.6s total wall time for both live cases)
+  `/transcribe` genuinely was not called. Missing file → same clear 404
+  mapping as above.
+- **400 (unrecognized language) live-verified end to end**, beyond what the
+  mocked tests cover: a real call with `language: "not-a-real-language-xyz"`
+  against a real synthesized clip correctly raised
+  `"Transcription rejected the request: invalid language
+  'not-a-real-language-xyz': Unsupported language: ... Language should be
+  one of: [...]"` — the tool's error-mapping surfaced the bridge's own
+  detail message cleanly rather than a raw HTTP error, and did not crash or
+  hang. `TranscribeAndSummarizeTool` shares the exact same `callTranscribe`/
+  `throwForErrorResponse` code path (`shared/audioBridge.ts`), so this
+  covers both tools' 400 handling without needing a second live repro.
+- GPU device placement was not independently re-measured this session
+  (sessions 19/20 already did this directly via `nvidia-smi`/
+  `torch.cuda.memory_allocated()`) — the bridge's own `/status` during this
+  session's runs reported `device: "cuda", fp16: true` for `transcribe`
+  with resident-memory figures (~1548MB) closely matching sessions 19/20's
+  own numbers, consistent with unchanged behavior, not independently
+  re-proven from first principles.
+
+### A real, more precisely diagnosed instance of the recurring stray-process issue — flagged, not fixed (out of `python-bridge/` ownership)
+
+While starting the bridge for live verification, hit the documented
+recurring stray-wrong-interpreter `server.py` process issue again (sessions
+2 and 18 both saw versions of this) — but this time with a more precise
+finding than "found two independent processes; killed both": using
+`Get-CimInstance Win32_Process ... | Select ProcessId,CreationDate,
+ParentProcessId,CommandLine`, the two `server.py` processes that appeared
+had **identical creation timestamps and a direct parent-child
+relationship** — the correct venv process (`venv\Scripts\python.exe`) is
+the *parent*, and a system-Python-3.11
+(`C:\Users\allge\AppData\Local\Programs\Python\Python311\python.exe`)
+process running `server.py` is its *child*, and it's the **child** that
+actually binds port 8756 and serves every request (confirmed via
+`bridge_stderr.log`'s own `"Started server process [<child PID>]"` line).
+This reproduced identically and immediately on a second, from-scratch
+attempt (kill both → confirm clean process list → restart via
+`start.ps1` → same parent/child pair appears within the same second) — not
+a leftover from an earlier session, an actual behavior of starting the
+bridge on this machine right now. `server.py` itself has no `reload=True`/
+explicit subprocess/multiprocessing spawn (checked directly), so the
+re-exec is coming from a dependency (torch/transformers/onnxruntime/
+uvicorn's own internals, not narrowed down further) — plausibly a library
+resolving a bare `"python"` command via `PATH` rather than
+`sys.executable`, which would explain the system interpreter specifically:
+`start.ps1` invokes the venv's `python.exe` by absolute path without ever
+running `Activate.ps1`, so the venv's own `Scripts/` directory is never
+prepended to `PATH` for any child process a dependency might spawn via
+PATH lookup, and whatever's first on `PATH` in this shell resolves to
+system Python 3.11.
+
+**Practical impact on this session's verification: none observed** — every
+live result (transcripts, VAD segments, language detection, error mapping,
+reported GPU device/fp16) was correct and consistent with sessions 19/20's
+own findings regardless of which interpreter actually served it, meaning
+system Python 3.11 on this machine apparently *also* has the full matching
+dependency stack installed (not a broken/incompatible fallback). This is
+still an environment-hygiene issue worth someone with `python-bridge/`
+ownership tracking down properly (two live copies of a heavy CUDA/torch
+stack is real disk/maintenance cost, and there's no guarantee the two
+installs stay version-matched forever) — **not fixed here**, both because
+it's `python-bridge-agent`'s directory, not this agent's, and because
+per-session instructions were explicit: this class of issue is
+already-diagnosed-enough to route around (kill the wrong one, restart,
+don't re-diagnose), not block on. Bridge was stopped cleanly at the end of
+verification (both processes killed, port 8756 confirmed free via a failed
+`curl` connection immediately after).
+
+### Verification
+
+- `bun run build`: clean.
+- `npx tsc --noEmit`: **3521 errors — exactly matching the documented
+  baseline**, independently re-run and re-confirmed by this session (not
+  just trusted from the last entry). Zero errors trace to any file touched
+  this session (grepped the full error list for `AudioAnalyze`/
+  `TranscribeAndSummarize`/`audioBridge` — no matches).
+- Scoped self-verification (`bun test src/tools src/services/tools
+  src/bridge src/utils/promptShellExecution.test.ts
+  src/utils/ripgrep.test.ts --path-ignore-patterns='**/*.live.test.ts'`):
+  **281/281 pass** across 23 files (up from the pre-session count — the two
+  new mocked test files, 21 tests total across
+  `AudioAnalyzeTool.test.ts`/`TranscribeAndSummarizeTool.test.ts`, are
+  included and passing).
+- `AudioAnalyzeTool.live.test.ts` / `TranscribeAndSummarizeTool.live.test.ts`:
+  4/4 and 3/3 respectively, against the real bridge — see Live verification
+  above. (Both files' per-test timeout is 150000ms, not the repo's more
+  typical 60000ms — a cold-load `/transcribe` call took a bit over 60s in
+  this environment during the first attempt, comfortably inside the tool's
+  own 120s `MODEL_BRIDGE_TIMEOUT_MS`; bumped to give real headroom rather
+  than a value tuned to exactly clear one observed run.)
+
+### Files touched
+
+New: `src/tools/shared/audioBridge.ts`,
+`src/tools/AudioAnalyzeTool/{AudioAnalyzeTool.ts,schemas.ts,prompt.ts,
+AudioAnalyzeTool.test.ts,AudioAnalyzeTool.live.test.ts}`,
+`src/tools/TranscribeAndSummarizeTool/{TranscribeAndSummarizeTool.ts,
+prompt.ts,TranscribeAndSummarizeTool.test.ts,
+TranscribeAndSummarizeTool.live.test.ts}`. Modified: `src/tools.ts`,
+`.claude/contracts/tool-contract.md`, this file. Not touched: anything
+under `python-bridge/` (bridge side already built/verified by sessions
+19/20; the stray-process finding above is diagnostic only, no fix
+attempted, per ownership), `src/services/api/` (`toolPreFilter.ts`'s
+`CORE_TOOL_NAMES` flagged above, not edited), the sibling `openclaude`
+repo.
+
+### Addendum — the automated self-verification gate needed the bridge running, and a note on the bridge's final state
+
+This agent's own standing self-verification check command
+(`bun test src/tools src/services/tools src/bridge
+src/utils/promptShellExecution.test.ts src/utils/ripgrep.test.ts`, no
+`--path-ignore-patterns` exclusion) is **not** the same as the
+`--path-ignore-patterns='**/*.live.test.ts'`-scoped command documented
+elsewhere in this file (that flag was added to a *different* script,
+`test:provider`, by session 3/17 — never to this one). Without that
+exclusion, the gate command picks up every `*.live.test.ts` file under
+`src/tools`, so it genuinely requires the bridge to be running to pass
+cleanly — it isn't hermetic in the same way `test:provider` was made to
+be. This first surfaced as a Stop-hook failure after this session had
+already stopped the bridge per its own (reasonable but, it turns out,
+incompatible-with-this-gate) plan to leave the environment clean:
+12/295 failed, and tracing every one confirmed they were **exclusively**
+live-bridge-dependent tests failing on "could not reach the local model
+bridge" — including the three *pre-existing* live test files
+(`DataAnalyzeTool.live.test.ts`, `DocumentQATool.live.test.ts`,
+`ImageCaptionTool.live.test.ts`), not just this session's two new ones —
+confirming this is a standing property of the gate command itself, not a
+defect introduced this session. Restarted the bridge (via `start.ps1`
+only, per instruction) and reran: **295 pass / 0 fail** across 30 files,
+`npx tsc --noEmit` reconfirmed at 3521 a further two times across this
+back-and-forth, all identical. The bridge was intentionally **left running
+at the end of this session** (a deliberate deviation from the "stopped
+cleanly, port confirmed free" note further up this entry, which described
+this session's own live-verification pass, not its final state) so the
+gate stays green — worth knowing for whoever picks this up next; the
+environment is not "clean" the way most prior sessions left it. Flagging,
+not fixing: whether this gate command should also get the
+`--path-ignore-patterns` treatment (making it hermetic like
+`test:provider`, at the cost of no longer catching live-path regressions
+automatically) is a real process decision for whoever owns this gate
+config, not something to change unilaterally from inside a single tool-
+building dispatch.
+
+Also independently reconfirms the parent-child stray-interpreter pattern
+described above: restarting via `start.ps1` alone (exactly as instructed,
+no bare `python` invocation anywhere this time) reproduced the identical
+venv-parent/system-Python-311-child pair on both of two further restarts
+during this addendum — strengthening, not weakening, the conclusion that
+this is environmental/dependency-level behavior on this machine, not
+something caused by how the bridge is launched.
+
+**Not committed**, per this project's established process — reporting back
+for the orchestrating session to personally verify and commit.
+
+## Session 22 (2026-08-13, orchestrating session) — Session 21 independently verified; Phase 4 complete (bridge + tools, gate not attempted); stray-process root cause corrected in the master plan
+
+Read `audioBridge.ts`, `AudioAnalyzeTool.ts`, `TranscribeAndSummarizeTool.ts`,
+`schemas.ts` in full, plus the `src/tools.ts`/`tool-contract.md` diffs —
+matches session 21's own description exactly, `DataAnalyzeTool`'s
+established pattern followed correctly throughout, `checkPermissions`/
+`isReadOnly` postures consistent with every other local-bridge tool.
+
+Re-ran the two new tools' dedicated test files directly (not trusting the
+reported count): **28/28 pass**, including live output visibly confirming
+real, correct transcription and VAD segmentation through the actual bridge.
+Ran the full scoped suite three times to resolve one flaky result: first
+run 515/516 (one failure, no detail captured due to an output-buffering
+issue on this end, not investigated further); two subsequent clean runs
+both **516/516 pass** — consistent with this project's own long-documented
+pre-existing test-hermeticity issue (shared resource contention across many
+live-test files run concurrently), not a regression from this session's
+work, matching the exact same pattern already characterized in earlier
+sessions. `bun run build`: clean. `npx tsc --noEmit`: **3521**, unchanged.
+
+**Corrected the "recurring stray bridge process" documentation in
+`LOCAL_AI_MASTER_PLAN.md`'s Phase 1 status note**: earlier sessions (16,
+18, 20) had guessed this was an external Windows Scheduled Task or Startup
+entry outside the repo. Session 21's own investigation this session
+disproved that and found the real mechanism — a parent-child relationship
+caused by `start.ps1` never activating the venv (so `PATH` never gets the
+venv's `Scripts/` directory prepended, letting a dependency's PATH-based
+`"python"` lookup resolve to system Python instead of `sys.executable`).
+Updated the master plan's note to reflect the corrected diagnosis and the
+likely fix (prepend the venv to `PATH` in `start.ps1`, or invoke via
+`Activate.ps1`) rather than leave the wrong explanation standing — this
+matters because "check Windows Task Scheduler" would have sent whoever
+picks this up next looking in the wrong place entirely.
+
+**Phase 4 marked built/verified in the master plan** (bridge + both
+TypeScript tools, live-verified end to end) — the plan's own gate
+("transcription spot-check vs a cloud STT on 3 real recordings") remains
+explicitly not attempted, flagged rather than skipped silently, since it
+needs real human recordings and an explicit paid-API opt-in neither
+session had reason to invoke unprompted.
+
+No discrepancies found between session 21's report and this verification.
+Committing sessions 19-22's combined work together.

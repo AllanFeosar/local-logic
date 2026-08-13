@@ -117,6 +117,8 @@ most agents will touch:
 | `AskMathModel` | `src/tools/AskMathModelTool/` | Calls a local Ollama math specialist — raw completion, not native tool-calling |
 | `DocumentQA` / `ImageCaption` | `src/tools/{DocumentQA,ImageCaption}Tool/` | Call the Python bridge (`python-bridge/`) over local HTTP |
 | `DataAnalyze` | `src/tools/DataAnalyzeTool/` | First domain **gateway tool** per `LOCAL_AI_MASTER_PLAN.md` §6 mitigation 2 — one tool, `operation: "question" \| "predict" \| "forecast"`, dispatching deterministically (no model choice below the gateway) to `/table-qa`, `/tabular-predict`, `/forecast` on the Python bridge. Tool-facing `inputSchema`/`outputSchema` are deliberately flat `ZodObject`s with every per-operation field optional, not a top-level `z.discriminatedUnion` — see `DataAnalyzeTool/schemas.ts`'s comment (mirrors the existing `LSPTool/schemas.ts` pattern: a discriminated union is used internally, in `validateInput()`/`call()`, purely for precise per-operation error messages). Future Vision/Audio gateway tools (§6) should follow this same shape. |
+| `AudioAnalyze` | `src/tools/AudioAnalyzeTool/` | Phase 4 "Hearing" gateway tool (added 2026-08-13, `tools-execution-agent`) — one tool, `operation: "transcribe" \| "vad"`, dispatching to `/transcribe`/`/vad` on the Python bridge (§3 below). Same flat-`ZodObject`-tool-facing-schema / internal-`z.discriminatedUnion`-for-validation shape as `DataAnalyzeTool` (`AudioAnalyzeTool/schemas.ts`). Unlike `DataAnalyzeTool`, `audio_path` is required by both operations, so the internal union's main job is rejecting operation-mismatched fields (e.g. `threshold` supplied with `operation: "transcribe"`) rather than a missing shared field. |
+| `TranscribeAndSummarize` | `src/tools/TranscribeAndSummarizeTool/` | Phase 4's named **fixed pipeline tool** (`LOCAL_AI_MASTER_PLAN.md` §6 mitigation 4 / §8 Phase 4) — one call runs `/vad` then `/transcribe` and returns the raw transcript + speech-segment metadata; does not call any LLM itself ("router summarizes" happens in the calling model's own next turn, same "return facts, not prose" posture as `DocumentQA`/`DataAnalyze`). Does not physically trim the audio to VAD's detected ranges before transcribing — see the tool's own `call()` comment for why (avoids duplicating `audio_utils.py`'s WAV parsing in TypeScript; Whisper's long-form generation already handles surrounding silence correctly). VAD's real payoff here: if it detects zero speech, transcription is skipped entirely (`had_speech: false`, empty transcript) rather than paying for a wasted Whisper pass. |
 | `TeamCreate` / `TeamDelete` / `SendMessage` | `src/tools/Team*Tool/`, `SendMessageTool/` | Swarm/teammate orchestration |
 | `EnterPlanMode` / `ExitPlanMode` | `src/tools/*PlanModeTool/` | Permission-mode transitions |
 
@@ -192,13 +194,15 @@ of `python-bridge-agent`'s `src/`-free surface), not done as part of this
 change. No tool-side code changes are expected — no route shape changed
 from what's documented above.
 
-### Phase 4 hearing routes, backing planned `AudioAnalyze`/`TranscribeAndSummarize` — bridge side implemented and live-verified 2026-08-13, tools not yet built
+### Phase 4 hearing routes, backing `AudioAnalyze`/`TranscribeAndSummarize` — bridge side and both tools built and live-verified
 
-Both routes below are live in the bridge (`python-bridge-agent`,
-2026-08-13) per `LOCAL_AI_MASTER_PLAN.md` §8 Phase 4. **No TypeScript tool
-calls either route yet** — building `AudioAnalyze`/`TranscribeAndSummarize`
-against this contract is a separate, later `tools-execution-agent` dispatch
-(explicitly out of scope for the bridge-side session that added these).
+Both routes below went live in the bridge (`python-bridge-agent`,
+2026-08-13) per `LOCAL_AI_MASTER_PLAN.md` §8 Phase 4, then `AudioAnalyzeTool`/
+`TranscribeAndSummarizeTool` were built against this exact contract
+(`tools-execution-agent`, 2026-08-13, same day — see §2's table above for
+each tool's shape). No route shape changed between the bridge-side session
+and the tool-side session; everything documented below is exactly what
+both tools call.
 
 | Route | Model | Request | Response |
 |---|---|---|---|
@@ -220,13 +224,32 @@ audio (short and >30s long-form) and a synthesized speech/silence/speech
 clip for VAD segmentation — see `LOCAL_AI_STATUS.md`'s Phase 4 session
 entry for exact transcripts/segment boundaries produced.
 
-If a future tool needs it, `TranscribeAndSummarize` (per the master plan's
-own naming) most likely wants to call `/vad` first to trim silence, then
-`/transcribe` on the trimmed audio — both routes are independent and
-composable, no bridge-side pipeline endpoint was built for this (deliberately
-left as tool-side orchestration, matching how `DataAnalyzeTool` composes
-three independent bridge routes rather than the bridge doing multi-model
-pipelines itself).
+`TranscribeAndSummarizeTool` calls `/vad` first, then `/transcribe` — both
+routes are independent and composable, no bridge-side pipeline endpoint
+exists for this (deliberately left as tool-side orchestration, matching how
+`DataAnalyzeTool` composes three independent bridge routes rather than the
+bridge doing multi-model pipelines itself). It does **not** trim the audio
+to VAD's detected ranges before transcribing (a real option the master
+plan's own phrasing left open — see that tool's `call()` comment for the
+justification); the only behavioral effect of the `/vad` call is an early
+exit when zero speech is detected, skipping `/transcribe` entirely.
+
+**Consumer side status (2026-08-13, tools-execution-agent):**
+`AudioAnalyzeTool` (`src/tools/AudioAnalyzeTool/`) and
+`TranscribeAndSummarizeTool` (`src/tools/TranscribeAndSummarizeTool/`) are
+both built and registered against this exact contract, request/response
+shapes verbatim. A shared HTTP client + 404/400 error-mapping helper
+(`src/tools/shared/audioBridge.ts`) backs both tools' bridge calls, so the
+`{"detail": "..."}` FastAPI error-body parsing and the 404→"not
+found/unsupported format" / 400→"rejected the request: `<detail>`" mapping
+live in exactly one place. Mocked tests cover both operations of
+`AudioAnalyzeTool` plus `TranscribeAndSummarizeTool`'s two-call pipeline
+(including the had-speech / no-speech branches and error propagation from
+either bridge call); `*.live.test.ts` files for both tools synthesize their
+own test audio at run time (Windows SAPI TTS for real speech, a small
+hand-rolled silent-WAV writer for the no-speech case) rather than depending
+on a checked-in binary fixture — see `LOCAL_AI_STATUS.md`'s Phase 4
+tool-side session entry for live-verification results.
 
 Extending this table is `python-bridge-agent`'s responsibility whenever a
 new route is added — see that agent's own Architecture rules for the
@@ -240,7 +263,8 @@ model" section).
 ## 4. Not yet implemented / planned
 > `tools-execution-agent` adds entries here as new tools are built.
 
-- `AudioAnalyze` / `TranscribeAndSummarize` — planned TypeScript tools to
-  call the now-live `/transcribe` and `/vad` bridge routes (§3 "Phase 4
-  hearing routes", added 2026-08-13). Not yet built — a separate,
-  later dispatch per `LOCAL_AI_MASTER_PLAN.md` §8 Phase 4.
+Nothing currently planned-but-unbuilt as of 2026-08-13 — `AudioAnalyze`/
+`TranscribeAndSummarize` (Phase 4) shipped this session; see §2's table and
+§3's "Consumer side status" note above. Next candidate per
+`LOCAL_AI_MASTER_PLAN.md` §8 is Phase 5's `VisionAnalyze` gateway tool, not
+yet started.

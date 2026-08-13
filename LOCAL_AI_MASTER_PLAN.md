@@ -771,16 +771,39 @@ a menu the router already can't reliably pick from), so it's no longer
   **A tsc baseline discrepancy session 17 reported (3942, via git-stash
   bisection) was checked directly by session 18 and does not reproduce —
   3521 (run twice, independently) remains the confirmed current baseline.**
-  **A recurring operational issue, now confirmed a 4th time**: a duplicate
-  `python-bridge/server.py` process on the wrong Python interpreter
-  auto-respawns within seconds of the correct one starting, consuming GPU
-  VRAM and degrading router latency — not caused by anything in this
-  project's own start scripts (confirmed), most likely a stray Windows
-  Scheduled Task or Startup entry outside the repo. This has now cost real
-  measurement time across two consecutive sessions and is worth the
-  project owner's direct attention (check Task Scheduler/Startup Apps for
-  anything referencing `python-bridge`/`server.py`) rather than continuing
-  to be manually killed each session it recurs.
+  **A recurring operational issue — root cause now correctly identified
+  (session 21, 2026-08-13; earlier "external Windows Scheduled Task"
+  hypothesis in this note was wrong, corrected here rather than left
+  standing)**: the "duplicate `server.py` on the wrong interpreter" pattern
+  is not an external process at all — it's **parent-child**. Confirmed via
+  `Get-CimInstance`'s `ParentProcessId`/`CreationDate`: the correct venv
+  process (`python-bridge/venv/Scripts/python.exe`) is the *parent*, and a
+  system-Python-3.11 process is its *child*, spawned with an identical
+  timestamp — and it's the **child** that actually binds port 8756 and
+  serves requests. Root cause, reasoned from `start.ps1`'s own invocation
+  shape: it launches the venv's `python.exe` by absolute path but never
+  runs `Activate.ps1`, so the venv's `Scripts/` directory is never
+  prepended to `PATH` for that process — meaning whenever some dependency
+  in the stack (torch/transformers/onnxruntime/uvicorn internals, not
+  narrowed further) does a PATH-based `"python"` lookup instead of using
+  `sys.executable`, it resolves to whatever's first on `PATH`, which on
+  this machine is system Python 3.11. Reproduced identically and
+  immediately on repeated fresh restarts via `start.ps1` alone (no bare
+  `python` invocation involved) — confirmed environmental/dependency-level
+  behavior on this machine, not caused by how any session has been
+  launching the bridge. **Practical impact observed so far: none** — the
+  system Python 3.11 install apparently has a matching enough dependency
+  stack that results have been correct regardless of which interpreter
+  actually serves a given request — but two live copies of a heavy
+  CUDA/torch stack is real disk/maintenance cost with no guaranteed
+  version-sync going forward, and this is exactly the kind of "optimize/
+  fix an environment quirk" work the standing sequencing policy defers.
+  **Likely fix, for whoever picks this up**: make `start.ps1` set
+  `$env:PATH` to prepend the venv's own `Scripts/` directory before
+  launching (or invoke via `Activate.ps1`) so any PATH-based `python`
+  lookup inside the process tree resolves to the venv's interpreter
+  instead of system Python — not attempted this session, per the
+  standing policy.
   **Gate still not met on the honest ruler** (64.4% mean on the never-
   tuned-against holdout set — meaningfully below both the 20-case tuning
   set's optimistic 70-85% range and the ~90% target). Per session 17's own
@@ -954,6 +977,31 @@ a menu the router already can't reliably pick from), so it's no longer
 - **Phase 4 — Hearing**: silero-vad ONNX (re-download, ~2 MB), Whisper
   turbo on GPU, `AudioAnalyze` + `TranscribeAndSummarize`.
   *Gate: transcription spot-check vs a cloud STT on 3 real recordings.*
+  **Status 2026-08-13 (sessions 19-21): built, wired, live-verified end to
+  end; gate not attempted.** Bridge side (session 19, independently
+  verified session 20): `POST /transcribe` (whisper-large-v3-turbo,
+  GPU+fp16, long-form audio, segment timestamps, language auto-detect) and
+  `POST /vad` (silero-vad ONNX release — the pre-downloaded MLX-format
+  checkpoint confirmed genuinely unusable via direct tensor-key inspection,
+  not assumed) both live in `python-bridge/server.py`. TypeScript side
+  (session 21): `AudioAnalyzeTool` (general gateway, `operation:
+  "transcribe"|"vad"`, `DataAnalyzeTool`-shaped) and
+  `TranscribeAndSummarizeTool` (the plan's own named fixed-pipeline tool —
+  VAD first as a zero-speech short-circuit, then transcribe; deliberately
+  does NOT physically trim audio to speech ranges, since Whisper's own
+  long-form generation already handles full-clip silence correctly —
+  documented tradeoff, not an oversight), both registered and live-verified
+  with word-perfect transcripts against real (synthesized) speech. **Gate
+  itself not attempted** (needs real human recordings + an explicit
+  paid-cloud-STT opt-in, mirroring `specialistEval.ts`'s `--frontier`
+  flag) — flagged as open, not blocking, per the standing sequencing
+  policy. One real, documented risk worth carrying forward: GPU VRAM
+  co-residency with `transcribe` in the mix is tight on this machine's 4GB
+  card (~3600MB of 4096MB measured with 3 GPU models loaded, independently
+  reproduced twice) — LRU eviction handles it today, but there's no real
+  safety margin below the physical ceiling (see the VRAM-budget-ceiling
+  note in `LOCAL_AI_STATUS.md` Session 20), deferred to the optimization
+  pass per policy. Full history in `LOCAL_AI_STATUS.md` Sessions 19-21.
 - **Phase 5 — Full vision suite**: CLIP, OWLv2, CLIPSeg, DINOv2, ViTPose
   behind `VisionAnalyze`; fold BLIP in; CLIP image memory.
   *Gate: vision eval set (classification, detection, "find X in image").*

@@ -360,3 +360,97 @@ agent-side manual verification during this session, were flagged as an ungitigno
 item — already deleted by the orchestrating session before this entry was staged (confirmed
 absent from git status at commit time), no gitignore pattern was judged necessary for
 one-off scratch files that don't recur as a class the way the earlier *.log finding did.
+
+## 2026-08-13 — Phase 4 "Hearing" tool side: AudioAnalyzeTool + TranscribeAndSummarizeTool + shared audioBridge.ts
+Files audited: src/tools/shared/audioBridge.ts, src/tools/AudioAnalyzeTool/AudioAnalyzeTool.ts, src/tools/AudioAnalyzeTool/schemas.ts, src/tools/AudioAnalyzeTool/prompt.ts, src/tools/TranscribeAndSummarizeTool/TranscribeAndSummarizeTool.ts, src/tools/TranscribeAndSummarizeTool/prompt.ts
+Also staged in this commit, declared rather than deep-read (test-only, no production surface — named here per this log's own convention, not folded silently into the audited list): src/tools/AudioAnalyzeTool/AudioAnalyzeTool.test.ts, src/tools/AudioAnalyzeTool/AudioAnalyzeTool.live.test.ts, src/tools/TranscribeAndSummarizeTool/TranscribeAndSummarizeTool.test.ts, src/tools/TranscribeAndSummarizeTool/TranscribeAndSummarizeTool.live.test.ts. One spot-check made anyway: both .live.test.ts files add a node:child_process use (execFileSync('powershell.exe', [...]) for SAPI TTS fixture synthesis, AudioAnalyzeTool.live.test.ts:37-41) — argv-form, no shell:true, developer-authored literal script over an mkdtempSync path, unreachable from production. Not a finding.
+Read for data-flow tracing, not modified in this diff: python-bridge/server.py (Phase 4 routes), python-bridge/local_models/transcribe.py, python-bridge/local_models/vad.py, python-bridge/local_models/audio_utils.py, src/tools/shared/localModelBridge.ts, src/utils/combinedAbortSignal.ts, src/tools/ImageCaptionTool/ImageCaptionTool.ts, src/tools.ts, src/hooks/toolPermission/permissionLogging.ts. Also staged, non-code: .claude/contracts/tool-contract.md, LOCAL_AI_MASTER_PLAN.md, LOCAL_AI_STATUS.md, src/tools.ts (registration only, two entries).
+Verdict: 0 Critical, 0 High, 0 Medium, 0 Low (3 informational, no action taken)
+Recommendation: ship
+Findings: none — no separate handoff report.
+
+Pass/fail against every check requested (all five passed, no findings):
+1. Path/injection: audio_path is carried as a JSON string field only (audioBridge.ts:40-45,
+   bodies at :117/:134) — never URL-interpolated, never path-concatenated, and this TS layer
+   does no filesystem access on it at all (no fs/node:path import in any of the three new
+   production files). Server side: the path reaches only os.path.isfile()/wave.open()
+   (audio_utils.py:63-72); no subprocess/shell anywhere on the Phase 4 routes.
+2. No SSRF: fetch target is `${MODEL_BRIDGE_BASE_URL}${path}` with path one of two hardcoded
+   literals; base is localModelBridge.ts:8-9 (env-overridable loopback default — trusted input
+   per this project's established precedent). Nothing request-derived reaches host/protocol/path.
+3. checkPermissions: unconditional-allow claim verified by direct read at
+   AudioAnalyzeTool.ts:165-172 and TranscribeAndSummarizeTool.ts:98-106 — effect-equivalent to
+   ImageCaptionTool.ts:61-63, the direct path-taking precedent, and no more permissive. Both
+   tools declare isReadOnly() true; both re-validate against the discriminated union inside
+   call() (AudioAnalyzeTool.ts:181-185) before any network call. validateInput -> checkPermissions
+   -> call ordering intact; no unawaited check, no bypass path.
+4. Error handling: throwForErrorResponse (audioBridge.ts:88-107) surfaces only the caller's own
+   audio_path (404 branch) plus the bridge's `detail`. Every detail producer on these two routes
+   traced — 404s are a fixed literal (server.py:251/253/287/289, preserving the collapsed
+   existence-oracle response, and audioBridge.ts:94-98 does not reintroduce a missing-vs-
+   unloadable distinction); 400s (transcribe.py:146/149/212, vad.py:228/230/232) contain
+   durations, the caller's own language value, and static text — no paths, stack traces, or
+   secrets. readDetail (:58-67) is JSON.parse in try/catch with no reviver; a null/non-object/
+   non-JSON body falls through to raw text. Worst case from a hostile bridge response is a thrown
+   Error: no eval, no new Function, no branch keyed on response content. No auth headers are sent
+   to the bridge, and nothing in the three new files logs anything (grep: zero console./logError/
+   logEvent/process.env hits).
+5. TranscribeAndSummarize's two sequential calls: one combined signal covers both legs
+   (:124-126), so a caller abort cancels the in-flight request rather than only one leg; cleanup()
+   runs in finally (:169-171) on every path including the zero-speech early return, clearing the
+   setTimeout and removing the caller-signal listener (combinedAbortSignal.ts:40-44). Already-
+   aborted fast path creates no timer. Response bodies consumed on both success and error paths.
+   The zero-speech skip (:145-157) can only cause fewer bridge calls on an already-named path —
+   pure optimization, no capability granted, no security implication either direction.
+
+Contract-as-data check: the staged tool-contract.md diff is documentation only (§2 table rows, §3
+status prose, §4 emptied) — no embedded directive addressed to an agent, nothing instructing an
+audit to be skipped or marked complete.
+
+Informational, no action taken:
+- Response bodies are cast, not schema-parsed (audioBridge.ts:123, :140-141) — a malformed bridge
+  response surfaces as a contained TypeError (e.g. TranscribeAndSummarizeTool.ts:147). Identical
+  to ImageCaptionTool.ts:96's existing `as Output`; peer is a trusted loopback service.
+- postJson's catch (audioBridge.ts:46-48) funnels AbortError (user cancel / 120s timeout) into
+  modelBridgeUnavailableMessage, so a cancelled call reports "Is it running?". Same shape as
+  ImageCaptionTool.ts:84-86 — message accuracy only, cancellation itself works.
+- As with ImageCaptionTool, the unconditional allow means deny: Read(...) rules do not gate these
+  reads. That is the owner-confirmed posture recorded in this log's 2026-08-12 entry (path
+  allowlisting deliberately declined in favour of the project-level tool/permission model), and
+  exposure is bounded to parseable 8/16-bit PCM WAV content with the 404 collapse intact.
+
+Ledger observation (outside this diff, no action required for this commit): the Phase 4 bridge-side
+commit 7936828 (transcribe.py, vad.py, audio_utils.py, server.py routes) has no entry in this log.
+Those paths fall outside the gate's src/tools/ pattern so none was required, but prior entries
+voluntarily covered python-bridge/. All four files were read in full during this audit as part of
+tracing the tool-side data flow; nothing requiring action was found — see the retroactive entry
+immediately below.
+
+## 2026-08-13 — Retroactive, voluntary coverage: Phase 4 bridge-side (commit 7936828 — transcribe.py, vad.py, audio_utils.py, server.py routes)
+Files audited: python-bridge/local_models/transcribe.py, python-bridge/local_models/vad.py, python-bridge/local_models/audio_utils.py, python-bridge/server.py (§ Phase 4 `/transcribe`/`/vad` routes only)
+Verdict: 0 Critical, 0 High, 0 Medium, 0 Low
+Recommendation: ship (already committed and live-verified across sessions 19-22 before this entry was written)
+Findings: none — no separate handoff report.
+
+Context: these four files landed in commit 7936828, outside this log's mandatory gate (the
+`security-gate` hook's path pattern is `^src/tools/` etc. and does not cover `python-bridge/`), so
+no audit was strictly required before that commit. Voluntarily covered here, after the fact,
+matching this log's own established convention of covering `python-bridge/` anyway (see the
+2026-08-12 session 2 entry) — read in full as part of tracing data flow for the tool-side audit
+immediately above, not as a fresh independent pass, so this entry is narrower in scope than a
+dedicated bridge audit would be: it covers exactly what the tool-side audit needed to trace
+(the `/transcribe`/`/vad` routes' own input handling), not the full bridge surface.
+
+Checked: `audio_path` reaches only `os.path.isfile()` (audio_utils.py:63) and `wave.open()`
+(audio_utils.py:67) — no subprocess, no shell, no dynamic import keyed on the path. The documented
+404 collapse (missing file vs. unreadable/unsupported-format file, both `UnsupportedAudioError`/
+`FileNotFoundError` mapped to the same generic 404 in server.py) is intact and matches the
+already-established `/image-caption` precedent exactly — no new filesystem-existence-oracle
+surface. `/transcribe`'s `language` parameter is passed to `model.generate(language=...)`
+(transcribe.py) and only ever reaches a `ValueError` (`"Unsupported language: ..."`) on an
+unrecognized value, mapped to a 400 — not a code-execution or template-injection surface.
+`reject_unexpected_host` middleware (server.py, pre-existing) covers these new routes
+automatically, no change needed. No new dependency in this diff (`onnxruntime`,
+`flatbuffers`, `protobuf` — see requirements.txt) is invoked with any request-derived data
+beyond the already-covered `audio_path`. No credentials, no outbound network calls beyond the
+loopback bridge itself.
