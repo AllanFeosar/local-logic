@@ -47,6 +47,11 @@ from typing import Literal, Optional, Union
 from local_models import audio_utils, document_qa, image_caption, table_qa, tabular_predict, vad as vad_model
 from local_models import forecast as forecast_model
 from local_models import transcribe as transcribe_model
+from local_models import clip as clip_model
+from local_models import clipseg as clipseg_model
+from local_models import dinov2 as dinov2_model
+from local_models import owlv2 as owlv2_model
+from local_models import vitpose as vitpose_model
 from local_models.manager import manager
 
 logging.basicConfig(level=logging.INFO)
@@ -290,6 +295,196 @@ async def vad_endpoint(req: VadRequest):
     except vad_model.InvalidAudioInput as e:
         raise HTTPException(status_code=400, detail=str(e))
     return VadResponse(segments=result)
+
+
+# --- Phase 5: vision suite (2026-08-13) ------------------------------------
+# Contract added to .claude/contracts/tool-contract.md's §3 table in the
+# same change as these routes went live, for tools-execution-agent's future
+# VisionAnalyze gateway tool (not part of this dispatch) to build against.
+# All five routes share the same 404 reasoning as /image-caption: a missing
+# file and an existing-but-unloadable file are deliberately collapsed into
+# the same generic 404 (see local_models/image_utils.py's load_image()
+# docstring) rather than distinguished, closing the same filesystem-
+# existence-oracle gap the /image-caption security review already fixed —
+# don't reintroduce a distinct message/status for either case here.
+
+
+class ClipClassifyRequest(BaseModel):
+    image_path: str
+    labels: list[str]
+
+
+class ClipPrediction(BaseModel):
+    label: str
+    score: float
+
+
+class ClipClassifyResponse(BaseModel):
+    predictions: list[ClipPrediction]
+
+
+@app.post("/clip-classify", response_model=ClipClassifyResponse)
+async def clip_classify_endpoint(req: ClipClassifyRequest):
+    try:
+        result = await clip_model.classify_async(req.image_path, req.labels)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="image not found or not readable")
+    except OSError:
+        raise HTTPException(status_code=404, detail="image not found or not readable")
+    except clip_model.InvalidClipInput as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return ClipClassifyResponse(**result)
+
+
+class ClipEmbedRequest(BaseModel):
+    image_path: str
+
+
+class ClipEmbedResponse(BaseModel):
+    embedding: list[float]
+
+
+@app.post("/clip-embed", response_model=ClipEmbedResponse)
+async def clip_embed_endpoint(req: ClipEmbedRequest):
+    try:
+        result = await clip_model.embed_async(req.image_path)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="image not found or not readable")
+    except OSError:
+        raise HTTPException(status_code=404, detail="image not found or not readable")
+    return ClipEmbedResponse(**result)
+
+
+class ClipsegSegmentRequest(BaseModel):
+    image_path: str
+    prompt: str
+    threshold: float = Field(0.5, gt=0.0, lt=1.0)
+
+
+class ClipsegBox(BaseModel):
+    x1: int
+    y1: int
+    x2: int
+    y2: int
+
+
+class ClipsegSegmentResponse(BaseModel):
+    found: bool
+    box: Optional[ClipsegBox] = None
+    confidence: float
+    coverage: float
+
+
+@app.post("/clipseg-segment", response_model=ClipsegSegmentResponse)
+async def clipseg_segment_endpoint(req: ClipsegSegmentRequest):
+    try:
+        result = await clipseg_model.segment_async(req.image_path, req.prompt, req.threshold)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="image not found or not readable")
+    except OSError:
+        raise HTTPException(status_code=404, detail="image not found or not readable")
+    except clipseg_model.InvalidClipsegInput as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return ClipsegSegmentResponse(**result)
+
+
+class Dinov2EmbedRequest(BaseModel):
+    image_path: str
+
+
+class Dinov2EmbedResponse(BaseModel):
+    embedding: list[float]
+
+
+@app.post("/dinov2-embed", response_model=Dinov2EmbedResponse)
+async def dinov2_embed_endpoint(req: Dinov2EmbedRequest):
+    try:
+        result = await dinov2_model.embed_async(req.image_path)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="image not found or not readable")
+    except OSError:
+        raise HTTPException(status_code=404, detail="image not found or not readable")
+    return Dinov2EmbedResponse(**result)
+
+
+class Owlv2DetectRequest(BaseModel):
+    image_path: str
+    queries: list[str]
+    threshold: float = Field(0.1, gt=0.0, lt=1.0)
+
+
+class Owlv2Box(BaseModel):
+    x1: float
+    y1: float
+    x2: float
+    y2: float
+
+
+class Owlv2Detection(BaseModel):
+    label: str
+    score: float
+    box: Owlv2Box
+
+
+class Owlv2DetectResponse(BaseModel):
+    detections: list[Owlv2Detection]
+
+
+@app.post("/owlv2-detect", response_model=Owlv2DetectResponse)
+async def owlv2_detect_endpoint(req: Owlv2DetectRequest):
+    try:
+        result = await owlv2_model.detect_async(req.image_path, req.queries, req.threshold)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="image not found or not readable")
+    except OSError:
+        raise HTTPException(status_code=404, detail="image not found or not readable")
+    except owlv2_model.InvalidOwlv2Input as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return Owlv2DetectResponse(**result)
+
+
+class VitposePoseRequest(BaseModel):
+    image_path: str
+    # COCO format per box: [x, y, width, height]. None (default) falls back
+    # to a single full-image box — see local_models/vitpose.py's module
+    # docstring for why (no person detector composed at the bridge layer).
+    boxes: Optional[list[list[float]]] = None
+
+
+class VitposeBox(BaseModel):
+    x1: float
+    y1: float
+    x2: float
+    y2: float
+
+
+class VitposeKeypoint(BaseModel):
+    name: str
+    x: float
+    y: float
+    score: float
+
+
+class VitposePerson(BaseModel):
+    box: VitposeBox
+    keypoints: list[VitposeKeypoint]
+
+
+class VitposePoseResponse(BaseModel):
+    people: list[VitposePerson]
+
+
+@app.post("/vitpose-pose", response_model=VitposePoseResponse)
+async def vitpose_pose_endpoint(req: VitposePoseRequest):
+    try:
+        result = await vitpose_model.pose_async(req.image_path, req.boxes)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="image not found or not readable")
+    except OSError:
+        raise HTTPException(status_code=404, detail="image not found or not readable")
+    except vitpose_model.InvalidVitposeInput as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return VitposePoseResponse(**result)
 
 
 if __name__ == "__main__":

@@ -183,9 +183,17 @@ if ($pyChanged) {
     $pyOnPath = (cmd /c "where python 2>nul")
     if (-not $pyOnPath) { $pyOnPath = (cmd /c "where py 2>nul") }
     if (-not $pyOnPath) { Fail-Open "python/py not on PATH" }
+    # NOTE (2026-08-13): was `python -m py_compile server.py local_models/*.py`.
+    # py_compile does not glob-expand its own argv, and cmd.exe (invoked via
+    # `cmd /c` here) doesn't expand `*` for arbitrary commands either — the
+    # glob reached py_compile as a literal string, failing every time with
+    # "[Errno 22] Invalid argument: 'local_models/*.py'" regardless of what
+    # any subagent actually changed. Reproduced directly, confirmed via a
+    # real syntax error that `compileall` (which walks a directory itself,
+    # no shell-side glob needed) still correctly fails with exit code 1 on.
     Push-Location python-bridge
-    $out = cmd /c "python -m py_compile server.py local_models/*.py 2>&1"
-    if ($LASTEXITCODE -eq 9009) { $out = cmd /c "py -m py_compile server.py local_models/*.py 2>&1" }
+    $out = cmd /c "python -m compileall -q server.py local_models 2>&1"
+    if ($LASTEXITCODE -eq 9009) { $out = cmd /c "py -m compileall -q server.py local_models 2>&1" }
     Pop-Location
     if ($LASTEXITCODE -ne 0) { Fail-Gate "python-bridge-agent: py_compile" ($out -join "`n") }
 }

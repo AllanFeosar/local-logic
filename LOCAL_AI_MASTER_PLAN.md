@@ -1005,6 +1005,31 @@ a menu the router already can't reliably pick from), so it's no longer
 - **Phase 5 — Full vision suite**: CLIP, OWLv2, CLIPSeg, DINOv2, ViTPose
   behind `VisionAnalyze`; fold BLIP in; CLIP image memory.
   *Gate: vision eval set (classification, detection, "find X in image").*
+  **Status 2026-08-13 (sessions 23-24): bridge side built, live-verified,
+  independently re-confirmed; `VisionAnalyze` TypeScript tool not yet
+  built.** All five models wired into `python-bridge/` following the
+  established `ModelSpec`/`manager.py` pattern: `POST /clip-classify`,
+  `/clip-embed`, `/clipseg-segment`, `/dinov2-embed`, `/owlv2-detect`,
+  `/vitpose-pose`. Device placement live-benchmarked per model, not
+  defaulted (CLIP and OWLv2 on GPU — the two with a real latency case, ~10x
+  and ~25x speedups respectively; CLIPSeg/DINOv2/ViTPose kept on CPU,
+  already comfortable and preserving this machine's tight GPU VRAM for the
+  two that need it). Two more real upstream-library bugs found and fixed
+  along the way (matching Phase 4's own pattern): `CLIPModel.
+  get_image_features()` returns a wrapped object, not a plain tensor, on
+  this transformers version; `VitPoseImageProcessor.
+  post_process_pose_estimation()`'s own returned bbox field is genuinely
+  broken (a real box comes back ~1-3 pixels regardless of input size) —
+  worked around by not using that field at all. **"CLIP image memory"
+  scoped deliberately, not half-built**: the embedding primitive
+  (`/clip-embed`) is exposed; a genuine persistent store/retrieval layer on
+  top of it is flagged as a separate, substantial design decision, not
+  attempted under this dispatch's time budget. VRAM co-residency measured
+  under multiple realistic scenarios including a deliberate worst case (all
+  5 new + 3 existing GPU models requested at once) — confirmed the existing
+  LRU eviction handles oversubscription correctly with zero code changes,
+  same finding Phase 4 already established. Full history in
+  `LOCAL_AI_STATUS.md` Sessions 23-24.
 - **Phase 6 — Voice out & generation** (optional): Qwen3-TTS feasibility
   spike → wire if transformers supports it; SD 1.5 on GPU; MusicGen last.
   *Gate: TTS round-trip (type → hear) at acceptable latency, or documented

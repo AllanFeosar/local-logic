@@ -251,6 +251,56 @@ hand-rolled silent-WAV writer for the no-speech case) rather than depending
 on a checked-in binary fixture — see `LOCAL_AI_STATUS.md`'s Phase 4
 tool-side session entry for live-verification results.
 
+### Phase 5 vision-suite routes, backing a future `VisionAnalyze` gateway tool — bridge side live, no consumer tool built yet
+
+All six routes below went live in the bridge (`python-bridge-agent`,
+2026-08-13) per `LOCAL_AI_MASTER_PLAN.md` §8 Phase 5. **No TypeScript tool
+calls these yet** — `VisionAnalyze` (or per-capability tools) is a separate,
+later `tools-execution-agent` dispatch; this section exists so that dispatch
+can build against exact, live-verified shapes rather than guessing.
+
+| Route | Model | Request | Response |
+|---|---|---|---|
+| `POST /clip-classify` | clip-vit-large-patch14 | `{ image_path: string, labels: string[] }` | `{ predictions: Array<{ label: string, score: number }> }` (sorted descending by score; softmax-normalized across the supplied `labels`, not a calibrated open-set probability) |
+| `POST /clip-embed` | clip-vit-large-patch14 | `{ image_path: string }` | `{ embedding: number[] }` (768-dim, L2-normalized — cosine similarity between two calls reduces to a dot product; NOT comparable to `/dinov2-embed`'s vectors, different model/space) |
+| `POST /clipseg-segment` | clipseg-rd64-refined | `{ image_path: string, prompt: string, threshold?: number }` (`threshold` optional, default 0.5, `0 < threshold < 1`) | `{ found: boolean, box: { x1: number, y1: number, x2: number, y2: number } \| null, confidence: number, coverage: number }` (`box` is a bounding box derived from the thresholded mask, in the *original* image's pixel coordinates, not a raw pixel mask — see `local_models/clipseg.py`'s module docstring for why a mask blob wasn't returned; `confidence` is mean sigmoid probability inside the box, `coverage` is the fraction of image pixels above threshold) |
+| `POST /dinov2-embed` | dinov2-small | `{ image_path: string }` | `{ embedding: number[] }` (384-dim, L2-normalized, the LayerNormed CLS token — NOT comparable to `/clip-embed`'s vectors) |
+| `POST /owlv2-detect` | owlv2-base-patch16-ensemble | `{ image_path: string, queries: string[], threshold?: number }` (`threshold` optional, default 0.1, `0 < threshold < 1`) | `{ detections: Array<{ label: string, score: number, box: { x1, y1, x2, y2 } }> }` (sorted descending by score; `box` is in the original image's absolute pixel coordinates, top-left/bottom-right — via `Owlv2Processor.post_process_grounded_object_detection`) |
+| `POST /vitpose-pose` | vitpose-plus-base | `{ image_path: string, boxes?: number[][] }` (`boxes`, if supplied, is COCO-format `[x, y, width, height]` per box; omitted defaults to a single full-image box — this bridge does not compose a person-detector stage internally, see below) | `{ people: Array<{ box: { x1, y1, x2, y2 }, keypoints: Array<{ name: string, x: number, y: number, score: number }> }> }` (17 COCO keypoints per person, `name` values like `"L_Shoulder"`/`"R_Knee"` from this checkpoint's own `config.id2label`) |
+
+All six: loopback-only, no auth, same collapsed-404 reasoning as
+`/image-caption`/`/transcribe` for a missing or unreadable `image_path`
+(`local_models/image_utils.py`, new shared helper this phase — see its own
+docstring); a malformed request body (empty `labels`/`queries`/`prompt`, a
+malformed `boxes` entry) is a 400, never a raw 500. Device placement was
+decided per-model from live benchmarks, not defaulted: `clip`/`owlv2` are
+GPU+fp16 (measured 10x and ~25x CPU/GPU speedups respectively, large enough
+to matter for a single interactive call); `clipseg`/`dinov2`/`vitpose` are
+CPU-only (measured CPU latency already comfortable, 55-296ms, and kept off
+the GPU to preserve this machine's tight VRAM headroom) — see
+`python-bridge/local_models/clip.py`'s module docstring for every model's
+exact benchmark numbers side by side, and `LOCAL_AI_STATUS.md`'s Phase 5
+session entry for live co-residency measurements against the existing GPU
+models (`document-qa`/`image-caption`/`transcribe`).
+
+**`vitpose-plus-base` is a mixture-of-experts checkpoint** — the bridge
+always requests the COCO-pretrained expert (`dataset_index=0`) internally;
+this is not exposed as a request parameter (no current use case for the
+other 5 experts). It is also genuinely top-down (requires a box at the
+image-processor level, confirmed by reading the processor's own source, not
+assumed) — there is no way to run it on a full image without *some* box,
+which is why `/vitpose-pose` supplies a full-image default rather than
+requiring the caller to always pass one.
+
+**CLIP image memory, scoped (2026-08-13)**: `/clip-embed` exposes the raw
+embedding primitive the master plan's "CLIP image memory" bullet names. A
+genuine persistent embedding store/retrieval layer on top of it (storage
+format, indexing, integration with the existing memdir/all-minilm
+text-memory system or a new one) is a separate, substantial design decision
+that was **not** built this dispatch — flagged for the project owner as a
+later, explicitly-scoped effort, not half-built here. See
+`LOCAL_AI_STATUS.md`'s Phase 5 session entry for the full reasoning.
+
 Extending this table is `python-bridge-agent`'s responsibility whenever a
 new route is added — see that agent's own Architecture rules for the
 lazy-load-singleton pattern every route follows (now: register a
@@ -263,8 +313,9 @@ model" section).
 ## 4. Not yet implemented / planned
 > `tools-execution-agent` adds entries here as new tools are built.
 
-Nothing currently planned-but-unbuilt as of 2026-08-13 — `AudioAnalyze`/
-`TranscribeAndSummarize` (Phase 4) shipped this session; see §2's table and
-§3's "Consumer side status" note above. Next candidate per
-`LOCAL_AI_MASTER_PLAN.md` §8 is Phase 5's `VisionAnalyze` gateway tool, not
-yet started.
+`AudioAnalyze`/`TranscribeAndSummarize` (Phase 4) shipped 2026-08-13; see
+§2's table and §3's "Consumer side status" note above. **Phase 5's vision
+routes are now live on the bridge (§3 above, 2026-08-13) but have no
+TypeScript consumer yet** — a `VisionAnalyze` gateway tool (or per-capability
+tools) against the exact shapes documented above is the next candidate per
+`LOCAL_AI_MASTER_PLAN.md` §8, not yet started.

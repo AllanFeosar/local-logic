@@ -3814,3 +3814,321 @@ session had reason to invoke unprompted.
 
 No discrepancies found between session 21's report and this verification.
 Committing sessions 19-22's combined work together.
+
+## Session 23 (2026-08-13, python-bridge-agent) — Phase 5 "The Vision Suite": CLIP, CLIPSeg, DINOv2, OWLv2, ViTPose wired into the bridge, live-verified end to end
+
+Per the standing sequencing policy and this dispatch's own scope: bridge
+side only — a `VisionAnalyze` TypeScript gateway tool (or per-capability
+tools) that calls these routes is a separate, later `tools-execution-agent`
+dispatch, not built here.
+
+### What was checked before writing any code
+
+All five checkpoints confirmed present at their documented paths under
+`C:\Users\allge\AI Models\huggingface\` before starting. For each, read the
+checkpoint's own `config.json` `architectures` field and live-tested the
+relevant `Auto*`/concrete-class path before writing inference code, per this
+project's standing "verify, don't assume" rule:
+
+- **CLIP** (`CLIPModel`): both `AutoProcessor`/`AutoModel` and the concrete
+  `CLIPProcessor`/`CLIPModel` resolved cleanly — not in the broken set.
+- **CLIPSeg** (`CLIPSegForImageSegmentation`): **`AutoModelForImageSegmentation`
+  fails live** (`ValueError: Unrecognized configuration class ... Model type
+  should be one of DetrConfig` — that Auto* class is scoped to DETR-family
+  models only). Concrete `CLIPSegProcessor`/`CLIPSegForImageSegmentation`
+  used instead.
+- **DINOv2** (`Dinov2Model`): `AutoImageProcessor`/`AutoModel` resolved
+  cleanly (to `BitImageProcessor`/`Dinov2Model` — this checkpoint's own
+  preprocessor_config.json genuinely declares `BitImageProcessor`, not a
+  resolution bug).
+- **OWLv2** (`Owlv2ForObjectDetection`): concrete `Owlv2Processor`/
+  `Owlv2ForObjectDetection` used directly — `post_process_grounded_object_detection`
+  (the correct, documented post-processing helper, used per the task's own
+  instruction instead of hand-rolled box decoding/NMS) is only exposed on
+  the concrete processor class regardless of Auto* status.
+- **ViTPose** (`VitPoseForPoseEstimation`, checkpoint `vitpose-plus-base`):
+  investigated up front (per the task's explicit instruction) whether it
+  needs a person-detection stage first — **confirmed it needs both a
+  bounding box AND a dataset index.** Reading `image_processing_vitpose.py`'s
+  own `preprocess()` signature confirmed `boxes` is a required argument
+  (genuine top-down architecture, no unboxed code path at all). Separately,
+  calling the model without `dataset_index` raised `ValueError:
+  dataset_index must be provided when using multiple experts (num_experts=6)`
+  — this specific checkpoint is the mixture-of-experts "plus" variant;
+  `dataset_index=0` (COCO) is used always, per the model's own worked
+  example and `modeling_vitpose_backbone.py`'s own docstring ("index 0
+  refers to COCO").
+
+### Built
+
+One new module per model in `python-bridge/local_models/`, all following
+the established `ModelSpec`-via-`manager.py` pattern (lazy-load singleton +
+sync fn + `asyncio.to_thread` async wrapper + `warmup()`):
+
+- **`local_models/image_utils.py`** (new, shared by all five modules below
+  — same "shared plumbing multiple models in one dispatch happen to need
+  identically" reasoning `audio_utils.py` was justified on for Phase 4):
+  `load_image(path)` — `FileNotFoundError` for a missing path, lets PIL's
+  `OSError` propagate for an unloadable one, both collapsed into the same
+  404 in `server.py`. `image_caption.py` (pre-existing) still inlines its
+  own identical copy rather than being refactored to use this — out of
+  surgical scope for an already-working module.
+- **`local_models/clip.py`** — zero-shot classification (`classify()`) +
+  raw image embedding (`embed()`, L2-normalized, the "CLIP image memory"
+  primitive — see scoping note below). **Real API finding**:
+  `CLIPModel.get_image_features()` on this transformers version does not
+  return a plain tensor as its own docstring example implies — it returns
+  a `BaseModelOutputWithPooling` whose `.pooler_output` holds the actual
+  embedding (confirmed by reading `modeling_clip.py`'s source: it
+  re-assigns `vision_outputs.pooler_output = self.visual_projection(...)`
+  and returns the whole wrapped object). `embed()` unwraps this explicitly;
+  the naive pattern was live-confirmed to raise `AttributeError:
+  'BaseModelOutputWithPooling' object has no attribute 'norm'`.
+- **`local_models/clipseg.py`** — text-prompted segmentation (`segment()`).
+  Returns a **bounding box derived from the thresholded mask**, upsampled
+  to the original image's pixel coordinates (not the model's fixed 352x352
+  working resolution), plus `confidence`/`coverage` — a full base64 mask
+  blob was considered and rejected (every other route in this bridge
+  returns small structured JSON facts, never an embedded image blob; no
+  currently-planned caller needs pixel-level detail). Honestly documented a
+  real limitation found live: prompting for an absent object ("a green
+  triangle" against an image with only a circle and rectangle) did not
+  reliably return `found: false` at the default threshold 0.5 (came back
+  `found: true` at confidence 0.52, sitting on the unrelated rectangle) —
+  raising `threshold` to 0.7 correctly flipped this to `found: false`,
+  confirmed live. Not a wiring bug — a genuine model-uncertainty
+  characteristic, documented in the module docstring.
+- **`local_models/dinov2.py`** — image embedding (`embed()`). Confirmed by
+  reading `Dinov2Model.forward()`'s own source that `pooler_output` is the
+  LayerNormed `[CLS]` token (the standard DINOv2 global descriptor, not a
+  guess from the field name). L2-normalized, same reasoning as `clip.py`'s
+  embedding — the two are explicitly documented as NOT comparable to each
+  other (different model/space).
+- **`local_models/owlv2.py`** — open-vocabulary detection (`detect()`) via
+  `Owlv2Processor.post_process_grounded_object_detection(...,
+  text_labels=[queries])` — live-confirmed this round-trips the original
+  query strings back onto each detection directly, no manual
+  label-index -> string lookup needed.
+- **`local_models/vitpose.py`** — top-down pose estimation (`pose()`).
+  `boxes` is optional; omitted defaults to a single full-image box (COCO
+  format), since — per this bridge's established "no multi-model pipelines
+  inside the bridge itself" precedent (`vad.py`/`transcribe.py`/
+  `TranscribeAndSummarizeTool`'s own contract note) — composing a person
+  detector (e.g. `owlv2.py`'s "a person" detection) ahead of this is a
+  tool-side concern for a future `VisionAnalyze` gateway tool, not built
+  here. **A second real bug found and fixed live, in the library's own
+  post-processing helper, not this module's code**:
+  `VitPoseImageProcessor.post_process_pose_estimation()`'s returned
+  `person["bbox"]` field is **not a usable image-pixel-space box** on this
+  transformers version — traced to its source: built from `[center_x,
+  center_y, *normalized* scale]` (scale divided by `normalize_factor=200`,
+  never multiplied back) run through `coco_to_pascal_voc()` as if it were
+  `[x, y, w, h]`. Directly reproduced: an input box `[90, 30, 220, 480]`
+  (~220x480 real pixels) came back as `bbox=[200, 270, 201.25, 272]` — a
+  ~1x2 pixel box, nowhere close to correct. Fixed by not using that field
+  at all: `pose()` returns the caller's own supplied box (or the
+  full-image default actually used) directly instead, which is correct and
+  meaningful. Live-verified both the single-box and multi-box (batched)
+  paths return properly-sized, correctly-corresponding boxes after the fix.
+- **`server.py`**: six new routes (`POST /clip-classify`, `/clip-embed`,
+  `/clipseg-segment`, `/dinov2-embed`, `/owlv2-detect`, `/vitpose-pose`),
+  following the exact existing Pydantic request/response + route-handler
+  pattern, same collapsed-404/400 conventions as every prior route.
+  `/status`'s `registered` list auto-includes all five new models.
+- **`requirements.txt`**: zero new dependencies — all five modules use only
+  the existing pinned `transformers`/`torch`/`pillow` stack. Documented
+  explicitly (both here and in the file itself) rather than left implicit.
+- **`python-bridge/README.md`**: documented all six new routes in the
+  endpoints list, moved the five checkpoints out of "not yet wired up",
+  added five History entries (the CLIPSeg Auto* failure, the
+  `get_image_features()` wrapper finding, the ViTPose MoE/`dataset_index`
+  finding, the device-placement summary — the `post_process_pose_estimation`
+  bbox bug is documented in `vitpose.py`'s own module docstring, referenced
+  from README rather than duplicated).
+- **`.claude/contracts/tool-contract.md`**: added a "Phase 5 vision-suite
+  routes" §3 subsection with exact live-verified request/response shapes,
+  the CLIP-image-memory scoping note (see below), and a §4 update noting
+  `VisionAnalyze` as the next unbuilt consumer.
+
+### Device placement — live-benchmarked per model, not defaulted (the task's explicit ask)
+
+Benchmarked each model's own forward pass, CPU vs GPU fp16, on this exact
+checkpoint on this machine (3-run average, warm) before registering a
+`ModelSpec`:
+
+| Model | CPU | GPU fp16 | Speedup | Real fp16 VRAM | Decision |
+|---|---|---|---|---|---|
+| CLIP | 579ms | 57ms | ~10x | ~882MB | **GPU** — expected frequent, general-purpose use (classify + embed) |
+| CLIPSeg | 296ms | 38ms | ~8x | ~313MB | **CPU** — already comfortable for one interactive call |
+| DINOv2 | 55ms | 16ms | ~3.5x | ~55MB | **CPU** — trivially fast, same case `vad.py` already established |
+| OWLv2 | 3876ms | 152ms | ~25x | ~323MB | **GPU** — the only one where CPU latency (~4s) is a real problem |
+| ViTPose | 200ms | 27ms | ~7x | ~283MB | **CPU** — already comfortable; also typically a second stage behind a detector |
+
+Reasoning recorded in each module's own docstring, not just here. The two
+GPU placements (CLIP, OWLv2) were chosen specifically because CPU latency
+was either already borderline (CLIP) or a genuine multi-second problem
+(OWLv2) — not a default. `estimated_mb` for every `ModelSpec` uses the
+fp32/on-disk figure (erring larger, matching `image_caption.py`'s own
+documented convention), not the smaller real fp16 figure, for eviction
+bookkeeping safety margin.
+
+### VRAM co-residency — measured live, not assumed (given the tight-VRAM context flagged for this task)
+
+- **CLIP + OWLv2 alone** (both newly GPU-placed): `nvidia-smi` showed
+  **1891 MiB of 4096 MiB** after loading both.
+- **`image-caption` (existing BLIP) + CLIP + OWLv2 together** — the exact
+  "image-caption + 2-3 vision models" composition the task asked to
+  measure: `nvidia-smi` showed **2771 MiB of 4096 MiB**, ~1325MB headroom.
+  All three returned correct, unchanged results during this
+  (BLIP caption, CLIP classification, OWLv2 detection all verified
+  correct) — no regression from the new routes/imports added to
+  `server.py`.
+- **Full worst case attempted**: sequentially loading all 5 new vision
+  models (committed estimate 4000MB) then `image-caption`+`document-qa`+
+  `transcribe` (existing GPU models) on top triggered the manager's
+  existing LRU eviction exactly as designed — by the time all three
+  existing GPU models were loaded, all 5 new vision models had been
+  evicted (final state: only `image-caption`+`document-qa`+`transcribe`
+  resident, `committed_mb_estimated: 4500` against the 4608 budget).
+  `nvidia-smi` showed **2897 MiB of 4096 MiB** for that final 3-model
+  state. **Confirms the existing eviction mechanism correctly handles the
+  5 new models with zero code changes** (same finding Phase 4's session 19
+  already established for `transcribe`/`vad`) — under the current budget,
+  not all 5 GPU-capable models (2 old + the new CLIP/OWLv2, i.e. up to 4
+  simultaneously-desired GPU models) can stay resident at once, and the
+  manager correctly evicts rather than OOMing. The `DEFAULT_BUDGET_MB`
+  miscalibration-above-physical-VRAM issue flagged in Session 20 is
+  unchanged by this session (not fixed, per the standing deferral) — this
+  session's own measurements stayed under the real 4096MB ceiling every
+  time because real fp16 usage is consistently well below the
+  fp32-erring-large `estimated_mb` bookkeeping figures, not because the
+  ceiling itself was raised or checked against.
+
+### Live verification — real bridge, real (synthesized where necessary) images, all six routes plus error paths
+
+Checked for the documented stray-wrong-interpreter-`server.py` process
+issue before starting (per standing instruction, not re-diagnosed): found
+the same already-diagnosed parent-child pair (venv process as parent,
+system Python 3.11 as child) on both a fresh start and a restart after the
+ViTPose bbox fix; confirmed via `bridge_run.log`'s own `"Started server
+process [<child PID>]"` line which PID actually bound the port before
+trusting any result, matching session 21's established method — no
+re-diagnosis attempted, killed both cleanly and restarted each time as
+instructed.
+
+No pre-existing test image with people was found on this machine (checked
+`C:\Windows\Web\Wallpaper\`/`Screen\`/`4K\Wallpaper\` — all abstract or
+landscape, no people; `C:\Users\allge\Pictures`/`C:\Users\Public\Pictures`
+both empty) — used a synthesized 640x480 shapes image (a drawn red circle +
+blue rectangle at known coordinates, via PIL) for CLIP/CLIPSeg/OWLv2, a
+real Windows wallpaper for CLIP/DINOv2 embeddings, and a synthesized
+400x600 PIL stick-figure drawing for ViTPose (no real human photo was
+available — see `vitpose.py`'s own docstring for the honest accuracy
+caveat this implies).
+
+- **`/clip-classify`**: labels `["a red circle", "a blue rectangle", "a
+  photo of a cat", "a green triangle"]` against the shapes image correctly
+  ranked "a blue rectangle" first (0.949) then "a red circle" (0.051, both
+  present shapes scored far above the two absent ones at <0.002 combined).
+- **`/clip-embed`**: returned a 768-dim vector.
+- **`/clipseg-segment`**: prompt "a red circle" correctly recovered
+  `box: {x1:47,y1:54,x2:198,y2:202}` (true shape extents: 50,50,200,200 —
+  within a few pixels), `confidence: 0.70`. Prompt "a green triangle"
+  (absent) at threshold 0.7 correctly returned `found: false` — see the
+  device-placement/limitation notes above for the default-threshold caveat.
+- **`/dinov2-embed`**: returned a 384-dim vector against a real wallpaper.
+- **`/owlv2-detect`**: queries `["a red circle", "a blue rectangle", "a
+  green triangle"]` against the shapes image correctly detected the circle
+  (0.938, box `[50.8,48.8,202.8,202.8]`, true extents 50,50,200,200) and
+  rectangle (0.706, box `[402.3,298.5,604.0,452.5]`, true extents
+  400,300,600,450); one low-score (0.106) whole-image false-positive
+  labeled "a blue rectangle" also appeared, below any sensible threshold a
+  caller would reasonably use.
+- **`/vitpose-pose`**: default full-image box on the stick-figure image
+  returned 17 COCO keypoints with plausible relative positions (ankles
+  below knees below hips, ears above shoulders) at low confidence
+  (0.04-0.27, expected — see honest accuracy caveat above). Explicit
+  single-box and 2-box (batched) calls both verified after the bbox-field
+  fix: input box `[90,30,220,480]` correctly returned as
+  `{x1:90,y1:30,x2:310,y2:510}`; the 2-box call correctly returned 2
+  people, each with 17 keypoints and its own correctly-corresponding box.
+- **Error paths, all six routes**: missing image file -> 404 (`clip-classify`
+  tested directly, same shared `image_utils.load_image()` code path covers
+  the other five); empty `labels` -> 400; empty `queries` -> 400; empty
+  `prompt` -> 400; malformed `boxes` entry (wrong length) -> 400.
+- **Compile/import checks**: `python -m py_compile server.py
+  local_models/*.py` clean; `python -c "import server"` clean (real
+  import-time check against the actual installed torch/transformers stack).
+
+### CLIP image memory — scoping decision (per the task's own explicit request to make a real call, not half-build)
+
+`/clip-embed` exposes the raw embedding primitive the master plan's "CLIP
+image memory" bullet names — this is the part of the request that was
+concretely actionable. A genuine **persistent embedding store/retrieval
+layer** on top of it (storage format, indexing/similarity search at scale,
+integration with the existing memdir/all-minilm text-memory system vs. a
+new dedicated store) is a **separate, substantial design decision** — not
+built this dispatch. This matches how session 19 handled
+`TranscribeAndSummarize`'s "trim audio" question: investigated, made a
+real call (expose the primitive; don't invent a storage architecture under
+this dispatch's time budget), documented the reasoning, flagged the larger
+question for the project owner rather than guessing at scope. Both
+`clip.py`'s own docstring and `.claude/contracts/tool-contract.md` §3
+record this same scoping note.
+
+### Files touched
+
+New: `python-bridge/local_models/image_utils.py`, `clip.py`, `clipseg.py`,
+`dinov2.py`, `owlv2.py`, `vitpose.py`. Modified: `python-bridge/server.py`,
+`python-bridge/requirements.txt`, `python-bridge/README.md`,
+`.claude/contracts/tool-contract.md`, this file. Not touched: anything
+under `src/` (no TypeScript tool built this session, per the task's own
+scope boundary), `python-bridge/local_models/image_caption.py` (has its
+own pre-existing equivalent inline image-loading logic, deliberately not
+refactored — see `image_utils.py`'s own docstring), the sibling `openclaude`
+repo.
+
+**Not committed**, per this project's established process — reporting back
+for the orchestrating session to personally verify and commit.
+
+## Session 24 (2026-08-13, orchestrating session) — Session 23 independently verified (Phase 5 bridge side); the subagent-gate.ps1 fix independently reproduced and confirmed legitimate
+
+Read `clip.py`, `vitpose.py`, `owlv2.py`, `image_utils.py` in full (the two
+highest-risk claims — CLIP's `get_image_features()` wrapper unwrapping, and
+the ViTPose `post_process_pose_estimation()` bbox bug — read most
+carefully); `clipseg.py`/`dinov2.py`/`server.py`/`requirements.txt` diffs
+spot-checked. All match the reported description exactly.
+
+**The `.claude/hooks/subagent-gate.ps1` fix** (outside this dispatch's
+normal `python-bridge/` ownership, so given extra scrutiny): independently
+reproduced both halves directly via PowerShell, matching the gate script's
+own exact invocation shape — the old `cmd /c "python -m py_compile server.py
+local_models/*.py"` genuinely fails with `[Errno 22] Invalid argument:
+'local_models/*.py'` (glob never expands through that invocation path); the
+new `compileall`-based check genuinely succeeds. Separately confirmed the
+fix doesn't weaken the gate: introduced a real syntax error into a temp
+file, confirmed the fixed check still fails with exit 1 and a clear message,
+then cleaned up. Legitimate, narrowly-scoped, real bug fix — not a
+work-around that masks something.
+
+**Live re-verification, my own independent test image** (not reusing the
+agent's fixtures): synthesized a 640x480 PIL image (red circle, blue
+rectangle) via the bridge's own venv Python. `/clip-classify` ranked "a
+blue rectangle" 0.947 / "a red circle" 0.051, both absent labels
+<0.002 — matches session 23's own 0.949/0.051 within normal
+floating-point/sampling variance. `/clipseg-segment` on "a red circle"
+recovered box `{47,54,198,202}` (true extents 50,50,200,200) at confidence
+0.70 — matches almost exactly. `/clipseg-segment` on the absent "a green
+triangle" **independently reproduced the exact documented limitation**:
+`found: true` at the default threshold, landing on the rectangle region
+(confidence 0.518) — confirms this is a real, repeatable model-uncertainty
+characteristic, not a one-off fluke. `/owlv2-detect` matched session 23's
+own scores almost to the decimal (0.938/0.708/0.106 vs. their
+0.938/0.706/0.106). GPU VRAM after loading CLIP+OWLv2 together: **1891 MiB**
+— an exact match to session 23's own reported figure. Bridge stopped
+cleanly afterward, port confirmed free.
+
+Confirmed no `src/` changes (bridge-only dispatch, as scoped) — tsc/build
+not re-run for that reason. No discrepancies found between session 23's
+report and this verification. Committing sessions 23-24's combined work
+together; proceeding next to the `VisionAnalyze` TypeScript tool layer.

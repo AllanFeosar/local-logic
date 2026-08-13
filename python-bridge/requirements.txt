@@ -135,3 +135,10 @@ psutil==7.2.2
 onnxruntime==1.28.0
 flatbuffers==25.12.19
 protobuf==7.35.1
+
+# --- Phase 5: vision suite (clip.py, clipseg.py, dinov2.py, owlv2.py, vitpose.py) ---
+# All five needed zero new dependencies — every one is the existing
+# transformers/torch/pillow stack already pinned above (CLIPModel,
+# CLIPSegForImageSegmentation, Dinov2Model + BitImageProcessor,
+# Owlv2ForObjectDetection, VitPoseForPoseEstimation). No new PyPI package
+# added this phase.

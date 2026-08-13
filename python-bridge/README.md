@@ -133,6 +133,42 @@ either, which is why fp16 was kept as the default rather than
   docstring for why the ONNX release is used instead of the pre-downloaded
   `Silero-VAD-v5-MLX` checkpoint (confirmed genuinely MLX-specific weight
   layout, not just a naming label).
+- `POST /clip-classify` — `{image_path, labels}` → `{predictions:
+  [{label, score}]}` (clip-vit-large-patch14, zero-shot image
+  classification against caller-supplied text labels, sorted descending by
+  score; GPU+fp16 by default — see `local_models/clip.py`'s module
+  docstring for the live-benchmarked device-placement reasoning). 400 on
+  an empty/all-blank `labels` list.
+- `POST /clip-embed` — `{image_path}` → `{embedding}` (same model, the
+  L2-normalized 768-dim CLIP image embedding vector — the "CLIP image
+  memory" building block; see `local_models/clip.py`'s module docstring for
+  why a persistent store/retrieval layer on top of this vector is
+  explicitly out of scope for this phase).
+- `POST /clipseg-segment` — `{image_path, prompt, threshold?}` → `{found,
+  box: {x1,y1,x2,y2} | null, confidence, coverage}` (clipseg-rd64-refined,
+  text-prompted segmentation; CPU). Returns a bounding box derived from the
+  thresholded mask (upsampled to the original image's pixel coordinates),
+  not a raw pixel mask — see `local_models/clipseg.py`'s module docstring
+  for why, and for an honestly-reported false-positive caveat at the
+  default threshold. 400 on an empty `prompt`.
+- `POST /dinov2-embed` — `{image_path}` → `{embedding}` (dinov2-small, the
+  L2-normalized 384-dim DINOv2 image embedding — NOT comparable to the CLIP
+  embedding above, different model/space; CPU).
+- `POST /owlv2-detect` — `{image_path, queries, threshold?}` → `{detections:
+  [{label, score, box: {x1,y1,x2,y2}}]}` (owlv2-base-patch16-ensemble,
+  open-vocabulary object detection via
+  `Owlv2Processor.post_process_grounded_object_detection`; GPU+fp16 by
+  default — the largest CPU/GPU gap measured in this phase, ~25x, see
+  `local_models/owlv2.py`'s module docstring). 400 on an empty/all-blank
+  `queries` list.
+- `POST /vitpose-pose` — `{image_path, boxes?}` → `{people: [{box:
+  {x1,y1,x2,y2}, keypoints: [{name, x, y, score}]}]}` (vitpose-plus-base,
+  top-down human pose estimation, COCO 17-keypoint skeleton; CPU). `boxes`
+  (COCO format `[x, y, width, height]` per box) is optional — omitted
+  defaults to a single full-image box, since this bridge doesn't compose a
+  person-detector stage internally (see `local_models/vitpose.py`'s module
+  docstring for why, and for the mixture-of-experts `dataset_index`
+  finding). 400 on a malformed box (not exactly 4 numbers).
 - `GET /status` — what's currently loaded (name, estimated MB, heavy/
   device/fp16 flags — `device`/`fp16` reflect the *actual resolved*
   placement, not just what a model declared; `declared_device` is what it
@@ -142,7 +178,7 @@ either, which is why fp16 was kept as the default rather than
   harness.
 - `GET /health` — liveness check
 
-Request/response shapes for all seven `POST` routes are the contract
+Request/response shapes for all thirteen `POST` routes are the contract
 `tools-execution-agent`'s tools build against — see
 `.claude/contracts/tool-contract.md` §3. Any shape change here must be
 reflected there in the same change.
@@ -230,20 +266,25 @@ That's the whole extension surface — no other file needs to change.
 
 ## Models downloaded but not yet wired up
 
-`clip-vit-large-patch14` / `clipseg-rd64-refined` (image-text matching /
-segmentation), and others in `C:\Users\allge\AI Models\huggingface\` are
-downloaded but have no `local_models/*.py` module or route yet. Follow the
-same pattern above to add them as needed — they weren't all wired up
-mechanically since each has a different input shape (image pair, etc.)
-worth designing deliberately rather than rubber-stamping. See
-`LOCAL_AI_MASTER_PLAN.md`'s phased plan for what's next (Phase 5: the
-vision suite).
-
-`whisper-large-v3-turbo` (Phase 4, 2026-08-13) is now wired up — see
+`whisper-large-v3-turbo` (Phase 4, 2026-08-13) is wired up — see
 `/transcribe` above and `local_models/transcribe.py`. The `TranscribeAndSummarize`/
-`AudioAnalyze` TypeScript-side tools that will call `/transcribe` and
-`/vad` are a separate, later dispatch (not built in this one — this
-session is the bridge side only).
+`AudioAnalyze` TypeScript-side tools that call `/transcribe` and `/vad` were
+built in a separate, later dispatch (`tools-execution-agent`, same day).
+
+`clip-vit-large-patch14` / `clipseg-rd64-refined` / `dinov2-small` /
+`owlv2-base-patch16-ensemble` / `vitpose-plus-base` (Phase 5, 2026-08-13,
+"the vision suite") are now wired up — see `/clip-classify`, `/clip-embed`,
+`/clipseg-segment`, `/dinov2-embed`, `/owlv2-detect`, `/vitpose-pose` above
+and `local_models/clip.py`/`clipseg.py`/`dinov2.py`/`owlv2.py`/`vitpose.py`.
+A `VisionAnalyze` TypeScript-side gateway tool that composes these routes is
+planned but not yet built — a separate, later dispatch, per
+`LOCAL_AI_MASTER_PLAN.md`'s own phasing (this session's task explicitly
+scoped it out: bridge side only).
+
+`videomae-base` and the rest of the remaining unwired models in
+`C:\Users\allge\AI Models\huggingface\` still have no `local_models/*.py`
+module or route. Follow the same pattern above to add them as needed — see
+`LOCAL_AI_MASTER_PLAN.md`'s phased plan for what's next.
 
 ## History (bugs found and fixed, don't reintroduce)
 
@@ -281,3 +322,42 @@ session is the bridge side only).
   documented fallback instead (re-download the standard silero-vad ONNX
   release) rather than attempting an unverified reverse-engineering fix.
   See `local_models/vad.py`'s module docstring for the full investigation.
+- **`AutoModelForImageSegmentation` does not support CLIPSeg (2026-08-13).**
+  Live-confirmed: raises `ValueError: Unrecognized configuration class ...
+  Model type should be one of DetrConfig` — that Auto* class is scoped to
+  DETR-family segmentation models only. `local_models/clipseg.py` uses the
+  concrete `CLIPSegProcessor`/`CLIPSegForImageSegmentation` classes; CLIP/
+  DINOv2 in the same phase, by contrast, both resolved cleanly through
+  `Auto*` when checked (don't assume either way for a new model — verify).
+- **`CLIPModel.get_image_features()` does not return a plain tensor on this
+  transformers version (2026-08-13)**, despite its own docstring example
+  implying `image_features = model.get_image_features(**inputs)` is usable
+  directly. It returns a `BaseModelOutputWithPooling` whose `.pooler_output`
+  holds the actual embedding (confirmed by reading `modeling_clip.py`'s
+  source: it re-assigns `vision_outputs.pooler_output =
+  self.visual_projection(pooled_output)` and returns the whole wrapped
+  object). `local_models/clip.py`'s `embed()` unwraps `.pooler_output`
+  explicitly. Live-confirmed by the naive pattern raising `AttributeError:
+  'BaseModelOutputWithPooling' object has no attribute 'norm'`.
+- **`vitpose-plus-base` is a mixture-of-experts checkpoint that requires an
+  explicit `dataset_index`, not just a bounding box (2026-08-13).**
+  Confirmed live: calling the model without one raises `ValueError:
+  dataset_index must be provided when using multiple experts
+  (num_experts=6)`. `local_models/vitpose.py` always passes
+  `dataset_index=0` (the COCO-pretrained expert, per
+  `modeling_vitpose_backbone.py`'s own forward() docstring and this
+  checkpoint's model-card example) — this bridge has no use case yet for
+  the other 5 experts. Separately confirmed this checkpoint is genuinely
+  top-down (requires `boxes` at the processor level; there is no unboxed
+  code path) — `/vitpose-pose` defaults to a full-image box when the caller
+  doesn't supply one, since no person-detector stage is composed at the
+  bridge layer (see `local_models/vitpose.py`'s module docstring).
+- **GPU device placement in Phase 5 was decided per-model from live
+  benchmarks, not defaulted (2026-08-13)** — `clip.py`/`owlv2.py` measured
+  large enough CPU/GPU gaps (10x and ~25x respectively) to justify
+  `device="cuda"`; `clipseg.py`/`dinov2.py`/`vitpose.py` measured CPU
+  latency already comfortable for a single interactive call (55-296ms) and
+  were kept on `device="cpu"` to preserve this machine's tight GPU VRAM
+  headroom instead. See `clip.py`'s module docstring for every model's
+  exact benchmark numbers side by side, and `LOCAL_AI_STATUS.md`'s Phase 5
+  session entry for live co-residency measurements.
