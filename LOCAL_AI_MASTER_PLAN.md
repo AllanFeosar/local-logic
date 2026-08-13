@@ -39,6 +39,25 @@ scope. The user also clarified the hardware guides: models on disk
 ≤ ~5 GB, peak model RAM ≤ ~7.5 GB — soft, machine-driven, not mandatory
 (§3).
 
+**2026-08-13 revision — standing sequencing policy: breadth (complete the
+plan) before depth (optimize it).** Explicit project-owner directive,
+consistent with the same call made earlier for memory/size ("first we make
+this system work and once all is running we optimize this size
+variation"), now applied the same way to routing-reliability tuning: stop
+spending further sessions chasing the Phase 1 routing-eval gate (currently
+64.4% mean on the honest holdout ruler, per §6/§8's session 17/18 entries)
+and **proceed with the rest of the plan's phases now, treating the current
+state as good enough to build on top of.** Phase 1's own documented gate
+(routing eval ≥ ~90%) is therefore **deliberately not being waited on** —
+this is a conscious, recorded relaxation of that gate, not an oversight or
+a silent abandonment of the reliability work. Optimization (routing
+accuracy further, memory/VRAM footprint, model size/quantization, latency)
+is deferred as a pass to make **after** the full plan (all phases) is
+built out, not skipped. Concretely: resume forward progress at whichever
+phase is next incomplete per §8 (Phase 2 as of this note), and only return
+to routing-reliability/size optimization once every phase has at least a
+first working version.
+
 ---
 
 ## 1. The honest definition of "all-purpose"
