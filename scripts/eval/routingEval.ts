@@ -29,6 +29,23 @@
  *   bun run scripts/eval/routingEval.ts
  *   bun run scripts/eval/routingEval.ts --case routing-math-1
  *   bun run scripts/eval/routingEval.ts --out-dir reports --no-report
+ *   bun run scripts/eval/routingEval.ts --split holdout
+ *   bun run scripts/eval/routingEval.ts --split holdout --runs 3
+ *
+ * **`--split tuning|holdout`** (added session 17/18 — see routingCases.ts's
+ * own header comment for the full rationale): filters the case set to just
+ * the original 20 "tuning" cases or the 30 new "holdout" cases. Omit to run
+ * the full 50-case set (both splits combined).
+ *
+ * **`--runs N`** (default 1, added session 17/18 — LOCAL_AI_MASTER_PLAN.md
+ * §6 "Fix the ruler before chasing the last points"): runs the selected
+ * case set N times and reports **mean ± std** across runs instead of a
+ * single-run score, matching BFCL's own "≥3 trials, don't trust one run"
+ * methodology. Each run gets its own printed summary; N>1 additionally
+ * prints/writes a combined mean±std summary. A single run's score at 20-50
+ * cases is worth too few points to distinguish "85% vs 90%" from ordinary
+ * sampling-temperature noise — this is the actual "fix the ruler" mechanism,
+ * not just more cases.
  *
  * IMPORTANT — this makes LIVE calls to Ollama (http://127.0.0.1:11434) via
  * the real CLI. It never calls a paid cloud provider (the .openclaude-profile.json
@@ -43,14 +60,14 @@ import { spawn } from 'node:child_process'
 import { mkdirSync, writeFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { routingCases, type ExpectedTool, type RoutingCase } from './routingCases.ts'
+import { routingCases, type ExpectedTool, type RoutingCase, type RoutingSplit } from './routingCases.ts'
 
 const PROJECT_ROOT = resolve(fileURLToPath(new URL('../../', import.meta.url)))
 // This environment's known git-bash location (see LOCAL_AI_STATUS.md /
 // LOCAL_AI_MASTER_PLAN.md) — only used as a fallback when the env var isn't
 // already set, so this stays portable to other machines/CI.
 const FALLBACK_GIT_BASH_PATH = 'E:\\Tools\\Git\\bin\\bash.exe'
-const CASE_TIMEOUT_MS = 45_000
+const DEFAULT_CASE_TIMEOUT_MS = 45_000
 
 type RunResult = {
   actualTool: string | null
@@ -100,7 +117,11 @@ function classify(expected: ExpectedTool, run: RunResult): Classification {
  *   - an assistant message contains a tool_use block (the router's decision), or
  *   - a "result" event arrives with no tool_use having been seen (no tool called).
  */
-function runRoutingCase(prompt: string, env: NodeJS.ProcessEnv): Promise<RunResult> {
+function runRoutingCase(
+  prompt: string,
+  env: NodeJS.ProcessEnv,
+  caseTimeoutMs: number = DEFAULT_CASE_TIMEOUT_MS,
+): Promise<RunResult> {
   return new Promise(resolvePromise => {
     const start = Date.now()
     let settled = false
@@ -133,7 +154,7 @@ function runRoutingCase(prompt: string, env: NodeJS.ProcessEnv): Promise<RunResu
         timedOut: true,
         erroredMessage: null,
       })
-    }, CASE_TIMEOUT_MS)
+    }, caseTimeoutMs)
 
     const processLine = (line: string) => {
       if (!line.trim()) return
@@ -275,6 +296,98 @@ function printSummaryTable(rows: ResultRow[]): void {
   }
 }
 
+function scoreOf(rows: ResultRow[]): number {
+  if (rows.length === 0) return 0
+  const correct = rows.filter(r => r.classification === 'correct').length
+  return correct / rows.length
+}
+
+/**
+ * Sample mean and sample standard deviation (N-1 denominator — the
+ * conventional choice when treating these runs as a sample used to
+ * *estimate* the model's true variance, not the full population of all
+ * possible runs). A single run (`values.length < 2`) has no meaningful
+ * variance estimate, so `std` is reported as 0 rather than NaN/undefined —
+ * callers should treat a 1-run "std" of 0 as "not actually measured", which
+ * is exactly why `--runs` defaulting to 1 still prints a single score with
+ * no ± (see `printMultiRunSummary`, only invoked when `runs > 1`).
+ */
+function meanStd(values: readonly number[]): { mean: number; std: number } {
+  const n = values.length
+  if (n === 0) return { mean: 0, std: 0 }
+  const mean = values.reduce((a, b) => a + b, 0) / n
+  if (n < 2) return { mean, std: 0 }
+  const variance = values.reduce((a, b) => a + (b - mean) ** 2, 0) / (n - 1)
+  return { mean, std: Math.sqrt(variance) }
+}
+
+function printMultiRunSummary(allRunsRows: ResultRow[][]): void {
+  const scores = allRunsRows.map(scoreOf)
+  const { mean, std } = meanStd(scores)
+
+  console.log('\n=== Mean ± std across runs ===')
+  scores.forEach((score, i) => {
+    const rows = allRunsRows[i]!
+    const correct = rows.filter(r => r.classification === 'correct').length
+    console.log(`  Run ${i + 1}/${scores.length}: ${correct}/${rows.length} correct (${(score * 100).toFixed(1)}%)`)
+  })
+  console.log(
+    `\nMean: ${(mean * 100).toFixed(1)}%  |  Std: ${(std * 100).toFixed(1)}pp  |  Runs: ${scores.length}`,
+  )
+}
+
+function writeMultiRunSummaryReport(
+  path: string,
+  allRunsRows: ResultRow[][],
+  split: RoutingSplit | 'all',
+): void {
+  const scores = allRunsRows.map(scoreOf)
+  const { mean, std } = meanStd(scores)
+  const payload = {
+    timestamp: new Date().toISOString(),
+    split,
+    runs: scores.length,
+    caseCount: allRunsRows[0]?.length ?? 0,
+    scores,
+    meanScore: mean,
+    stdScore: std,
+    perRun: allRunsRows.map((rows, i) => ({
+      run: i + 1,
+      correct: rows.filter(r => r.classification === 'correct').length,
+      total: rows.length,
+      score: scoreOf(rows),
+    })),
+  }
+  writeFileSync(path, JSON.stringify(payload, null, 2), 'utf8')
+  console.log(`\nMulti-run summary written to ${path}`)
+}
+
+function writeMultiRunSummaryMarkdown(
+  path: string,
+  allRunsRows: ResultRow[][],
+  split: RoutingSplit | 'all',
+): void {
+  const scores = allRunsRows.map(scoreOf)
+  const { mean, std } = meanStd(scores)
+  const lines: string[] = []
+  lines.push('# Routing eval — mean ± std summary')
+  lines.push('')
+  lines.push(`Generated: ${new Date().toISOString()}`)
+  lines.push(`Split: ${split}`)
+  lines.push(`Cases per run: ${allRunsRows[0]?.length ?? 0}`)
+  lines.push('')
+  lines.push(`**Mean: ${(mean * 100).toFixed(1)}%  |  Std: ${(std * 100).toFixed(1)}pp  |  Runs: ${scores.length}**`)
+  lines.push('')
+  lines.push('| Run | Correct | Total | Score |')
+  lines.push('|---|---|---|---|')
+  allRunsRows.forEach((rows, i) => {
+    const correct = rows.filter(r => r.classification === 'correct').length
+    lines.push(`| ${i + 1} | ${correct} | ${rows.length} | ${(scoreOf(rows) * 100).toFixed(1)}% |`)
+  })
+  writeFileSync(path, lines.join('\n') + '\n', 'utf8')
+  console.log(`Multi-run summary (markdown) written to ${path}`)
+}
+
 function writeJsonReport(path: string, rows: ResultRow[]): void {
   const total = rows.length
   const correct = rows.filter(r => r.classification === 'correct').length
@@ -346,10 +459,30 @@ type CliOptions = {
   caseIds: Set<string> | null
   outDir: string
   writeReport: boolean
+  /** null = run both splits (the full case set). */
+  split: RoutingSplit | null
+  /** Number of times to re-run the selected case set — see this file's own header comment ("Fix the ruler"). */
+  runs: number
+  /**
+   * Per-case kill timeout in ms. Defaults to `DEFAULT_CASE_TIMEOUT_MS`
+   * (45s), calibrated for a single-shot router decision. A multi-sample
+   * lever (e.g. self-consistency, LOCAL_AI_MASTER_PLAN.md §6 lever H) can
+   * legitimately take several times that — pass a larger value via
+   * `--case-timeout` when measuring such a lever so the harness's own
+   * impatience isn't mistaken for a routing failure.
+   */
+  caseTimeoutMs: number
 }
 
 function parseArgs(argv: string[]): CliOptions {
-  const options: CliOptions = { caseIds: null, outDir: 'reports', writeReport: true }
+  const options: CliOptions = {
+    caseIds: null,
+    outDir: 'reports',
+    writeReport: true,
+    split: null,
+    runs: 1,
+    caseTimeoutMs: DEFAULT_CASE_TIMEOUT_MS,
+  }
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i]
     if (arg === '--no-report') {
@@ -370,6 +503,38 @@ function parseArgs(argv: string[]): CliOptions {
       if (next && !next.startsWith('--')) {
         options.outDir = next
         i++
+      }
+      continue
+    }
+    if (arg === '--split') {
+      const next = argv[i + 1]
+      if (next === 'tuning' || next === 'holdout') {
+        options.split = next
+        i++
+      } else {
+        console.error(`Invalid --split value ${JSON.stringify(next)} — must be "tuning" or "holdout". Ignoring.`)
+      }
+      continue
+    }
+    if (arg === '--runs') {
+      const next = argv[i + 1]
+      const parsed = next ? Number.parseInt(next, 10) : NaN
+      if (Number.isFinite(parsed) && parsed >= 1) {
+        options.runs = parsed
+        i++
+      } else {
+        console.error(`Invalid --runs value ${JSON.stringify(next)} — must be a positive integer. Ignoring.`)
+      }
+      continue
+    }
+    if (arg === '--case-timeout') {
+      const next = argv[i + 1]
+      const parsed = next ? Number.parseInt(next, 10) : NaN
+      if (Number.isFinite(parsed) && parsed >= 1000) {
+        options.caseTimeoutMs = parsed
+        i++
+      } else {
+        console.error(`Invalid --case-timeout value ${JSON.stringify(next)} — must be a positive integer (ms), at least 1000. Ignoring.`)
       }
       continue
     }
@@ -417,36 +582,62 @@ async function main(): Promise<void> {
     delete env[key]
   }
 
-  const casesToRun = options.caseIds
-    ? routingCases.filter(c => options.caseIds!.has(c.id))
-    : routingCases
+  const casesToRun = routingCases.filter(c => {
+    if (options.caseIds && !options.caseIds.has(c.id)) return false
+    if (options.split && c.split !== options.split) return false
+    return true
+  })
 
   if (casesToRun.length === 0) {
-    console.log('No cases matched --case filter. Exiting.')
+    console.log('No cases matched the --case/--split filter. Exiting.')
     return
   }
 
-  console.log(`Running ${casesToRun.length} routing case(s) against the compiled CLI (dist/cli.mjs)...`)
+  const splitLabel = options.split ?? 'all (tuning + holdout)'
+  console.log(
+    `Running ${casesToRun.length} routing case(s) [split: ${splitLabel}] against the compiled CLI (dist/cli.mjs), ${options.runs} run(s)...`,
+  )
 
-  const rows: ResultRow[] = []
-  for (const routingCase of casesToRun) {
-    process.stdout.write(`  [${routingCase.id}] running… `)
-    const run = await runRoutingCase(routingCase.prompt, env)
-    const classification = classify(routingCase.expectedTool, run)
-    console.log(`${run.actualTool ?? '(none)'} — ${classification} (${run.durationMs}ms)`)
-    rows.push({ case: routingCase, run, classification })
+  const allRunsRows: ResultRow[][] = []
+  for (let run = 1; run <= options.runs; run++) {
+    if (options.runs > 1) console.log(`\n--- Run ${run}/${options.runs} ---`)
+    const rows: ResultRow[] = []
+    for (const routingCase of casesToRun) {
+      process.stdout.write(`  [${routingCase.id}] running… `)
+      const result = await runRoutingCase(routingCase.prompt, env, options.caseTimeoutMs)
+      const classification = classify(routingCase.expectedTool, result)
+      console.log(`${result.actualTool ?? '(none)'} — ${classification} (${result.durationMs}ms)`)
+      rows.push({ case: routingCase, run: result, classification })
+    }
+    printSummaryTable(rows)
+    allRunsRows.push(rows)
   }
 
-  printSummaryTable(rows)
+  if (options.runs > 1) {
+    printMultiRunSummary(allRunsRows)
+  }
 
   if (options.writeReport) {
     const outDir = resolve(process.cwd(), options.outDir)
     mkdirSync(outDir, { recursive: true })
-    writeJsonReport(resolve(outDir, 'eval-routing.json'), rows)
-    writeMarkdownReport(resolve(outDir, 'eval-routing.md'), rows)
+
+    if (options.runs === 1) {
+      const rows = allRunsRows[0]!
+      writeJsonReport(resolve(outDir, 'eval-routing.json'), rows)
+      writeMarkdownReport(resolve(outDir, 'eval-routing.md'), rows)
+    } else {
+      // Per-run detail (each run's own full case-by-case breakdown) plus one
+      // combined mean±std summary — the actual "fix the ruler" deliverable.
+      allRunsRows.forEach((rows, i) => {
+        writeJsonReport(resolve(outDir, `eval-routing-run${i + 1}.json`), rows)
+        writeMarkdownReport(resolve(outDir, `eval-routing-run${i + 1}.md`), rows)
+      })
+      writeMultiRunSummaryReport(resolve(outDir, 'eval-routing-summary.json'), allRunsRows, options.split ?? 'all')
+      writeMultiRunSummaryMarkdown(resolve(outDir, 'eval-routing-summary.md'), allRunsRows, options.split ?? 'all')
+    }
   }
 
-  const hasFailure = rows.some(r => r.classification !== 'correct')
+  const hasFailure = allRunsRows.some(rows => rows.some(r => r.classification !== 'correct'))
   if (hasFailure) {
     process.exitCode = 1
   }

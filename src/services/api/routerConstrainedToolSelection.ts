@@ -400,7 +400,16 @@ function appendToolCatalogToSystemMessage(
   return [{ role: 'system', content: catalogText }, ...messages]
 }
 
-function buildDecisionMessage(
+/**
+ * Exported (in addition to being used internally by this module) so
+ * `routerSelfConsistency.ts` (LOCAL_AI_MASTER_PLAN.md §6 lever H) can build
+ * the same Anthropic-shaped message object from its own majority-vote
+ * winner, which is already the same `{kind:'tool'|'none', ...}` shape as
+ * this module's own `DecodedToolDecision` — reused rather than
+ * reimplemented, same rationale as `rerankCandidates.ts` reusing
+ * `rerank.ts`'s scoring primitive (LOCAL_AI_STATUS.md Session 6).
+ */
+export function buildDecisionMessage(
   decision: Extract<DecodedToolDecision, { kind: 'tool' | 'none' }>,
   data: {
     id?: string

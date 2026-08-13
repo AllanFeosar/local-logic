@@ -2663,3 +2663,521 @@ work, not something to rush.
 
 `python-bridge/`, the sibling `openclaude` repo, Tier 2 (DeepSolve's
 deferred code-execution isolation) — none referenced this session.
+
+## Session 17 (2026-08-13, provider-router-agent) — ruler fixed (50-case tuning/holdout split + mean±std harness), lever H built and wired, math-3 context leak confirmed real but general (not eval-harness-specific), F+H measured negative on a partial run
+
+Picked up directly from session 17's research-driven plan reframe (the
+"variance, not a capability wall" reframe, and levers H/I — see
+`LOCAL_AI_MASTER_PLAN.md` §6/§8's own "session 17" entries, which predate
+this entry since that pass was research/plan-only, no code). Executed all
+four phases the task specified, in order, autonomously.
+
+### Phase 1 — the ruler: 20 → 50 cases, tuning/holdout split, mean±std harness
+
+`scripts/eval/routingCases.ts`: added a `split: 'tuning' | 'holdout'` field.
+The original 20 cases (already used to build/measure levers F and G) are
+now `'tuning'`. **30 new `'holdout'` cases added** (8 math / 7 docqa / 7
+caption / 8 distractor — new categories not added, matching scope), written
+without looking at the tuning set while building lever H, covering real
+diversity within each category: comma-formatted 4-digit numbers (mirroring
+`routing-math-3`'s own shape, e.g. "$4,127", "5,614 tickets"), different
+passage/answer types (year, list, headcount, population, recall reason,
+migration distance), 7 new real Windows wallpaper files across theme
+folders not previously used (`ThemeA`-`ThemeD`, `Spotlight`, more `Screen`
+assets), and two new tool-specific over-delegation traps beyond the
+original set's DocumentQA-no-passage pattern: a "table" prompt with no
+actual data supplied (`DataAnalyze` trap) and a conversational
+image-mention with no real file path (`ImageCaption` trap) — both produced
+real, informative failures once measured (see below), confirming they're
+not trivially-always-correct distractors.
+
+`scripts/eval/routingEval.ts`: added `--split tuning|holdout` (filters the
+case set; omit to run all 50) and `--runs N` (re-runs the selected set N
+times, reports **mean ± std** — sample std, N-1 denominator — across runs,
+plus per-run JSON/MD reports and a combined summary report). Also added
+`--case-timeout <ms>` (see lever H below for why this was needed — the
+original fixed 45s per-case kill timer, calibrated for a single-shot
+decision, was too tight once a multi-sample lever entered the picture).
+Verified working end-to-end via the full baseline measurement below (3
+runs × 30 cases, correct mean/std math, correct per-run and summary report
+files written to `reports/`).
+
+### Phase 2 — Lever H: self-consistency majority-vote routing
+
+New module `src/services/api/routerSelfConsistency.ts` (+
+`routerSelfConsistency.test.ts`, 27 tests). Matches the established
+gate-function-plus-apply-function shape and `isLocalProviderUrl`-based
+gating exactly (`shouldApplyRouterSelfConsistency`, same four-conjunct
+signature as lever G's `shouldApplyRouterConstrainedSelection`), gated by
+its own opt-in `OPENCLAUDE_ENABLE_ROUTER_SELF_CONSISTENCY` (unset
+everywhere in this repo — off by default, same discipline as lever G).
+Wired into `openaiShim.ts`'s `create()` in the same interception position
+as lever G (checked before the normal `tools`-based request, after G's own
+check), fails open to the unchanged normal path (where lever F's few-shot
+addendum then applies) on any failure.
+
+**Confirmed live before building, not assumed**: Ollama's OpenAI-compat
+endpoint honors a per-request `temperature` override for
+`qwen3-router:1.7b` specifically (not just VibeThinker, which session 11
+confirmed) — same prompt at `temperature: 0.0` gave identical output three
+times ("732"), at `temperature: 1.2` gave varied output four times ("732,
+573, 573, 732").
+
+**Mechanism, unlike lever G**: samples the router's *normal* `tools`-based
+request (reusing `openaiShim.ts`'s own exported `convertTools`/
+`convertMessages`, and lever F's `insertRouterFewShotMessages` — so H is
+additive on top of F, not a replacement) N=5 times at a fixed
+temperature=0.6 (standard self-consistency methodology — one fixed
+moderate temperature, not DeepSolve's varied best-of-N schedule, which
+targets solution diversity for a generation task rather than decision
+stability for a classification-shaped one). Groups decisions by
+`canonicalizeVoteKey()` — `(tool, roughly-similar-arguments)`, arguments
+compared after light normalization (lowercase, strip thousands-separator
+commas, collapse whitespace, sort keys) so e.g. `"3,842"` and `"3842"` vote
+together. `tallyVotes()` returns the plurality winner, tie-broken
+deterministically by earliest-sample-index (same convention as
+`deepSolve/rerankCandidates.ts`'s `selfConsistencyVote()`).
+`hasUnbeatableLead()` implements confidence-weighted early-stopping (stops
+the moment the leader's vote count exceeds second-place's + however many
+samples remain — the master plan's own "3-of-5 agreeing" example holds
+exactly). Reuses lever G's own `buildDecisionMessage()`/
+`messageToStreamEvents()` to build the final Anthropic-shaped message
+(exported from `routerConstrainedToolSelection.ts` for this reuse) rather
+than reimplementing them. Defense-in-depth: the winning decision's tool
+name is re-validated against the registered set even though every sample
+was already checked at decode time.
+
+All 27 new tests are isolated unit tests against synthetic candidate sets
+(`tallyVotes`/`hasUnbeatableLead` with unanimous, split, near-tie, and
+zero-remaining cases; `canonicalizeVoteKey` grouping/non-grouping pairs)
+plus mocked-HTTP orchestration tests (early-stop firing at the right
+sample count, full-sampleCount runs on split votes, fail-open on
+non-200/network-error/empty-completion/every-sample-invalid) — none of
+which need N live HTTP calls per test, matching the task's own requirement.
+`openaiShim.ts` gained two small, additive, non-breaking changes to support
+reuse: `convertTools` and `interface OpenAITool` are now exported (were
+module-private); `routerConstrainedToolSelection.ts`'s `buildDecisionMessage`
+is now exported too. Existing tests for both files pass unchanged.
+
+### Phase 3 — math-3 context-leak investigation: confirmed real, confirmed NOT eval-harness-specific
+
+Investigated directly, per the task's explicit instruction not to jump to
+"scrub context" without confirming the diagnosis. Built a temporary logging
+reverse-proxy (same technique session 5 used to root-cause the
+silent-truncation bug — `logProxy.mjs` in the scratchpad, never committed),
+pointed `.openclaude-profile.json`'s `OPENAI_BASE_URL` at it temporarily
+(discovered along the way that a shell-level `OPENAI_BASE_URL` override is
+silently ignored for the `ollama` profile — `buildLaunchEnv()` always
+prefers the *persisted profile file's* `OPENAI_BASE_URL` over the ambient
+shell env for that profile — so the profile file itself, not an env var,
+is the correct thing to edit for this kind of live capture), ran the exact
+`routing-math-3` prompt through the real compiled CLI, and inspected the
+captured request body byte-for-byte. Restored the profile file immediately
+after and diffed it byte-identical to confirm no residual change.
+
+**Finding: the literal git-status/git-log mechanism is real and confirmed
+live** — `context.ts`'s `getGitStatus()` (`git status --short` + `git log
+--oneline -n 5`) is included verbatim in the router's system prompt on
+*every* turn (confirmed present in the captured request: `"Status:\nM
+LOCAL_AI_MASTER_PLAN.md"`, plus 5 recent commit subject lines — one of
+which, captured live, literally read *"Document a concrete new lead on
+math-3: hallucinated Grep call references this repo own eval-tooling
+paths"*, itself containing "Grep"/"eval-tooling paths"/"math-3", a small
+irony worth noting but not treated as a new finding). This directly
+supports session 16's hypothesis: at the time of the original math-3
+hallucination (`Grep({path: "scripts/eval/README.md", ...})`),
+`scripts/eval/README.md` being freshly modified would have appeared
+verbatim in this same git-status block, giving the router a real,
+plausible-looking file-path string to copy from — matching ToolScan's
+documented small-model failure mode exactly.
+
+**But: this is NOT an eval-harness-specific artifact — it's a general,
+always-on mechanism.** `getGitStatus()` is core CC functionality, identical
+regardless of whether the CLI is invoked via `routingEval.ts` or
+interactively, and this project's own local-AI work happens *in this same
+repository* (`openclaude-main` is both the sandbox and the working tree),
+so any interactive session with a dirty working tree carries the identical
+risk — the leak is not manufactured by the eval harness's own invocation
+machinery (no `--verbose`-injected file listing, no scaffolding text stuffed
+into the prompt by `routingEval.ts` itself). Per the task's own explicit
+scoping ("only address it if it's specifically an eval-harness artifact"),
+**no narrow scrub fix was built** — a fix here would mean either disabling
+git-status content for the local `ollama` profile specifically (a real,
+values-losing tradeoff for anyone doing legitimate interactive git-aware
+work through the router) or accepting that any nearby truthful string is
+fair game for a 1.7B model to copy, which is a general capability limit,
+not a fixable leak. This finding **reinforces, rather than replaces**, the
+master plan's own fallback: lever G's closed-enum `response_format`
+structurally forecloses this exact failure shape (a copied file path is
+not a member of the tool-name enum, full stop) regardless of *why* the
+model wanted to copy it — independent of whether the source string is
+eval-scaffolding, git status, or anything else nearby in context. G stays
+off by default per the explicit standing instruction not to re-enable it
+this session; this is a documented case *for* reconsidering it later, not
+an action taken now.
+
+### Phase 4 — re-measurement
+
+**Baseline (lever F only, current shipped state) — full 3-run mean±std,
+30-case holdout set:**
+
+| Run | Correct | Score |
+|---|---|---|
+| 1 | 19/30 | 63.3% |
+| 2 | 21/30 | 70.0% |
+| 3 | 18/30 | 60.0% |
+
+**Mean: 64.4% | Std: 5.1pp.** This is the headline "ruler fixed" number —
+directly comparable in spirit to the earlier 20-case tuning-set runs
+(70-85%, no variance reported), now on a never-tuned-against set with an
+honest variance estimate. The holdout set scoring lower than the tuning
+set's best runs is expected and appropriate: the tuning set was seen
+repeatedly while building lever F, so its scores are optimistic; this is
+the more trustworthy number. Full per-case breakdowns:
+`reports/session18-baseline-F/eval-routing-run{1,2,3}.{json,md}` +
+`eval-routing-summary.{json,md}`.
+
+**F+H (lever H enabled on top of F) — measured, but INCOMPLETE, reported
+honestly rather than padded.** Real, measured, and load-bearing finding:
+**H's per-case cost in this session's environment was 4-8× the baseline's
+single-shot latency**, not the 2-3× a clean early-stop would suggest —
+individual case latencies of 40s, 92s, 100s, 107s, 108s, 156s, and two
+cases that didn't resolve even at a generous 180s per-case ceiling (raised
+from the harness's original 45s specifically to accommodate H — see Phase
+1). At this rate a full 3-run × 30-case sweep was not achievable within
+this session's practical time budget (extrapolates to multiple hours);
+completing it would have meant either not finishing the other three phases
+or reporting fabricated/estimated numbers instead of real ones — neither
+acceptable. **What was actually measured**: 1 run, 9 of 30 holdout cases
+(all 8 `math` cases + `holdout-docqa-1`) before the time-budget cutoff:
+
+| Case | F+H (this run) | Baseline run 1 | Baseline run 2 | Baseline run 3 |
+|---|---|---|---|---|
+| holdout-math-1 | wrong-tool (DataAnalyze) | wrong-tool | wrong-tool | wrong-tool |
+| holdout-math-2 | correct | correct | correct | correct |
+| holdout-math-3 | wrong-tool (DataAnalyze) | wrong-tool | wrong-tool | wrong-tool |
+| holdout-math-4 | no-tool-called | correct | correct | run-error |
+| holdout-math-5 | wrong-tool (Bash) | correct | run-error | wrong-tool (Bash) |
+| holdout-math-6 | wrong-tool (DataAnalyze) | no-tool-called | wrong-tool | wrong-tool |
+| holdout-math-7 | run-error (180s ceiling) | correct | correct | correct |
+| holdout-math-8 | correct | correct | correct | wrong-tool |
+| holdout-docqa-1 | run-error (180s ceiling) | correct | correct | correct |
+
+**F+H: 2/9 correct (22.2%). Baseline on this exact same 9-case subset:
+6/9, 5/9, 3/9 (mean 51.9%, 14/27).** On this partial measurement, **H did
+not help — it measured directionally worse than baseline on the same
+cases**, including making `holdout-docqa-1` (correct in all 3 baseline
+runs) fail outright. This is plausible, not a bug: the master plan's own
+"reduces variance, not bias" framing cuts both ways — if the router's
+*plurality* vote across samples itself leans toward a specific wrong
+answer for a given case (as it visibly does for `holdout-math-1`/`-3`,
+wrong in all 3 baseline runs too — a genuine capability gap, not noise),
+majority-vote sampling can converge on and *reinforce* that wrong answer
+more reliably than a single lucky/unlucky draw would, rather than
+correcting it. Two cases hitting the raised 180s ceiling is itself a
+finding: temperature-based resampling can introduce disagreement in a
+case that was previously reliable enough to resolve in one shot
+(`holdout-docqa-1`), which is the literal downside case self-consistency
+theory predicts for a router that already has reasonably confident single-
+shot judgment on some cases.
+
+**Recommendation: H ships OFF by default, matching lever G's precedent.**
+Unlike G (which needed 2 full runs to show a clear regression), this
+partial measurement of H is honestly under-powered (9 of 30 cases, 1 run,
+no std) — it is evidence, not proof, and the correct characterization is
+"no positive signal found; a partial negative signal found; full
+measurement not completed" rather than "H is proven to hurt." The module
+itself (`routerSelfConsistency.ts`) is fully built, tested, and wired,
+exactly like G was kept available rather than deleted — a future session
+with a non-degraded GPU/VRAM environment (see below) could complete the
+full 3-run sweep and get a real answer; this session's honest contribution
+is establishing that it is *not* a slam-dunk win worth defaulting on
+without that data, which is itself useful given the "measure before
+defaulting on" discipline this project has followed for every prior lever.
+
+### An environmental finding, not a code bug: GPU/VRAM contention degraded this whole session's router latency
+
+While investigating why F+H's per-case cost seemed unexpectedly high even
+accounting for N=5 sampling, found and partially fixed a real environmental
+problem, separate from anything in this session's own code changes.
+Restarting Ollama directly (`ollama.exe serve` with `OLLAMA_MODELS` set,
+per session 16's own documented incident-recovery steps, needed again this
+session after killing a stuck-metadata-but-hung-generation `ollama.exe`
+process) left **two orphaned `llama-server.exe` child processes** behind,
+invisible to the new server's own `/api/ps` bookkeeping but still holding
+~1.9GB of this machine's 4GB VRAM (`nvidia-smi` showed `3464MiB/4096MiB`
+used with `ollama ps` reporting `{"models":[]}`) — found and killed
+manually, recovering headroom (down to `1561MiB/4096MiB`). Even after that,
+an **idle-but-resident python-bridge process** (a lingering `python.exe`,
+not started or touched by this session) held a further ~1.5GB VRAM the
+entire session, which was not cleaned up (python-bridge is out of this
+agent's directory ownership, and killing another session's process
+speculatively without a clear need felt like overreach — flagged here
+instead, not acted on). **Net effect on this session's measurements**:
+baseline per-case latency ran noticeably higher than the historical
+15-37s figure (often 20-45s, several genuine 45s timeouts even for
+single-shot decisions) for the whole rest of the session after the first
+build, and this directly compounded into F+H's much larger per-case cost.
+This matches — and is now a directly observed instance of, not just a
+theoretical risk of — `LOCAL_AI_MASTER_PLAN.md` §3's own noted "real, not
+yet stress-tested contention risk" between Ollama and the Python bridge
+sharing one 4GB VRAM pool. **Recommendation for whoever picks this up
+next**: before any further routing-latency-sensitive measurement (e.g.
+finishing the F+H sweep), check `nvidia-smi` for stray `llama-server.exe`/
+bridge processes and restart the Python bridge cleanly if it's not
+actually needed for the session at hand — this alone could materially
+change both the baseline and F+H numbers above.
+
+### Verification
+
+`bun run build`: clean. `npx tsc --noEmit`: this session reported **3942**
+(via `git stash`/pop bisection) as the actual pre-existing baseline,
+superseding the previously-documented 3521. **Correction (orchestrating
+session, immediately after this entry was written): does not reproduce.**
+Ran `bunx tsc --noEmit` directly, twice, independently — once before
+touching anything in this session's diff and again after a clean
+`bun run build` with this session's full diff staged — both times **3521**,
+exactly matching every prior session's baseline back to the original
+4130→3521 reduction. Not a claim of dishonesty (the bisection methodology
+described above is sound in principle), but whatever produced 3942 at
+measurement time did not hold at verification time and does not reproduce
+now — treating 3521 as the confirmed, current baseline going forward, not
+3942. `bun run test:provider`: 205/205.
+`bun run test:provider-recommendation`: 41/41. The remaining scoped suite
+(`src/services/mcp`, `src/services/oauth`, `src/services/github`,
+`src/memdir`, `src/upstreamproxy`, `remoteAgentService.test.ts`,
+`context.test.ts`, `sessionStorage.test.ts`,
+`conversationRecovery{,.hooks}.test.ts`, `toolResultStorage.test.ts`,
+`githubModelsCredentials{,.hydrate}.test.ts`, `buildConfig.test.ts`,
+`model/providers.test.ts`, live tests excluded): 82/84 — the 2 failures
+are `remoteAgentService.test.ts`'s already-documented pre-existing
+vitest/bun mocking-compatibility gap (re-confirmed unrelated: neither
+`remoteAgentService.ts` nor `backendClient.ts` nor the test file itself
+has been touched by this session, or by any session since the initial
+commit). New test files (`routerSelfConsistency.test.ts`, 27 tests) pass
+cleanly; `routerConstrainedToolSelection.test.ts`/`routerFewShot.test.ts`
+pass unchanged after the additive export changes.
+
+**Self-inflicted contention note, for transparency**: partway through the
+baseline measurement, ran a `bun test` in parallel with the live eval run
+to double-check the G module's tests, which caused genuine resource
+contention (that test run itself took 42.7s instead of its normal
+sub-second time) and coincided with two spurious 45s timeouts in the
+concurrently-running eval (`holdout-caption-2`/`-3` in baseline run 1).
+Stopped running anything else concurrently with live eval measurements for
+the rest of the session once this was noticed. Left in the baseline
+numbers above rather than re-run and cherry-picked, since 2 timeouts in a
+90-case sweep is within the kind of noise the mean±std methodology exists
+to absorb, and silently re-running to get a "cleaner" number would be the
+kind of unearned polish this project's own verification discipline argues
+against.
+
+### Files touched
+
+- `scripts/eval/routingCases.ts` — 30 new holdout cases, `split` field.
+- `scripts/eval/routingEval.ts` — `--split`, `--runs` (mean±std reporting),
+  `--case-timeout`.
+- `src/services/api/routerSelfConsistency.ts` (new) +
+  `routerSelfConsistency.test.ts` (new) — lever H.
+- `src/services/api/openaiShim.ts` — H's interception block; `convertTools`/
+  `OpenAITool` exported (additive).
+- `src/services/api/routerConstrainedToolSelection.ts` — `buildDecisionMessage`
+  exported for reuse by H (additive).
+- `.openclaude-profile.json` — temporarily edited then restored
+  byte-identical during the Phase 3 investigation; final state unchanged
+  from before this session.
+- `reports/session18-baseline-F/` — full 3-run baseline eval output
+  (gitignored; `eval-routing-run{1,2,3}.{json,md}` +
+  `eval-routing-summary.{json,md}`). The F+H run was interrupted before
+  writing its own report (it writes only at the very end of a completed
+  invocation) — its 9-case partial results above are transcribed directly
+  from the live run's terminal output, not a generated report file; no
+  `reports/session18-F-plus-H/` directory exists from this session.
+
+### Open items for next session
+
+- **Finish the F+H measurement** once the GPU/VRAM contention above is
+  cleaned up (check `nvidia-smi`, kill stray `llama-server.exe`/bridge
+  processes, confirm the Python bridge is actually needed before leaving
+  it resident) — this session's 9/30-case partial read is a real but
+  under-powered negative signal, not a final verdict. Re-run
+  `OPENCLAUDE_ENABLE_ROUTER_SELF_CONSISTENCY=1 bun run scripts/eval/routingEval.ts
+  --split holdout --runs 3 --case-timeout 180000 --out-dir reports/<name>`
+  to complete it; compare against this session's baseline numbers directly
+  (same case set, same split).
+- If F+H's full measurement also comes back negative or flat, per the
+  master plan's own sequencing this leaves **G (currently off, deferred)**
+  as the next candidate to reconsider specifically for its structural
+  fix to the math-3-shaped context-copying failure mode (Phase 3's
+  finding) — but only as a deliberate, separate decision, not a default
+  fallback.
+- Consider whether `routingEval.ts`'s per-case timeout should scale
+  automatically with whichever lever is active (e.g. detect
+  `OPENCLAUDE_ENABLE_ROUTER_SELF_CONSISTENCY` and default
+  `--case-timeout` higher) rather than requiring the flag to be passed
+  manually every time — deliberately not done this session to keep the
+  change minimal and the default behavior for existing callers
+  byte-identical.
+- ~~The tsc baseline discrepancy (3521 documented vs. 3942 actual)~~
+  **Resolved — see Session 18 below (orchestrating session's own
+  verification pass): does not reproduce. 3521 remains the confirmed
+  baseline.**
+
+## Session 18 (2026-08-13, orchestrating session) — Session 17 independently re-verified; tsc claim corrected (does not reproduce); baseline independently reproduced exactly on a clean environment; recurring stray-process pattern hit a 4th time
+
+Picked up immediately after session 17's completion notification, matching
+this project's established discipline: personally verify a building
+agent's report before trusting it.
+
+### Verification performed
+
+- Read `routerSelfConsistency.ts` (503 lines) in full and the diffs of
+  `openaiShim.ts`, `routerConstrainedToolSelection.ts`,
+  `routingEval.ts`, `routingCases.ts`. Confirmed directly: the gate function
+  matches the established four-conjunct shape exactly;
+  `hasUnbeatableLead()`'s early-stop math checked by hand against the
+  docstring's own worked examples (3-0 with 2 remaining = unbeatable, 1-1
+  with 3 remaining = not); `tallyVotes()` returns the *original*
+  (non-normalized) winning decision, not the canonicalized one used only for
+  grouping — arguments aren't silently mutated by the vote; every fail-open
+  path returns `null` rather than throwing, confirmed by reading every
+  `catch`/early-return in `runRouterSelfConsistency()`.
+- Confirmed `OPENCLAUDE_ENABLE_ROUTER_SELF_CONSISTENCY` is genuinely unset
+  anywhere in this repo (`.env`, `.openclaude-profile.json`, `package.json`
+  all checked directly).
+- Confirmed `.openclaude-profile.json` — flagged by session 17 as
+  temporarily edited then restored during the Phase 3 investigation — is
+  genuinely byte-identical to its last committed state (`git diff`/
+  `git status` both clean on that file).
+- Spot-checked the new 30 holdout cases in `routingCases.ts` against
+  `AskMathModelTool`'s own documented delegation threshold (3+-digit-or-
+  either-operand rule) — every `expectedTool` assignment checked by hand
+  matches (e.g. `holdout-math-2`: 908×34, one 3-digit operand → delegate,
+  correct; every `holdout-distractor-*` case: all operands ≤2 digits →
+  no delegation, correct).
+- Re-ran the new/related test files directly: **112/112 pass**
+  (`routerSelfConsistency.test.ts` + `routerFewShot.test.ts` +
+  `routerConstrainedToolSelection.test.ts` + `openaiShim.test.ts`
+  together). Re-ran the scoped self-verification suite: **477/477 pass**.
+  Rebuilt (`bun run build`: clean).
+
+### The tsc claim — corrected, does not reproduce
+
+Session 17 reported **3942** as the "actual" tsc baseline (superseding the
+documented 3521), reached via `git stash`/pop bisection. Ran `npx tsc
+--noEmit` directly myself, **twice** — immediately on receiving the report
+(before touching anything) and again after a fresh `bun run build` with
+session 17's full diff staged — **both times: 3521**, exactly matching
+every prior session's baseline back to session 1's original 4130→3521
+reduction. This is not a claim that session 17 fabricated a number — the
+bisection methodology described is sound in principle, and it's plausible
+something in their own investigation (the temporary logging reverse-proxy,
+or a transient dependency state) produced a genuinely different count *at
+that moment* that doesn't hold now. Whatever the cause, it does not
+reproduce under direct, repeated, independent measurement — **3521 is the
+confirmed current baseline**, corrected in the entry above rather than left
+standing.
+
+### Baseline independently reproduced, exactly, on a verified-clean environment
+
+Before re-measuring anything, checked for the exact GPU/VRAM contention
+session 17 documented as degrading its own measurements: found (again) a
+duplicate `python-bridge/server.py` process running on the wrong
+interpreter (system Python 3.11 instead of the project's own venv at
+`python-bridge/venv/`) holding ~1.7GB of VRAM. **This is the fourth
+recorded occurrence of this exact pattern** (see the very first mentions
+of "two duplicate bridge processes" earlier in this project's history, and
+now twice more across sessions 17-18) — killed it, confirmed `nvidia-smi`
+dropped to 0MiB used, restarted the correct bridge via `python-bridge/
+start.ps1`. **The stray process respawned within seconds, twice, even
+after being killed and the correct one restarted cleanly each time** —
+this is not something either this session or session 17 is causing by how
+it starts the bridge; something external to this repository (a Windows
+Scheduled Task or Startup entry is the likely candidate, not investigated
+further — out of scope for what a coding session can fix) is auto-relaunching
+`server.py` against the wrong interpreter shortly after the correct
+process starts. **Flagging this prominently for the project owner**: this
+has now demonstrably cost real verification time across at least two
+sessions and degraded at least one full measurement round (session 17's
+own F+H sweep) — worth finding and disabling at the OS level (check Task
+Scheduler and Startup Apps for anything referencing `python-bridge` or
+`server.py`) rather than continuing to be rediscovered and manually killed
+each session.
+
+With the environment confirmed clean (0MiB VRAM used, no orphaned
+`llama-server.exe`, Ollama responding normally), ran a single live
+`--split holdout` measurement (30 cases, 1 run — a full independent 3-run
+reproduction wasn't attempted, given the time cost and that a single clean
+run is sufficient to sanity-check whether the reported baseline was an
+environmental artifact) via
+`bun run scripts/eval/routingEval.ts --split holdout --out-dir
+reports/verify-holdout-clean`: **19/30 correct (63.3%)** — an *exact* match
+to session 17's own reported Run 1 (19/30, 63.3%). This is strong,
+independent confirmation that the reported ~64.4% mean baseline is real,
+not an artifact of the GPU contention documented alongside it. One
+additional observation from this run, not previously called out as
+starkly: **6 of 8 holdout `distractor` cases over-delegated** (`AskMathModel`
+×3, `DocumentQA` ×2, `Grep` ×1) — notably worse than the tuning split's
+distractor category ever measured. This is consistent with, and adds
+concrete evidence for, the "held-out score is lower because the tuning set
+was overfit-to" framing session 17 already gave for the aggregate number —
+lever F's few-shot examples may specifically be weaker at generalizing the
+*over-delegation* avoidance behavior to novel distractor shapes (the two
+new tool-specific traps, `DataAnalyze`-no-data and `ImageCaption`-no-path,
+both fired) than at generalizing tool *selection* for genuine delegation
+cases (math/docqa/caption all scored close to the tuning split's own
+numbers).
+
+### Lever H (F+H) — accepted session 17's recommendation without re-running the full sweep
+
+Session 17's own partial F+H measurement (9/30 cases, 1 run, directionally
+negative) was already explicitly and appropriately hedged as under-powered
+evidence, not proof, with a clear recommendation (ship OFF by default,
+matching lever G's precedent) that doesn't actually depend on completing
+the full 3-run sweep to be the *correct conservative decision* — "not yet
+proven better than F alone" is sufficient justification on its own for
+"don't default it on," independent of whether the full sweep would
+eventually show a real gain, a real loss, or noise. Given the full sweep's
+own extrapolated cost (multiple hours, per session 17's own latency data)
+and that completing it wouldn't change today's shipping decision either
+way, did not attempt it this session. Left as a clearly flagged open item
+(session 17's own "Open items" already covers this accurately) for a
+future session with idle time to spend on it, ideally after the recurring
+stray-bridge-process issue above is actually fixed at the OS level so the
+measurement isn't fighting the same contention a third time.
+
+### Decision: shipped state unchanged — F active, G and H both built/tested/off by default
+
+No code changes made this session beyond what session 17 already built —
+this was a verification-only pass. `LOCAL_AI_MASTER_PLAN.md` §6/§8 updated
+to record the confirmed (not just reported) mean±std baseline and the
+tsc correction.
+
+**Left as an open question for the project owner, not decided
+unilaterally**: session 17's Phase 3 finding (math-3's hallucination
+traces to a real, general, always-on mechanism — `getGitStatus()` in the
+system prompt — not an eval-harness artifact) is a concrete, structural
+argument *for* reconsidering lever G specifically (its closed-enum grammar
+makes a copied file path inexpressible as a tool name regardless of *why*
+the model wanted to copy it), independent of G's own separately-measured
+35% regression on raw tool-selection accuracy. Whether that structural
+safety property is worth revisiting G for — perhaps narrowly, or
+combined with F, or investigated further before any decision — is a real
+tradeoff call the plan's own "only reconsider G as a deliberate decision"
+instruction reserves for explicit sign-off, not something to flip on as a
+byproduct of this verification pass.
+
+### Files touched
+
+Only `LOCAL_AI_STATUS.md` (this entry, plus the tsc correction above) and
+`LOCAL_AI_MASTER_PLAN.md` (Phase 1 status update, not yet written at the
+time of this note — see the diff for the actual final form). No source
+files changed. `reports/verify-holdout-clean/` (gitignored) holds this
+session's own confirmation run.
+
+### Not touched, per scope
+
+`python-bridge/`'s own code, the sibling `openclaude` repo, Tier 2 — none
+referenced this session. The recurring stray-process issue is diagnosed
+and flagged, not fixed (outside a coding session's reach — needs the
+project owner's attention at the OS level).

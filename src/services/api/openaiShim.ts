@@ -48,6 +48,10 @@ import {
   shouldApplyRouterConstrainedSelection,
   type RouterToolDefinition,
 } from './routerConstrainedToolSelection.js'
+import {
+  runRouterSelfConsistency,
+  shouldApplyRouterSelfConsistency,
+} from './routerSelfConsistency.js'
 import { recoverToolCallFromText } from './toolCallRecovery.js'
 import { createCombinedAbortSignal } from '../../utils/combinedAbortSignal.js'
 
@@ -125,7 +129,7 @@ export interface OpenAIMessage {
   name?: string
 }
 
-interface OpenAITool {
+export interface OpenAITool {
   type: 'function'
   function: {
     name: string
@@ -367,7 +371,7 @@ function normalizeSchemaForOpenAI(
   return record
 }
 
-function convertTools(
+export function convertTools(
   tools: Array<{ name: string; description?: string; input_schema?: Record<string, unknown> }>,
 ): OpenAITool[] {
   const isGemini = isEnvTruthy(process.env.CLAUDE_CODE_USE_GEMINI)
@@ -806,6 +810,50 @@ class OpenAIShimMessages {
           return effectiveParams.stream
             ? new OpenAIShimStream(messageToStreamEvents(constrained.message))
             : constrained.message
+        }
+        // Fails open — fall through to the normal tools-based path below.
+      }
+
+      // Self-consistency majority-vote router tool selection
+      // (LOCAL_AI_MASTER_PLAN.md §6 lever H) — see routerSelfConsistency.ts's
+      // own header comment for the full rationale, gating, and fail-open
+      // discipline. Checked in the same position as lever G above (before
+      // the normal tools-based request is built) but, unlike G, this
+      // RESAMPLES the same native tools-based request N times at a sampling
+      // temperature rather than replacing it with a different wire format —
+      // when it applies and finds a majority decision, it REPLACES this
+      // turn's single request with that decision; on any failure (every
+      // sample errored, or no votes could be tallied) it returns null and
+      // this falls through to the unchanged normal single-shot path below,
+      // where lever F's few-shot addendum applies exactly as it always has.
+      if (
+        shouldApplyRouterSelfConsistency(
+          request.baseUrl,
+          needsToolCallRecovery,
+          hasToolsThisTurn,
+          isEnvTruthy(process.env.OPENCLAUDE_ENABLE_ROUTER_SELF_CONSISTENCY),
+        )
+      ) {
+        const consensus = await runRouterSelfConsistency({
+          baseUrl: request.baseUrl,
+          resolvedModel: request.resolvedModel,
+          messages: effectiveParams.messages as Array<{
+            role: string
+            message?: { role?: string; content?: unknown }
+            content?: unknown
+          }>,
+          system: effectiveParams.system,
+          tools: (effectiveParams.tools ?? []) as unknown as RouterToolDefinition[],
+          max_tokens: effectiveParams.max_tokens,
+          top_p: effectiveParams.top_p,
+          apiKey: self.providerOverride?.apiKey ?? process.env.OPENAI_API_KEY ?? '',
+          extraHeaders: { ...self.defaultHeaders, ...(options?.headers ?? {}) },
+          signal: options?.signal,
+        })
+        if (consensus) {
+          return effectiveParams.stream
+            ? new OpenAIShimStream(messageToStreamEvents(consensus.message))
+            : consensus.message
         }
         // Fails open — fall through to the normal tools-based path below.
       }

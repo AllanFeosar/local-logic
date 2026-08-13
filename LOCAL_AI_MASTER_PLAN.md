@@ -352,6 +352,49 @@ existing status notes that cite "mitigation 3/5" still resolve.**
   re-measurement, not just a plausible design, before being trusted.
   Sequencing: try F first (cheap, prompt-only); only build this if F alone
   doesn't clear the 90% gate.
+- **H. Self-consistency (majority-vote routing) — the lever aimed at the
+  *variance*, added 2026-08-13, evidence-verified.** The routing eval's own
+  numbers (best run 85%, average ~79% on 20 cases) are a variance
+  signature, not a capability wall — at 20 cases each result is worth 5
+  points, so the score swings 1–2 cases run-to-run on temperature
+  nondeterminism. Self-consistency targets exactly this: sample the routing
+  decision N times (T≈0.5–0.7, start N=5), take the majority tool. It
+  "reduces variance, not bias," which is the right medicine precisely when
+  the *average sits below the best* — it pulls the average up toward the
+  best (79 → 85+), it does not raise the ceiling. Reported effect size:
+  small-model mean 0.71 → ~0.9 with std down ~0.8 from k=1→k=5. Cost is N×
+  latency, but routing outputs are short-token and confidence-weighted
+  early-stopping (stop as soon as N samples agree) cuts it. This is a
+  *better* latency/reliability trade than the think-enabled variant (which
+  measured 3–4× latency to fix one case) — prefer majority-vote over
+  reasoning-per-decision for a fast router. Sources:
+  [self-consistency variance reduction](https://zeroentropy.dev/concepts/self-consistency/),
+  [Estimating LLM self-consistency (arxiv 2509.19489)](https://arxiv.org/pdf/2509.19489).
+- **I. Context hygiene — the specific fix for the persistent math-3
+  failure, added 2026-08-13.** math-3 (fails in every config tried across
+  every session) hallucinates a tool call that *copies this project's own
+  eval-tooling file paths* out of context. This is a named, benchmarked
+  failure mode, not a mystery: ToolScan
+  ([arxiv 2411.13547](https://arxiv.org/abs/2411.13547)) found small models
+  "copy or modify strings from the surrounding context rather than purely
+  hallucinating random tool names," and the tendency **increases in smaller
+  models** — qwen3:1.7b is maximally susceptible. The copied strings being
+  *eval-tooling paths* specifically points at a **test artifact**: the eval
+  harness is leaking its own scaffolding into the router's context, so
+  math-3 may not even reproduce in real use — worth confirming before
+  treating it as a real routing defect. Fixes: scrub eval-scaffolding
+  strings from the router's context (context-flattening cuts hallucinated
+  params 40–60% in the param-hallucination literature); and note lever G's
+  closed-enum `response_format` makes it structurally impossible regardless
+  — a file path simply is not a member of the tool-name enum, so it cannot
+  be emitted.
+- **Futurist direction (not near-term) — hidden-state hallucination
+  detection.** A lightweight classifier on the model's intermediate-layer
+  activations predicts a hallucinated tool selection *before* execution at
+  AUROC 0.89 ([arxiv 2601.05214](https://arxiv.org/pdf/2601.05214)). It
+  needs hidden-state access, which Ollama does not expose but llama.cpp
+  does — so it only becomes reachable if the router ever moves from Ollama
+  to direct llama.cpp. Park as a future option; do not build now.
 
 0. **Scope MCP servers out of the local-AI router's profile** (do this
    *first* — zero code changes). Roughly 40 of the ~65 tools are
@@ -413,6 +456,22 @@ purely on *did the router pick the right tool*, independent of whether
 the specialist then answered correctly (the existing `scripts/eval/`
 harness already covers that half). Build this before attempting any
 mitigation above — otherwise "did that help" stays a guess.
+
+**Fix the ruler before chasing the last points (added 2026-08-13).** The
+20-case set is too small to resolve the 90% gate: each case is worth 5
+points, so "85% vs 90%" sits inside run-to-run noise, and a single run's
+score is nearly meaningless. BFCL — the reference tool-calling benchmark —
+runs **≥3 trials averaged, on held-out splits, with a deterministic AST
+matcher** for exactly this reason
+([BFCL methodology](https://openreview.net/pdf?id=2GmDdhBdDk)). Before
+spending more effort closing the gap: (a) grow the set to ~50–100 cases
+with a **held-out split** (so few-shot gains are measured on unseen
+prompts, not overfit to the tuning set); (b) report **mean ± std over ≥3
+runs**, not a best single run. Only then can a lever's effect be
+distinguished from variance. Real possibility to hold in mind: once the
+ruler is honest, the score may settle at ~85% and that may simply be this
+1.7B model's ceiling — at which point Phase 2+ is the better use of effort
+than grinding a metric the eval can't resolve (see §8 Phase 1 gate note).
 
 ## 7. Memory & self-improvement loop
 
@@ -603,6 +662,115 @@ a menu the router already can't reliably pick from), so it's no longer
   been wrong in literally every configuration tried across every session,
   suggesting a case-specific issue worth its own investigation separate
   from the general routing-reliability work.
+  **Update 2026-08-13 (session 17) — research-driven reframe + two new
+  levers (§6 H, I), all claims source-verified.** After F (real gain, not
+  ≥90%) and G (regressed, OFF by default), a full evidence sweep reframed
+  what "the gap" even is: **best 85% / average ~79% on 20 cases is a
+  *variance* signature, not a capability wall** (each case = 5 points, so
+  the score swings 1–2 cases on temperature noise). Two consequences:
+  (1) **Fix the ruler first** — grow the eval to ~50–100 cases with a
+  held-out split and report mean±std over ≥3 runs (BFCL methodology); on
+  20 cases "85 vs 90" is inside the noise band, so the gate is currently
+  measuring noise (see the "Fix the ruler" note in §6). (2) The two levers
+  that target the *actual* symptoms: **H — self-consistency majority-vote
+  routing** (sample N=5 at T≈0.5–0.7, majority tool; reduces variance not
+  bias, so it pulls the average up toward the 85% best — the medicine for
+  this exact symptom, and a better latency trade than the think-variant),
+  and **I — context hygiene for math-3** (ToolScan confirms small models
+  copy context strings into tool names; math-3 copies *eval-tooling
+  paths*, so it is likely a test-harness context leak, not a real routing
+  defect — scrub the router's context and confirm before treating it as
+  real). **Judgment recorded on session 15/16's three open questions:**
+  (a) think-enabled G variant — **drop it**, majority-vote (H) is the
+  better latency/reliability trade for a fast router; (b) keep chasing vs
+  Phase 2 — **fix the ruler, then decide**: if the honest mean±std settles
+  ~85%, that is plausibly the 1.7B ceiling and Phase 2+ is the better use
+  of effort; (c) grow the eval set — **yes, do this first**, it is the
+  prerequisite that distinguishes a real fix from overfitting. Suggested
+  sequence: grow+split the eval → H (self-consistency) → I (context scrub
+  for math-3) → only then reconsider G. Futurist option parked: hidden-
+  state hallucination detection (AUROC 0.89) needs llama.cpp-direct, not
+  reachable through Ollama today (§6). Full research + sources in §6
+  levers H/I and the risk register.
+  **Update 2026-08-13 (session 17, built; session 18, independently
+  verified) — ruler fixed and confirmed, H built and shipped OFF by
+  default, I investigated and found real-but-general (not eval-harness-
+  specific).** Eval grown 20→50 (30 new never-tuned-against `holdout`
+  cases) with a genuine tuning/holdout split and a `--runs N` mean±std
+  reporting mode (`scripts/eval/routingEval.ts`/`routingCases.ts`). **The
+  honest number, on the holdout split, current shipped state (F only):
+  mean 64.4%, std 5.1pp across 3 runs (63.3%/70.0%/60.0%)** — independently
+  reproduced exactly by session 18 on a freshly-verified-clean environment
+  (19/30 = 63.3%, an exact match to session 17's own Run 1), so this is a
+  confirmed real number, not a GPU-contention artifact, despite real
+  documented GPU contention affecting other parts of both sessions. Lower
+  than the tuning split's 70-85% range, as expected — the tuning set was
+  seen repeatedly while building F, so its scores are optimistic; this
+  holdout number is the trustworthy one going forward. One added detail
+  from session 18's own confirmation run: 6 of 8 holdout `distractor`
+  cases over-delegated, suggesting F's few-shot examples generalize tool
+  *selection* for genuine delegation better than they generalize
+  *over-delegation avoidance* to novel distractor shapes.
+  **Lever H (self-consistency, `src/services/api/routerSelfConsistency.ts`)
+  built, tested, wired — confirmed live that Ollama honors per-request
+  temperature for this router model before building.** Measured
+  incomplete/partial (9 of 30 holdout cases, 1 run — a full 3-run×30-case
+  sweep extrapolated to multiple hours, not completed within either
+  session's time budget) but directionally negative: F+H 2/9 (22.2%) vs.
+  baseline 6/9, 5/9, 3/9 (mean 51.9%) on the identical subset — plausible,
+  not a bug, since self-consistency "reduces variance not bias" cuts both
+  ways: it can just as easily converge on and reinforce a wrong plurality
+  answer as a right one. **Shipped OFF by default**
+  (`OPENCLAUDE_ENABLE_ROUTER_SELF_CONSISTENCY`, unset everywhere, confirmed
+  by session 18), matching lever G's precedent — this is the correct
+  conservative decision regardless of whether a completed sweep would
+  eventually show a gain, since "not yet proven better than F alone" is
+  sufficient justification on its own. Full sweep remains a legitimate
+  next step whenever the environment (see below) allows a clean multi-hour
+  measurement.
+  **Lever I investigated, not built as a narrow fix — found real but
+  general, not eval-harness-specific.** Live request capture (temporary
+  logging proxy, profile file restored byte-identical afterward, verified)
+  confirmed `context.ts`'s `getGitStatus()` (git status + recent commits)
+  is included verbatim in the router's system prompt on *every* turn,
+  identically whether invoked via the eval harness or real interactive
+  use — math-3's original `Grep` hallucination copying
+  `scripts/eval/README.md` is explained by that file having been freshly
+  modified (appearing in git status) at the time, exactly matching
+  ToolScan's documented small-model context-copying failure mode. Since
+  this is a general, always-on, values-losing-to-disable mechanism rather
+  than a fixable eval-harness leak, no narrow scrub was built — this
+  **reinforces lever G's closed-enum `response_format` fix as the
+  structurally correct long-term answer** to this specific failure shape
+  (a copied file path is inexpressible as a tool name in G's grammar
+  regardless of why the model wanted to copy it), independent of G's own
+  separately-measured accuracy regression on other grounds. **Left as an
+  open question for the project owner**, not decided unilaterally: whether
+  this structural argument is worth reconsidering G for (narrowly, or in
+  combination with something else) — the plan's own "only reconsider G as
+  a deliberate decision" instruction reserves that call.
+  **A tsc baseline discrepancy session 17 reported (3942, via git-stash
+  bisection) was checked directly by session 18 and does not reproduce —
+  3521 (run twice, independently) remains the confirmed current baseline.**
+  **A recurring operational issue, now confirmed a 4th time**: a duplicate
+  `python-bridge/server.py` process on the wrong Python interpreter
+  auto-respawns within seconds of the correct one starting, consuming GPU
+  VRAM and degrading router latency — not caused by anything in this
+  project's own start scripts (confirmed), most likely a stray Windows
+  Scheduled Task or Startup entry outside the repo. This has now cost real
+  measurement time across two consecutive sessions and is worth the
+  project owner's direct attention (check Task Scheduler/Startup Apps for
+  anything referencing `python-bridge`/`server.py`) rather than continuing
+  to be manually killed each session it recurs.
+  **Gate still not met on the honest ruler** (64.4% mean on the never-
+  tuned-against holdout set — meaningfully below both the 20-case tuning
+  set's optimistic 70-85% range and the ~90% target). Per session 17's own
+  reframe: this may plausibly be close to this 1.7B model's real ceiling
+  under the current architecture (native `tools` path, unconstrained
+  decoding) — the honest next decision point, not decided this session, is
+  whether to keep investing in routing-reliability levers (finish the H
+  sweep, reconsider G, try a different mechanism) or treat ~65% as the
+  practical floor and move attention to Phase 2+.
 - **Phase 2 — Finish the platform**: dedicated CUDA venv (confirmed
   2026-08-12 — build it; never touch the Debate venv); migrate BLIP +
   DistilBERT to real GPU device placement in `manager.py` (turning the
@@ -817,6 +985,9 @@ destroyed.
 | **Learned scorer reward-hacking** (PRMs/rerankers reward fluency not logic — >0.9 reward at <4% accuracy) | Deterministic verifier is load-bearing; reranker is a tie-break among *already-verified* candidates only, never a correctness oracle (§11 "Sharper findings", pipeline step 3) |
 | **Imperfect-verifier ceiling on best-of-N** (resampling against a flawed checker plateaus; verification gets harder as the generator improves) | Prefer executed/rule verifiers over learned judges; cap N; low confidence is an honest output when nothing verifies (§11 "Sharper findings") |
 | **Diversity-hurts (Self-MoA)** — mixing weaker models on one problem lowers quality | Heterogeneity is for routing *across domains*; within one hard problem, best-of-N from the single strongest solver, not a weaker-model mix (§11 "Sharper findings") |
+| **Small-eval-set noise** — 20-case routing eval can't resolve "85% vs 90%" (each case = 5 points; scores swing 1–2 cases on temperature) | Grow to ~50–100 cases with a held-out split; report mean±std over ≥3 runs before chasing points (BFCL methodology, §6 "Fix the ruler", §8 Phase 1) |
+| **Context-string copying** — small models copy context strings (file paths, tool names) into tool calls; worse the smaller the model ([ToolScan, arxiv 2411.13547](https://arxiv.org/abs/2411.13547)) | Scrub eval-scaffolding/irrelevant strings from the router's context; closed-enum `response_format` (§6 lever G) makes non-registered names inexpressible (§6 lever I) |
+| **Routing variance (avg below best)** — single-run routing score is noisy, average sits below best achievable | Self-consistency majority-vote (N=5, T≈0.5–0.7) reduces variance toward the best; confidence-weighted early-stop to bound latency (§6 lever H) |
 
 ## 10. Anti-goals (explicit, to keep the project honest)
 
