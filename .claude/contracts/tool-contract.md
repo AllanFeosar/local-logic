@@ -310,6 +310,56 @@ lazy-load-singleton pattern every route follows (now: register a
 per-module singleton — see `python-bridge/README.md`'s "Adding another
 model" section).
 
+### Phase 6 voice-out/generation routes — bridge side only, no TypeScript tool yet (2026-08-13)
+
+Built by `python-bridge-agent`, 2026-08-13, per `LOCAL_AI_MASTER_PLAN.md` §8
+Phase 6 ("Voice out & generation", explicitly optional/park-sanctioned).
+Two of the plan's three named models are wired; Qwen3-TTS was investigated
+and **deliberately parked** — see `LOCAL_AI_STATUS.md`'s Phase 6 session
+entry for the full evidence-based reasoning (short version: its official
+inference package hard-pins `transformers==4.57.3` against this venv's
+load-bearing `5.12.1`, and its module graph additionally requires
+`torchaudio`, for which no PyPI wheel exists matching this venv's pinned
+`torch==2.12.1+cu130`). No TypeScript tool calls these routes yet — this
+dispatch was scoped bridge-side only, matching Phase 5's own two-stage
+precedent (bridge session, then a later `tools-execution-agent` session).
+
+| Route | Model | Request | Response |
+|---|---|---|---|
+| `POST /image-generate` | stable-diffusion-v1-5 | `{ prompt: string, negative_prompt?: string, steps?: number, width?: number, height?: number, guidance_scale?: number, seed?: number }` (`steps` default 25, range 1-75; `width`/`height` default 512, range 64-512 **and must be a multiple of 8** — the 512 ceiling is a live-benchmarked VRAM cliff on this machine's 4GB card, not an arbitrary conservative number, see `local_models/image_generate.py`'s module docstring; `guidance_scale` default 7.5, range >0-30) | `{ image_base64: string, width: number, height: number }` (`image_base64` is PNG bytes, base64-encoded — the first route in this bridge to return generated binary media rather than structured facts) |
+| `POST /music-generate` | musicgen-small | `{ prompt: string, duration_seconds?: number, guidance_scale?: number }` (`duration_seconds` default 8.0, range 1-30 — 30 matches the model's own shipped `generation_config.json` max_length of 1500 codec steps at its fixed 50 steps/sec; `guidance_scale` default 3.0, range >0-15) | `{ audio_base64: string, sample_rate: number, duration_seconds: number }` (`audio_base64` is mono 16-bit PCM WAV bytes, base64-encoded, via stdlib `wave` — no new audio-encoding dependency) |
+
+Both: loopback-only, no auth; a malformed request body (empty `prompt`,
+out-of-range/non-multiple-of-8 `width`/`height`, out-of-range `steps`/
+`guidance_scale`/`duration_seconds`) is a 400, never a raw 500. Device
+placement: both GPU+fp16, live-benchmarked not defaulted — SD1.5 registers
+`heavy=True` (evicts every other loaded model first; peak measured VRAM for
+one 512x512 generation was ~2.9GB reserved on this 4GB card, leaving no real
+co-residency headroom), MusicGen does not (peak measured VRAM ~2.4GB
+reserved for a 5s clip, comfortable headroom left for at least one smaller
+model to coexist under normal LRU eviction). See
+`python-bridge/local_models/image_generate.py`'s/`music_generate.py`'s
+module docstrings for the full benchmark numbers and reasoning, and
+`LOCAL_AI_STATUS.md`'s Phase 6 session entry for live end-to-end
+verification results (real generated PNG/WAV output, not just "the forward
+pass ran").
+
+Live-verified in-process against the real FastAPI `app` object (`httpx.
+AsyncClient` + `ASGITransport`, not a bare subprocess — see that session
+entry for why: this machine has a reproducible, already-diagnosed
+stray-wrong-interpreter-child-process issue,
+`LOCAL_AI_STATUS.md` Sessions 16/21, that made a real end-to-end HTTP round
+trip against `start.ps1`/a bare `python server.py` launch unreliable to
+trust for this verification specifically) — both routes returned valid
+generated media (PNG signature bytes / WAV `RIFF`/`WAVE` header, decodable,
+non-silent audio) and correctly rejected malformed input with 400s.
+
+Extending this table for a future TypeScript-side tool (e.g. an
+`ImageGenerate`/`MusicGenerate` pair, or folded into a generation gateway)
+is `tools-execution-agent`'s job whenever that dispatch happens — nothing
+about these two routes' shapes is provisional or expected to change for
+that build.
+
 **Consumer side status (2026-08-13, tools-execution-agent):**
 `VisionAnalyzeTool` (`src/tools/VisionAnalyzeTool/`) is built and registered
 against this exact contract (request/response shapes above, verbatim,

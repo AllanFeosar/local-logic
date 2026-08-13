@@ -169,6 +169,28 @@ either, which is why fp16 was kept as the default rather than
   person-detector stage internally (see `local_models/vitpose.py`'s module
   docstring for why, and for the mixture-of-experts `dataset_index`
   finding). 400 on a malformed box (not exactly 4 numbers).
+- `POST /image-generate` — `{prompt, negative_prompt?, steps?, width?,
+  height?, guidance_scale?, seed?}` → `{image_base64, width, height}`
+  (stable-diffusion-v1-5, text-to-image; GPU+fp16, `heavy=True` exclusivity
+  — see `local_models/image_generate.py`'s module docstring for the
+  live-benchmarked VRAM cliff above 512x512 that sets this route's
+  width/height cap). `steps` defaults to 25 (range 1-75), `width`/`height`
+  default to 512 (range 64-512, must be a multiple of 8), `guidance_scale`
+  defaults to 7.5 (range >0-30). Returns base64-encoded PNG bytes — the
+  first route in this bridge to return generated binary media rather than
+  structured facts; see that module's docstring for the output-shape
+  decision. 400 on empty `prompt`, out-of-range `steps`/`width`/`height`/
+  `guidance_scale`, or a `width`/`height` not a multiple of 8.
+- `POST /music-generate` — `{prompt, duration_seconds?, guidance_scale?}` →
+  `{audio_base64, sample_rate, duration_seconds}` (musicgen-small,
+  text-to-music; GPU+fp16, not `heavy` — see
+  `local_models/music_generate.py`'s module docstring for the VRAM
+  headroom reasoning). `duration_seconds` defaults to 8.0 (range 1-30,
+  matching the model's own shipped `generation_config.json` max_length of
+  1500 codec steps at 50 steps/sec), `guidance_scale` defaults to 3.0
+  (range >0-15). Returns base64-encoded mono 16-bit PCM WAV bytes (stdlib
+  `wave`, no new audio-encoding dependency). 400 on empty `prompt` or
+  out-of-range `duration_seconds`/`guidance_scale`.
 - `GET /status` — what's currently loaded (name, estimated MB, heavy/
   device/fp16 flags — `device`/`fp16` reflect the *actual resolved*
   placement, not just what a model declared; `declared_device` is what it
@@ -178,7 +200,7 @@ either, which is why fp16 was kept as the default rather than
   harness.
 - `GET /health` — liveness check
 
-Request/response shapes for all thirteen `POST` routes are the contract
+Request/response shapes for all fifteen `POST` routes are the contract
 `tools-execution-agent`'s tools build against — see
 `.claude/contracts/tool-contract.md` §3. Any shape change here must be
 reflected there in the same change.
@@ -281,6 +303,23 @@ planned but not yet built — a separate, later dispatch, per
 `LOCAL_AI_MASTER_PLAN.md`'s own phasing (this session's task explicitly
 scoped it out: bridge side only).
 
+`stable-diffusion-v1-5` and `musicgen-small` (Phase 6, 2026-08-13, "voice out
+& generation") are now wired up — see `/image-generate`/`/music-generate`
+above and `local_models/image_generate.py`/`music_generate.py`.
+`Qwen3-TTS-12Hz-1.7B-CustomVoice` (+ its `Qwen3-TTS-Tokenizer-12Hz` sibling,
+confirmed identical to the CustomVoice checkpoint's own embedded
+`speech_tokenizer/` subfolder — byte-for-byte same `model.safetensors` size,
+so the separate download is redundant, not a second thing that needs
+loading) was investigated and **deliberately parked** — see
+`LOCAL_AI_STATUS.md`'s Phase 6 session entry for the full, evidence-based
+reasoning (short version: its official inference package hard-pins
+`transformers==4.57.3`, directly conflicting with this venv's load-bearing
+`transformers==5.12.1`, and its module graph additionally requires
+`torchaudio`, for which no PyPI wheel exists matching this venv's pinned
+`torch==2.12.1+cu130`). Image-generate/music-generate TypeScript-side tools
+are a separate, later dispatch, per this session's own scope (bridge side
+only).
+
 `videomae-base` and the rest of the remaining unwired models in
 `C:\Users\allge\AI Models\huggingface\` still have no `local_models/*.py`
 module or route. Follow the same pattern above to add them as needed — see
@@ -361,3 +400,43 @@ module or route. Follow the same pattern above to add them as needed — see
   headroom instead. See `clip.py`'s module docstring for every model's
   exact benchmark numbers side by side, and `LOCAL_AI_STATUS.md`'s Phase 5
   session entry for live co-residency measurements.
+- **A single-combined-checkpoint directory can look like the standard
+  diffusers multi-component layout without actually being loadable as one
+  (2026-08-13).** `stable-diffusion-v1-5`'s directory has every subfolder
+  `model_index.json` expects (`unet`/`vae`/`text_encoder`/etc.), but each
+  subfolder only contains a `config.json` — no weight file. The one
+  `v1-5-pruned-emaonly.safetensors` at the directory root carries every
+  component's actual weights (the classic "original Stable Diffusion"
+  single-file format). `StableDiffusionPipeline.from_pretrained(dir)` does
+  NOT work against this layout; `StableDiffusionPipeline.from_single_file
+  (checkpoint_path, config=dir, local_files_only=True)` does — confirmed by
+  directly listing the directory tree before writing any loading code, not
+  assumed from the presence of the subfolders. See
+  `local_models/image_generate.py`'s module docstring.
+- **A resolution increase that "just" completes slower can actually be a
+  VRAM-pressure cliff, not real compute scaling (2026-08-13).** Doubling
+  Stable Diffusion's output resolution from 512x512 to 768x768 (2.25x the
+  pixels, 1.33x the steps in the test) took **11x longer** (23s → 268s) and
+  pushed reserved VRAM to ~4.16 GB — essentially the entire physical 4 GB
+  card. The image still came out correctly (visually confirmed, not an
+  OOM crash), but the wildly disproportionate slowdown is the signature of
+  Windows' driver-level "shared GPU memory" fallback silently kicking in
+  under VRAM pressure rather than a clean error. `/image-generate` caps
+  width/height at 512 as a direct consequence of this measurement, not a
+  guessed-conservative number.
+- **Qwen3-TTS's official `qwen-tts` inference package is NOT modularly
+  separable by tokenizer variant, discovered by live import tracing, not
+  assumed from reading its file list (2026-08-13).** The package ships its
+  own concrete model classes (no `trust_remote_code`/`AutoModel` support in
+  this venv's `transformers==5.12.1` — confirmed, `Qwen3TTSForConditional
+  Generation` doesn't exist in it). This checkpoint (`...-CustomVoice`) only
+  needs the 12Hz tokenizer path, but `qwen_tts/core/__init__.py`
+  unconditionally imports the legacy 25Hz tokenizer path too, and that path
+  hard-imports `sox` (needs the system SoX CLI binary) and `torchaudio` —
+  for which no PyPI wheel exists matching this venv's pinned
+  `torch==2.12.1+cu130` (verified live against the official cu130 wheel
+  index: latest available is `torchaudio==2.11.0+cu130`). Combined with the
+  package's own hard pin on `transformers==4.57.3` (vs. this venv's
+  load-bearing `5.12.1`), this was parked rather than worked around by
+  patching the vendored source — see `LOCAL_AI_STATUS.md`'s Phase 6 session
+  entry for the full investigation and reasoning.

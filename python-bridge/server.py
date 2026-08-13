@@ -52,6 +52,8 @@ from local_models import clipseg as clipseg_model
 from local_models import dinov2 as dinov2_model
 from local_models import owlv2 as owlv2_model
 from local_models import vitpose as vitpose_model
+from local_models import image_generate as image_generate_model
+from local_models import music_generate as music_generate_model
 from local_models.manager import manager
 
 logging.basicConfig(level=logging.INFO)
@@ -485,6 +487,74 @@ async def vitpose_pose_endpoint(req: VitposePoseRequest):
     except vitpose_model.InvalidVitposeInput as e:
         raise HTTPException(status_code=400, detail=str(e))
     return VitposePoseResponse(**result)
+
+
+# --- Phase 6: voice out & generation (2026-08-13) --------------------------
+# Contract added to .claude/contracts/tool-contract.md's §3 table in the same
+# change as these routes went live. Qwen3-TTS was researched and PARKED this
+# phase (see LOCAL_AI_STATUS.md's Phase 6 session entry for the full,
+# well-evidenced reasoning) — only image-generate (Stable Diffusion v1.5) and
+# music-generate (MusicGen) are wired below. Both are the first routes in
+# this bridge to return generated binary media: base64-encoded bytes in the
+# JSON response body (PNG / WAV respectively), not a written-to-disk path —
+# see image_generate.py's/music_generate.py's module docstrings for the full
+# reasoning on that call.
+
+
+class ImageGenerateRequest(BaseModel):
+    prompt: str
+    negative_prompt: Optional[str] = None
+    steps: int = 25
+    width: int = 512
+    height: int = 512
+    guidance_scale: float = 7.5
+    seed: Optional[int] = None
+
+
+class ImageGenerateResponse(BaseModel):
+    image_base64: str
+    width: int
+    height: int
+
+
+@app.post("/image-generate", response_model=ImageGenerateResponse)
+async def image_generate_endpoint(req: ImageGenerateRequest):
+    try:
+        result = await image_generate_model.generate_async(
+            req.prompt,
+            req.negative_prompt,
+            req.steps,
+            req.width,
+            req.height,
+            req.guidance_scale,
+            req.seed,
+        )
+    except image_generate_model.InvalidImageGenerateInput as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return ImageGenerateResponse(**result)
+
+
+class MusicGenerateRequest(BaseModel):
+    prompt: str
+    duration_seconds: float = 8.0
+    guidance_scale: float = 3.0
+
+
+class MusicGenerateResponse(BaseModel):
+    audio_base64: str
+    sample_rate: int
+    duration_seconds: float
+
+
+@app.post("/music-generate", response_model=MusicGenerateResponse)
+async def music_generate_endpoint(req: MusicGenerateRequest):
+    try:
+        result = await music_generate_model.generate_async(
+            req.prompt, req.duration_seconds, req.guidance_scale
+        )
+    except music_generate_model.InvalidMusicGenerateInput as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return MusicGenerateResponse(**result)
 
 
 if __name__ == "__main__":

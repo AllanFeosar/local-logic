@@ -142,3 +142,32 @@ protobuf==7.35.1
 # CLIPSegForImageSegmentation, Dinov2Model + BitImageProcessor,
 # Owlv2ForObjectDetection, VitPoseForPoseEstimation). No new PyPI package
 # added this phase.
+
+# --- Phase 6: voice out & generation (image_generate.py, music_generate.py) ---
+# music_generate.py (MusicGen) needed zero new dependencies — it's the
+# existing transformers/torch stack (MusicgenForConditionalGeneration/
+# AutoProcessor), live-verified compatible with transformers==5.12.1 before
+# committing to it (see music_generate.py's module docstring).
+#
+# image_generate.py (Stable Diffusion v1.5) needed exactly one new package:
+# `diffusers`, for `StableDiffusionPipeline.from_single_file()` (this
+# checkpoint's on-disk layout is the classic single-combined-file format,
+# not per-component weight files — see image_generate.py's module docstring
+# for the full investigation). Verified compatible before installing: its
+# own PyPI metadata declares torch/transformers only as *optional extras*
+# (not hard base dependencies), already satisfied anyway by this venv's
+# existing torch==2.12.1+cu130 / transformers==5.12.1 pins; a plain
+# `pip install diffusers` (no extras) pulled exactly the two lightweight
+# packages below and touched neither torch nor torchvision — confirmed live
+# before pinning, so this did not risk the kind of torch-upgrade venv
+# corruption the "Rebuilding from scratch" section's Bug #5 history note
+# warns about. `qwen-tts` (Qwen3-TTS's official inference package) was
+# investigated and deliberately NOT added — see LOCAL_AI_STATUS.md's Phase 6
+# session entry for the full park reasoning (hard-pins
+# transformers==4.57.3, directly conflicting with this venv's pinned
+# 5.12.1 that every other model here depends on; its own module graph
+# additionally requires torchaudio, for which no PyPI wheel exists matching
+# this venv's pinned torch==2.12.1+cu130 as of this check).
+diffusers==0.39.0
+importlib_metadata==9.0.0
+zipp==4.1.0

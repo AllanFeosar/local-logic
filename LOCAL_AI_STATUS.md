@@ -4423,3 +4423,286 @@ reported count exactly. `bun run build`: clean. `npx tsc --noEmit`:
 Dispatching the required independent security-audit-agent review next
 (this touches `src/tools/`, same gate requirement as every prior
 `src/tools/` addition) before committing sessions 25-26's combined work.
+
+## Session 27 (2026-08-13, python-bridge-agent) — Phase 6 "Voice out & generation": Stable Diffusion v1.5 + MusicGen wired and live-verified; Qwen3-TTS investigated and deliberately parked
+
+Per `LOCAL_AI_MASTER_PLAN.md` §8 Phase 6 — explicitly optional, gated on
+"TTS round-trip at acceptable latency, **or documented park decision**".
+Two of the three named models built and live-verified end to end; the
+plan's own highest-priority item (Qwen3-TTS) was investigated in real depth
+and parked with concrete, reproducible evidence — a legitimate outcome the
+plan's own gate text sanctions, not a shortfall. Bridge side only, per this
+dispatch's explicit scope — no TypeScript tool built this session.
+
+### Qwen3-TTS — investigated, PARKED (not a "ran out of time" call)
+
+Read `config.json`'s `architectures` (`Qwen3TTSForConditionalGeneration`,
+`model_type: qwen3_tts`) before writing any code. Confirmed live: this
+venv's pinned `transformers==5.12.1` has no `qwen3_tts` model at all (not
+even on the `main`/`v5.15.0` branches of `transformers` upstream, checked
+directly against GitHub — so upgrading transformers wouldn't help either,
+and would be a huge unjustified risk to every other already-verified
+specialist regardless). The model requires its own official inference
+package, `qwen-tts` (PyPI, ships its own concrete model classes — not a
+`transformers`-Auto*/`trust_remote_code` situation; the downloaded
+checkpoint directory has no `.py` files of its own). Four independent,
+concrete blockers found, any one of which alone would justify parking:
+
+1. **Hard version conflict.** `qwen-tts`'s own PyPI metadata pins
+   `transformers==4.57.3` exactly — directly conflicting with this venv's
+   `transformers==5.12.1`, load-bearing for the twelve other models already
+   wired into this bridge. Downgrading would risk regressing all of them
+   with no budget in this dispatch to re-verify each one.
+2. **Not modularly separable, confirmed by live import tracing (not
+   assumed from the file list).** This checkpoint only needs the package's
+   12Hz tokenizer path, but `qwen_tts/core/__init__.py` unconditionally
+   imports the legacy 25Hz tokenizer path too (traced the actual
+   `ImportError` chain: `modeling_qwen3_tts.py` →
+   `inference.qwen3_tts_tokenizer` → `core.__init__` → both tokenizer
+   variants) — there is no way to load only the part this checkpoint uses
+   without also successfully importing the part it doesn't.
+3. **The unavoidable 25Hz path hard-requires `torchaudio`, for which no
+   PyPI wheel exists matching this venv's pinned `torch==2.12.1+cu130`** —
+   verified live against the official `download.pytorch.org/whl/cu130`
+   index: the latest available is `torchaudio==2.11.0+cu130`. Installing
+   any available version risks exactly the ABI/ torch-upgrade venv
+   corruption this project's own README documents as "Bug #5" (an unpinned
+   `torchvision` install once pulled a `torch` upgrade that corrupted the
+   old shared Debate venv) — a case study this project treats as never to
+   repeat.
+4. **The same path also requires the `sox` PyPI wrapper**, which itself
+   needs the SoX command-line binary present on the system — a new,
+   unconfirmed-present OS-level dependency, for functionality (the 25Hz
+   tokenizer) this specific CustomVoice/12Hz checkpoint doesn't even use.
+
+A workaround exists in principle (vendor + patch the ~2500 lines of
+`qwen_tts`'s own modeling code to sever the 25Hz cross-import, add only
+`librosa`+its lighter dependency chain, skip `torchaudio`/`sox`/`gradio`
+entirely) — test-installed `librosa==0.11.0` in the real venv to confirm
+its own dependency chain (`numba`, `soundfile`, `soxr`, `audioread`,
+`pooch`, `lazy_loader`, `msgpack`, `decorator`, `cffi`, `pycparser`, `zipp`
+already present) touches neither `torch` nor `torchvision`, so it would be
+safe in isolation. But even after that patch, real semantic compatibility
+of the vendored code's transformers-version-sensitive internals
+(`masking_utils.create_causal_mask`, `modeling_rope_utils`,
+`GradientCheckpointingLayer`, `ALL_ATTENTION_FUNCTIONS`, etc. — the file
+targets `transformers==4.57.3`, a full major version behind this venv's
+`5.12.1`) would remain completely unverified short of actually loading the
+4.3GB model and running generation, and this shape of integration —
+patching someone else's model source to route around dependency
+conflicts — is a fundamentally different, much higher-risk pattern than
+every other model in this bridge, all of which follow the single-file
+"copy a template, register a `ModelSpec`" pattern with zero upstream-code
+patching. **Decision: park, don't patch.** `librosa` was uninstalled again
+after the test (confirmed the venv's core `torch`/`transformers` stack was
+untouched: `torch 2.12.1+cu130`, `transformers 5.12.1`,
+`torch.cuda.is_available() == True`, reconfirmed after cleanup). One
+genuinely useful side-finding from the investigation, worth recording:
+the separately-downloaded `Qwen3-TTS-Tokenizer-12Hz` (~651MB) is **byte-
+identical** to the CustomVoice checkpoint's own embedded
+`speech_tokenizer/model.safetensors` (both exactly 682,293,092 bytes) — so
+even if this were unparked later, only one copy needs to actually load, not
+both, contrary to this task's own opening assumption.
+
+### Stable Diffusion v1.5 — built, live-verified end to end
+
+**Investigated before writing code.** `model_index.json` names
+`StableDiffusionPipeline`, but directly listing the full directory tree
+showed every component subfolder (`unet`/`vae`/`text_encoder`/etc.) has
+only a `config.json`, no weight file — all weights live in the single
+`v1-5-pruned-emaonly.safetensors` at the directory root (the classic
+"original Stable Diffusion" single-file format). Confirmed
+`StableDiffusionPipeline.from_pretrained(dir)` does NOT work against this
+layout; `from_single_file(checkpoint, config=dir, local_files_only=True)`
+does. `diffusers==0.39.0` verified compatible before installing: its own
+PyPI metadata declares `torch`/`transformers` only as optional extras
+(already satisfied anyway by this venv's pins), and a plain
+`pip install diffusers` pulled exactly two lightweight new packages
+(`importlib_metadata==9.0.0`, `zipp==4.1.0`) touching neither `torch` nor
+`torchvision` — confirmed live before pinning into `requirements.txt`.
+
+**Live-benchmarked device placement and resolution cap (not defaulted):**
+- 512x512, 15 steps, GPU fp16 + attention slicing: **~23s**, ~2.06GB VRAM
+  allocated / ~2.94GB reserved.
+- 768x768, 20 steps, same settings: **~268s** (11x longer for only 2.25x
+  the pixels and 1.33x the steps) and ~4.16GB VRAM reserved — essentially
+  the entire physical 4GB card. Output was still a valid, correct image
+  (visually confirmed), but the wildly disproportionate slowdown is the
+  signature of VRAM-pressure thrashing (Windows' driver-level "shared GPU
+  memory" fallback), not real compute scaling.
+- **Consequence: `/image-generate` caps width/height at 512** — the
+  measured cliff, not a guessed number. Registered `heavy=True` (the first
+  model in this bridge to actually use heavy-exclusivity — the manager
+  mechanism has existed since Phase 2/3 but nothing needed it until now):
+  peak VRAM at the safe 512 cap already leaves no real co-residency
+  headroom on this card.
+- Safety checker deliberately disabled (`safety_checker=None`) — documented
+  as a real call, not an oversight: loopback-only, no-auth, single-operator
+  bridge, consistent with this project's general "no auth complexity
+  disproportionate to the threat model" posture.
+
+**Live end-to-end verification (real route, not just "the forward pass
+ran"):** see "Verification approach" below for why an in-process ASGI test
+was used instead of a real HTTP round trip. `POST /image-generate` with
+`{"prompt": "a small blue robot reading a book, digital art", "steps": 20,
+"seed": 42}` → 200 OK in 66.6s (cold load ~10s + generation), 446,147 bytes,
+valid PNG signature (`\x89PNG\r\n\x1a\n`), 512x512 — visually confirmed a
+genuinely correct, coherent image matching the prompt (a blue robot
+character holding an open book), not noise/garbage. 400s correctly returned
+for an empty prompt and for a 1024x1024 request (the documented cap).
+
+### MusicGen — built, live-verified end to end
+
+**Investigated before writing code**, unlike Qwen3-TTS: `AutoProcessor`/
+`MusicgenForConditionalGeneration` both resolved cleanly against this
+checkpoint on `transformers==5.12.1`, live-verified by import before
+committing to the concrete classes — **zero new dependencies needed.**
+
+**Live-benchmarked device placement:** ~5s of audio (256 new tokens at the
+model's own confirmed 50 tokens/sec codec rate — 256/50=5.12s, matched the
+actual returned duration exactly) took **13.0s on GPU fp16** (~1.26GB VRAM
+allocated / ~2.43GB reserved) vs. **~12s on CPU fp32 for only 100 new
+tokens (~2s audio)** — roughly 2-3x faster per second of audio on GPU.
+Smaller gap than CLIP/OWLv2's 10x/25x (Phase 5) or SD's GPU-thrashing cliff
+above, but real and reproducible, and comfortable VRAM headroom remains
+(unlike SD) — registered `device="cuda", fp16=True`, **not** `heavy=True`
+(LRU eviction is sufficient; there's real room for a smaller model to
+coexist). A harmless upstream quirk recorded for future readers: this
+checkpoint's own shipped `generation_config.json` declares
+`pad_token_id`/`bos_token_id`=2048, one past the codec vocabulary's valid
+`[0,2047]` range, so transformers logs a benign warning on every load —
+live-confirmed this does not degrade output (99.6%/97.7% non-silent samples
+across two separate test generations, normal-range amplitudes, not
+degenerate).
+
+**Live end-to-end verification.** `POST /music-generate` with
+`{"prompt": "a short cheerful acoustic guitar riff", "duration_seconds":
+3.0}` → 200 OK in 18.1s, 188,204 bytes, valid `RIFF`/`WAVE` WAV header,
+32000 Hz, 2.94s actual duration (matches the requested 3.0s within one
+codec-token's rounding). Decoded the returned WAV back with the stdlib
+`wave` module and checked its basic properties per this session's own
+"confirm the mechanism, not full quality" honesty bar (can't literally
+listen): 97.7% of samples non-silent, peak amplitude 0.26 (well within
+[-1,1], not clipped, not near-zero) — consistent with genuine generated
+audio content, not silence or noise. 400s correctly returned for an empty
+prompt and for a 999-second duration request (the documented 30s cap).
+
+### Verification approach — a real instance of the documented stray-interpreter issue, worked around for this session's own testing
+
+Before trusting any live result, checked which process actually bound the
+port, per this project's own established discipline (`LOCAL_AI_STATUS.md`
+Sessions 16-25) — and hit it again, reproducibly: launching
+`venv\Scripts\python.exe server.py` directly (no `start.ps1` involved)
+still spawned a child `C:\...\Python311\python.exe` process that bound the
+actual port, confirmed via `Get-CimInstance`'s `ParentProcessId`
+(venv process → system-Python child, identical shape to the prior
+sessions' findings). Confirmed the child lacks `torch`/`transformers`/
+`diffusers` entirely (`ModuleNotFoundError` when checked directly) — so a
+real HTTP request to `/image-generate`/`/music-generate` against that
+specific bound port would have failed with a 500, not because of anything
+wrong in this session's code, but because the wrong interpreter answered.
+Tried prepending the venv's `Scripts/` directory to `PATH` before launching
+(the master plan's own "likely fix, not attempted" suggestion) — **did
+not** prevent the same child spawn, so whatever triggers the PATH-based
+lookup does not appear to respect a parent-process `PATH` override on this
+machine; noted here as a new, mildly negative data point on that open
+question, not chased further (root-cause narrowing is explicitly deferred
+to the optimization pass per standing policy). Instead of fighting the
+stray-process issue, verification used `httpx.AsyncClient` +
+`ASGITransport` directly against the real `server.app` FastAPI object
+in-process (no socket/subprocess involved at all) — this exercises the
+exact same route/Pydantic-validation/manager code a real deployed server
+would run, just without the OS-level networking layer that's actually the
+unreliable part on this machine right now. All assertions passed
+(200s with valid decoded media, 400s on every malformed-input case tried,
+`/status` correctly listing both new models in the `registered` set and the
+heavy-eviction/LRU behavior firing exactly as designed). Confirmed no
+stray processes or GPU memory left behind afterward
+(`Get-CimInstance`/`nvidia-smi` both clean).
+
+### Self-verification
+
+`python -m py_compile server.py local_models/*.py`: clean. `python -c
+"import server"`: clean, all fifteen `POST` routes present including the
+two new ones (confirmed via `server.app.routes`). Full runtime venv is
+available in this environment (not a stub-only check) — both new models
+were live-loaded and ran real inference as documented above, not just
+import-checked.
+
+### Files touched
+
+New: `python-bridge/local_models/image_generate.py`,
+`python-bridge/local_models/music_generate.py`. Modified:
+`python-bridge/server.py` (two new routes + imports),
+`python-bridge/requirements.txt` (`diffusers==0.39.0`,
+`importlib_metadata==9.0.0`, `zipp==4.1.0`, all `--no-deps`-installable,
+documented inline with the compatibility investigation), `python-bridge/
+README.md` (endpoints, venv/history notes, "models downloaded but not yet
+wired" section), `.claude/contracts/tool-contract.md` (new §3 subsection
+for the two Phase 6 routes), this file. Not touched: anything under
+`src/` (bridge side only, per this dispatch's explicit scope — no
+`ImageGenerate`/`MusicGenerate` TypeScript tool built this session), the
+sibling `openclaude` repo.
+
+**Not committed**, per this project's established process — reporting back
+for the orchestrating session to personally verify and commit. New
+dependency added: `diffusers==0.39.0` (+ its two transitive lightweight
+deps `importlib_metadata==9.0.0`/`zipp==4.1.0`), installed `--no-deps` per
+this venv's established discipline, verified beforehand not to touch
+`torch`/`torchvision`. No dependency was added for Qwen3-TTS or MusicGen
+(the latter needed none; the former was parked before any install was
+committed to `requirements.txt` — the exploratory `librosa` test install
+was fully uninstalled again, confirmed via `pip list`).
+
+## Session 28 (2026-08-13, orchestrating session) — Session 27 independently verified; the Qwen3-TTS park decision's two load-bearing technical claims independently reproduced from first-party sources
+
+Read `image_generate.py`/`music_generate.py` in full; confirmed
+`ModelSpec(heavy=True)`'s eviction behavior directly in `manager.py`
+(`_make_room_for`: `for victim_name in list(self._loaded.keys()):
+self._evict(victim_name)`) — genuinely evicts everything before loading,
+exactly as the module docstring claims, not just declared and unused.
+Checked `server.py`'s diff for both new routes and `requirements.txt`'s
+diff for the new `diffusers` pin — both clean, match the reported
+description exactly.
+
+**The Qwen3-TTS park decision rests on two falsifiable technical claims —
+independently checked against first-party sources, not just trusted**:
+1. "No PyPI wheel exists for `torchaudio` matching this venv's pinned
+   `torch==2.12.1+cu130`" — fetched `download.pytorch.org/whl/cu130/
+   torchaudio/`'s real index directly: latest available is **2.11.0**.
+   Confirmed accurate.
+2. "`qwen-tts` hard-pins `transformers==4.57.3` and requires `torchaudio`"
+   — fetched `qwen-tts`'s real PyPI JSON metadata directly: `requires_dist`
+   contains exactly `transformers==4.57.3` (a hard `==` pin, not a range)
+   and an unconstrained `torchaudio`. Confirmed accurate.
+
+Both claims hold. This is a well-evidenced park decision, not a shortcut —
+matching this project's own established standard for when "not built" is
+an acceptable, documented outcome rather than a failure to investigate.
+
+**Live re-verification, real HTTP calls against a freshly-started bridge
+(no stray-process issue this run)**: `/music-generate` (prompt "a short
+upbeat acoustic guitar melody", 3s) returned a genuinely valid WAV — decoded
+and inspected directly: mono 16-bit PCM, 32kHz (matching MusicGen's own
+output rate), 2.94s actual duration, 91.9% non-silent samples, max amplitude
+0.65 (normal range, not degenerate). `/image-generate` (prompt "a red apple
+on a wooden table, simple photo", 512x512, seed 42) returned a genuinely
+valid 512x512 RGB PNG — decoded and **visually inspected directly**: a
+correct, recognizable image of a red apple on a wooden table, accurately
+matching the prompt. `heavy=True` eviction confirmed live, not just in code:
+after loading `music-generate` then `image-generate`, `/status` showed only
+`image-generate` resident — the heavy model correctly evicted the
+non-heavy one on load, exactly as designed. GPU VRAM with `image-generate`
+alone: 3035 MiB, consistent with session 27's own ~2.9GB reserved figure.
+Bridge stopped cleanly afterward, port confirmed free.
+
+Confirmed no `src/` changes (bridge-only dispatch, as scoped). No
+discrepancies found between session 27's report and this verification —
+including the park decision, which held up under independent, first-party
+re-checking rather than being taken on faith. Committing sessions 27-28's
+combined work together. This closes out Phase 6 and, with it, every phase
+in `LOCAL_AI_MASTER_PLAN.md` §8 has now been attempted — Phase 6 itself
+ends in the plan's own explicitly-sanctioned partial state (2 of 3 models
+built and verified, 1 honestly parked with concrete evidence), not full
+completion, which is the documented, legitimate outcome its own gate text
+anticipated.

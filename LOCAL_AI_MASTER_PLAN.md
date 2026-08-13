@@ -1048,6 +1048,36 @@ a menu the router already can't reliably pick from), so it's no longer
   spike → wire if transformers supports it; SD 1.5 on GPU; MusicGen last.
   *Gate: TTS round-trip (type → hear) at acceptable latency, or documented
   park decision.*
+  **Status 2026-08-13 (sessions 27-28): closed out via the gate's own
+  documented-park-decision path — SD 1.5 and MusicGen built and
+  live-verified end to end; Qwen3-TTS parked with concrete evidence.**
+  `POST /image-generate` (Stable Diffusion v1.5, via a newly-added
+  `diffusers==0.39.0` dependency — this checkpoint turned out to be the
+  single-combined-file format, needing `from_single_file()` not
+  `from_pretrained()`) and `POST /music-generate` (MusicGen, zero new
+  dependencies) both wired into `python-bridge/` and live-verified with
+  real generated output (an actually-correct apple photo; a genuinely
+  non-silent audio clip, both independently decoded and inspected, not
+  just "the call returned 200"). First use of the bridge's own
+  `heavy=True` exclusive-eviction mechanism (built earlier, never
+  previously exercised) — SD's live-benchmarked VRAM footprint (~2.9GB of
+  this card's 4GB) leaves no real co-residency room, confirmed working
+  live. A genuine VRAM-thrashing cliff found at 768x768 (11x slower for
+  2.25x the pixels) capped `/image-generate` at 512x512, an
+  empirically-derived limit, not an arbitrary one. **Qwen3-TTS parked**,
+  not built — the plan's own gate explicitly sanctions this outcome. Four
+  independent blockers found, two of the most load-bearing independently
+  re-verified against live first-party sources (PyPI metadata, the
+  PyTorch wheel index) rather than taken on faith: the official `qwen-tts`
+  package hard-pins `transformers==4.57.3` against this venv's
+  load-bearing `5.12.1`, and separately requires `torchaudio`, for which
+  no PyPI wheel exists matching this venv's pinned `torch==2.12.1+cu130`
+  (latest available: 2.11.0). A vendor-and-patch workaround exists in
+  principle but was judged a fundamentally different risk shape than
+  every other model in this bridge, not attempted. **This closes out every
+  phase in this section** — Phase 6 itself ends in exactly the partial,
+  documented state its own gate anticipated, not full completion. Full
+  history in `LOCAL_AI_STATUS.md` Sessions 27-28.
 - **Continuous, from Phase 1 onward**: delegation ledger (§7 — Stage 1
   log-only starts now; Stage 2 similarity reuse only once real volume
   exists), routing tuned from logs, eval suite (both specialist and
