@@ -44,8 +44,9 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from typing import Literal, Optional, Union
 
-from local_models import document_qa, image_caption, table_qa, tabular_predict
+from local_models import audio_utils, document_qa, image_caption, table_qa, tabular_predict, vad as vad_model
 from local_models import forecast as forecast_model
+from local_models import transcribe as transcribe_model
 from local_models.manager import manager
 
 logging.basicConfig(level=logging.INFO)
@@ -209,6 +210,86 @@ async def forecast_endpoint(req: ForecastRequest):
     except forecast_model.InvalidForecastInput as e:
         raise HTTPException(status_code=400, detail=str(e))
     return ForecastResponse(**result)
+
+
+# --- Phase 4: hearing (2026-08-13) ----------------------------------------
+# Contract added to .claude/contracts/tool-contract.md's §3 table in the
+# same change as these routes went live, for tools-execution-agent's
+# AudioAnalyze/TranscribeAndSummarize tools (built separately, later — not
+# part of this dispatch) to build against.
+
+
+class TranscribeRequest(BaseModel):
+    audio_path: str
+    # None (default) lets Whisper auto-detect the spoken language rather
+    # than forcing one — see transcribe.py's transcribe() docstring/comment
+    # for what an unrecognized value does (400, not 500).
+    language: Optional[str] = None
+
+
+class TranscribeSegment(BaseModel):
+    text: str
+    start: float
+    end: float
+
+
+class TranscribeResponse(BaseModel):
+    text: str
+    language: str
+    segments: list[TranscribeSegment]
+
+
+@app.post("/transcribe", response_model=TranscribeResponse)
+async def transcribe_endpoint(req: TranscribeRequest):
+    try:
+        result = await transcribe_model.transcribe_async(req.audio_path, req.language)
+    except FileNotFoundError:
+        # Same collapsed 404 as /image-caption and /vad below — see
+        # audio_utils.py's UnsupportedAudioError docstring for why "doesn't
+        # exist" and "exists but unreadable" are deliberately not
+        # distinguished on this unauthenticated local endpoint.
+        raise HTTPException(status_code=404, detail="audio file not found or not readable")
+    except audio_utils.UnsupportedAudioError:
+        raise HTTPException(status_code=404, detail="audio file not found or not readable")
+    except transcribe_model.InvalidAudioInput as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return TranscribeResponse(**result)
+
+
+class VadRequest(BaseModel):
+    audio_path: str
+    threshold: float = Field(0.5, gt=0.0, lt=1.0)
+    min_speech_duration_ms: float = Field(250.0, gt=0)
+    min_silence_duration_ms: float = Field(100.0, gt=0)
+    speech_pad_ms: float = Field(30.0, ge=0)
+
+
+class VadSegment(BaseModel):
+    start: float
+    end: float
+
+
+class VadResponse(BaseModel):
+    segments: list[VadSegment]
+
+
+@app.post("/vad", response_model=VadResponse)
+async def vad_endpoint(req: VadRequest):
+    try:
+        result = await vad_model.detect_speech_segments_async(
+            req.audio_path,
+            req.threshold,
+            req.min_speech_duration_ms,
+            req.min_silence_duration_ms,
+            req.speech_pad_ms,
+        )
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="audio file not found or not readable")
+    except audio_utils.UnsupportedAudioError:
+        raise HTTPException(status_code=404, detail="audio file not found or not readable")
+    except vad_model.InvalidAudioInput as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return VadResponse(segments=result)
 
 
 if __name__ == "__main__":

@@ -192,6 +192,42 @@ of `python-bridge-agent`'s `src/`-free surface), not done as part of this
 change. No tool-side code changes are expected — no route shape changed
 from what's documented above.
 
+### Phase 4 hearing routes, backing planned `AudioAnalyze`/`TranscribeAndSummarize` — bridge side implemented and live-verified 2026-08-13, tools not yet built
+
+Both routes below are live in the bridge (`python-bridge-agent`,
+2026-08-13) per `LOCAL_AI_MASTER_PLAN.md` §8 Phase 4. **No TypeScript tool
+calls either route yet** — building `AudioAnalyze`/`TranscribeAndSummarize`
+against this contract is a separate, later `tools-execution-agent` dispatch
+(explicitly out of scope for the bridge-side session that added these).
+
+| Route | Model | Request | Response |
+|---|---|---|---|
+| `POST /transcribe` | whisper-large-v3-turbo | `{ audio_path: string, language?: string }` | `{ text: string, language: string, segments: Array<{ text: string, start: number, end: number }> }` (`language` omitted in the request auto-detects — the response's `language` field always reports what was actually used, detected or supplied; an unrecognized requested language string is a 400, not a 500) |
+| `POST /vad` | silero-vad (ONNX release, not the pre-downloaded `Silero-VAD-v5-MLX` checkpoint — see `local_models/vad.py`'s module docstring for why) | `{ audio_path: string, threshold?: number, min_speech_duration_ms?: number, min_silence_duration_ms?: number, speech_pad_ms?: number }` (all four optional, defaults 0.5/250/100/30) | `{ segments: Array<{ start: number, end: number }> }` (seconds, speech segment timestamps only — not a transcription) |
+
+Both: `audio_path` currently only accepts **WAV audio** (mono or stereo,
+8-bit or 16-bit PCM — 16-bit live-tested, 8-bit implemented but untested;
+compressed WAV and non-WAV containers like mp3/m4a are rejected, not
+silently mishandled — see `local_models/audio_utils.py`). A missing,
+unreadable, or unsupported-format file is a 404 (same collapsed-existence-
+oracle reasoning as `/image-caption` — see that route's own contract note
+above); a too-short/too-long/out-of-range parameter is a 400. `/transcribe`
+is GPU+fp16 (`device="cuda"`, falls back to CPU automatically); `/vad` is
+CPU-only (live-benchmarked ~250x real-time at this model's size — GPU
+placement would add complexity for no measurable benefit, see `vad.py`).
+Live-verified end-to-end against real Windows-SAPI-synthesized speech
+audio (short and >30s long-form) and a synthesized speech/silence/speech
+clip for VAD segmentation — see `LOCAL_AI_STATUS.md`'s Phase 4 session
+entry for exact transcripts/segment boundaries produced.
+
+If a future tool needs it, `TranscribeAndSummarize` (per the master plan's
+own naming) most likely wants to call `/vad` first to trim silence, then
+`/transcribe` on the trimmed audio — both routes are independent and
+composable, no bridge-side pipeline endpoint was built for this (deliberately
+left as tool-side orchestration, matching how `DataAnalyzeTool` composes
+three independent bridge routes rather than the bridge doing multi-model
+pipelines itself).
+
 Extending this table is `python-bridge-agent`'s responsibility whenever a
 new route is added — see that agent's own Architecture rules for the
 lazy-load-singleton pattern every route follows (now: register a
@@ -204,5 +240,7 @@ model" section).
 ## 4. Not yet implemented / planned
 > `tools-execution-agent` adds entries here as new tools are built.
 
-(none tracked yet — this scaffold was generated before any post-scaffold
-tool work began)
+- `AudioAnalyze` / `TranscribeAndSummarize` — planned TypeScript tools to
+  call the now-live `/transcribe` and `/vad` bridge routes (§3 "Phase 4
+  hearing routes", added 2026-08-13). Not yet built — a separate,
+  later dispatch per `LOCAL_AI_MASTER_PLAN.md` §8 Phase 4.

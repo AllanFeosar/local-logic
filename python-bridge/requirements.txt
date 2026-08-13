@@ -111,3 +111,27 @@ charset-normalizer==3.4.9
 chronos-forecasting==2.3.1
 accelerate==1.14.0
 psutil==7.2.2
+
+# --- Phase 4: hearing (transcribe.py, vad.py) ---
+# transcribe.py (Whisper turbo STT) needed zero new dependencies — it's the
+# existing transformers/torch stack (WhisperForConditionalGeneration/
+# WhisperProcessor), same as document_qa.py/image_caption.py.
+#
+# vad.py (Silero VAD) needed exactly one new dependency: onnxruntime, for
+# the standard silero-vad ONNX release (see vad.py's module docstring for
+# why the ONNX route was used instead of the pre-downloaded
+# `Silero-VAD-v5-MLX` checkpoint, which turned out to be genuinely
+# MLX-framework-specific weight layout, not just a repo-name label — and
+# why the `silero-vad` PyPI package wasn't used either: it would pull in
+# `torchaudio` just for its own WAV-loading helper, which this bridge
+# doesn't need given local_models/audio_utils.py's own stdlib-only loader).
+# CPU execution provider only (no `onnxruntime-gpu`) — live-benchmarked at
+# ~250x real-time on CPU alone for this ~309K-param model, so GPU placement
+# would add real complexity for no measurable benefit; see vad.py's module
+# docstring. flatbuffers/protobuf are onnxruntime's own direct runtime
+# dependencies (resolved once via normal pip dependency resolution in a
+# throwaway venv, same recipe as every other pin in this file, then
+# transcribed here and reinstalled with --no-deps).
+onnxruntime==1.28.0
+flatbuffers==25.12.19
+protobuf==7.35.1

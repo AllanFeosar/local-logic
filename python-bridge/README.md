@@ -114,6 +114,25 @@ either, which is why fp16 was kept as the default rather than
   (chronos-t5-tiny, zero-shot time-series forecasting; CPU). 400 on
   malformed input (empty/too-short series, non-positive or excessive
   horizon).
+- `POST /transcribe` — `{audio_path, language?}` → `{text, language,
+  segments: [{text, start, end}]}` (whisper-large-v3-turbo, speech-to-text;
+  GPU+fp16 by default). `language` omitted lets Whisper auto-detect the
+  spoken language (the detected code is echoed back in the response either
+  way); an unrecognized requested value returns 400. Handles long-form audio
+  (>30s) correctly via transformers' built-in long-form generation loop,
+  not a naive 30s truncation — see `local_models/transcribe.py`'s module
+  docstring for the live verification. 404 on a missing/unreadable/
+  unsupported-format audio file (same collapsed-existence-oracle reasoning
+  as `/image-caption`); 400 on audio that's too short (<0.1s) or over the
+  20-minute defensive cap.
+- `POST /vad` — `{audio_path, threshold?, min_speech_duration_ms?,
+  min_silence_duration_ms?, speech_pad_ms?}` → `{segments: [{start, end}]}`
+  (silero-vad ONNX, voice activity detection — speech segment timestamps in
+  seconds, not a transcription; CPU, ~250x real-time). Same 404/400
+  conventions as `/transcribe`. See `local_models/vad.py`'s module
+  docstring for why the ONNX release is used instead of the pre-downloaded
+  `Silero-VAD-v5-MLX` checkpoint (confirmed genuinely MLX-specific weight
+  layout, not just a naming label).
 - `GET /status` — what's currently loaded (name, estimated MB, heavy/
   device/fp16 flags — `device`/`fp16` reflect the *actual resolved*
   placement, not just what a model declared; `declared_device` is what it
@@ -123,7 +142,7 @@ either, which is why fp16 was kept as the default rather than
   harness.
 - `GET /health` — liveness check
 
-Request/response shapes for all five `POST` routes are the contract
+Request/response shapes for all seven `POST` routes are the contract
 `tools-execution-agent`'s tools build against — see
 `.claude/contracts/tool-contract.md` §3. Any shape change here must be
 reflected there in the same change.
@@ -211,15 +230,20 @@ That's the whole extension surface — no other file needs to change.
 
 ## Models downloaded but not yet wired up
 
-`whisper-large-v3-turbo` (speech-to-text), `clip-vit-large-patch14` /
-`clipseg-rd64-refined` (image-text matching / segmentation), and others in
-`C:\Users\allge\AI Models\huggingface\` are downloaded but have no
-`local_models/*.py` module or route yet. Follow the same pattern above to
-add them as needed — they weren't all wired up mechanically since each has
-a different input shape (audio file, image pair, etc.) worth designing
-deliberately rather than rubber-stamping. See `LOCAL_AI_MASTER_PLAN.md`'s
-phased plan for what's next (Phase 4: hearing/Whisper; Phase 5: the vision
-suite).
+`clip-vit-large-patch14` / `clipseg-rd64-refined` (image-text matching /
+segmentation), and others in `C:\Users\allge\AI Models\huggingface\` are
+downloaded but have no `local_models/*.py` module or route yet. Follow the
+same pattern above to add them as needed — they weren't all wired up
+mechanically since each has a different input shape (image pair, etc.)
+worth designing deliberately rather than rubber-stamping. See
+`LOCAL_AI_MASTER_PLAN.md`'s phased plan for what's next (Phase 5: the
+vision suite).
+
+`whisper-large-v3-turbo` (Phase 4, 2026-08-13) is now wired up — see
+`/transcribe` above and `local_models/transcribe.py`. The `TranscribeAndSummarize`/
+`AudioAnalyze` TypeScript-side tools that will call `/transcribe` and
+`/vad` are a separate, later dispatch (not built in this one — this
+session is the bridge side only).
 
 ## History (bugs found and fixed, don't reintroduce)
 
@@ -237,3 +261,23 @@ suite).
   `BlipForConditionalGeneration` for BLIP). Still relevant in the new venv
   (same transformers version); TAPAS/TabPFN/Chronos added 2026-08-12 follow
   the same concrete-classes rule.
+- **Not every transformers-v5 Auto* path is actually broken — verify per
+  model, don't assume the pattern generalizes (2026-08-13).** Whisper was
+  explicitly checked before committing to concrete classes:
+  `AutoProcessor`/`AutoModelForSpeechSeq2Seq` both resolved cleanly against
+  `whisper-large-v3-turbo` on this exact transformers version (unlike
+  BLIP/DistilBERT). `local_models/transcribe.py` still uses the concrete
+  `Whisper*` classes anyway, for consistency with the rest of this package
+  — but the decision was based on a live check, not a copy-pasted
+  assumption from the BLIP/DistilBERT breakage. See that module's own
+  docstring for the full verification note.
+- **A pre-downloaded checkpoint's repo name/tag can be a real, verifiable
+  signal, not just cosmetic (2026-08-13).** `Silero-VAD-v5-MLX`'s "MLX" in
+  the name turned out to describe a genuine weight-layout difference
+  (transposed Conv1d weights, summed LSTM biases) confirmed by reading its
+  `model.safetensors` tensor keys directly against its own README's
+  documented conversion mapping — not loadable as a standard PyTorch state
+  dict without reimplementing that conversion. Used the project's own
+  documented fallback instead (re-download the standard silero-vad ONNX
+  release) rather than attempting an unverified reverse-engineering fix.
+  See `local_models/vad.py`'s module docstring for the full investigation.

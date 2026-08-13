@@ -3181,3 +3181,304 @@ session's own confirmation run.
 referenced this session. The recurring stray-process issue is diagnosed
 and flagged, not fixed (outside a coding session's reach — needs the
 project owner's attention at the OS level).
+
+## Session 19 (2026-08-13, python-bridge-agent) — Phase 4 "Hearing": Whisper turbo STT + Silero VAD wired into the bridge, live-verified end to end
+
+Per the project owner's explicit sequencing directive (recorded at the top
+of `LOCAL_AI_MASTER_PLAN.md`'s revision log): proceeded with Phase 4
+directly, the "blocked on router reliability" framing from earlier status
+notes explicitly lifted. **Bridge side only** — `AudioAnalyze`/
+`TranscribeAndSummarize` TypeScript tools are a separate, later dispatch to
+`tools-execution-agent`, not built here.
+
+### What was checked before writing any code
+
+- **Pre-downloaded models confirmed present**, per the task's own
+  instruction not to re-download blindly: `whisper-large-v3-turbo`
+  (~1.6GB, standard `transformers` Whisper checkpoint, `torch_dtype:
+  float16` in its own config.json) and `Silero-VAD-v5-MLX` (config.json +
+  a 1.2MB `model.safetensors`) both verified present at their documented
+  paths.
+- **Whisper Auto-class resolution live-tested rather than assumed broken**:
+  both `AutoProcessor`/`AutoModelForSpeechSeq2Seq` resolved cleanly against
+  this checkpoint on transformers 5.12.1 (to `WhisperProcessor`/
+  `WhisperForConditionalGeneration`) — unlike BLIP/DistilBERT, Whisper is
+  NOT in this project's known-broken-Auto*-class set. `local_models/
+  transcribe.py` still uses the concrete classes directly anyway, for
+  consistency with the rest of the package (same reasoning table_qa.py
+  already documented for TAPAS) — not because Auto* failed here.
+- **`Silero-VAD-v5-MLX` confirmed genuinely unusable as-is, not just
+  suspiciously named**: read its `config.json` (`model_type:
+  "silero_vad_v5"`, not a registered HF architecture — no Auto*/pipeline()
+  path exists regardless) and inspected `model.safetensors`'s tensor keys
+  directly via `safetensors.safe_open` (`stft.weight`,
+  `encoder.{0..3}.{weight,bias}`, `lstm.Wx`/`lstm.Wh`/`lstm.bias`,
+  `decoder.{weight,bias}`) against that repo's own README "Weight Mapping"
+  table — confirmed byte-for-byte match with the *documented MLX
+  conversion* (transposed Conv1d weights for MLX's channels-last format,
+  `bias_ih`+`bias_hh` pre-summed into one tensor). Not loadable as a
+  standard PyTorch state dict without reimplementing and verifying the
+  inverse of that conversion, with no reference implementation on this
+  platform to check it against. Used the plan's own documented fallback
+  instead: re-downloaded the standard `silero_vad.onnx` release directly
+  from `snakers4/silero-vad`'s GitHub (2,327,524 bytes; sha256 verified
+  byte-identical against a second fresh download) to
+  `C:\Users\allge\AI Models\huggingface\silero-vad-onnx\`. Read the
+  reference `utils_vad.py`'s `OnnxWrapper`/`get_speech_timestamps` source
+  directly from GitHub to get the exact input/output contract (chunk size,
+  state/context tensor shapes, hysteresis thresholds) right, rather than
+  guessing from the ONNX graph's I/O names alone.
+
+### Built
+
+- **`python-bridge/local_models/audio_utils.py`** (new, shared by both
+  modules below — not a new per-model pattern, just plumbing two models in
+  this dispatch happen to need identically): stdlib-only (`wave` +
+  `numpy`) WAV loader → mono float32 @ 16kHz. Tested live against 16-bit
+  PCM WAV at both native 16kHz and an off-rate (22050Hz, linear-interpolation
+  resampled) — untested: 8-bit PCM (implemented, same code path, no real
+  8-bit file available to exercise it) and anything non-WAV (mp3/m4a/ogg —
+  deliberately unsupported, no ffmpeg dependency added). `FileNotFoundError`
+  for a missing path, `UnsupportedAudioError(ValueError)` for anything that
+  exists but isn't a readable/supported WAV — both collapsed into the same
+  generic 404 in server.py, identical reasoning to `image_caption.py`'s
+  existing missing-vs-unloadable collapse.
+- **`python-bridge/local_models/transcribe.py`** (new) — Whisper turbo STT.
+  `ModelSpec(device="cuda", fp16=True)`, real GPU placement confirmed live
+  (see Verification below). `transcribe(audio_path, language=None) ->
+  {text, language, segments: [{text, start, end}]}` via `manager.use(...)`,
+  `transcribe_async`, `warmup()`. Always calls the feature extractor with
+  `truncation=False, padding="longest"` (not the default fixed-30s window)
+  — live-verified this correctly engages transformers' built-in long-form
+  generation loop rather than silently truncating: a 48-second synthesized
+  test clip transcribed in full across three correctly-boundaried segments.
+  Segment timestamps come from `generate(..., return_timestamps=True)` +
+  `processor.tokenizer.decode(ids, skip_special_tokens=True,
+  output_offsets=True)` (per-sequence — `processor.batch_decode` was tried
+  first and silently returned empty offsets on this version) — no extra
+  model pass needed.
+  **Real bug found and fixed live**: combining `padding="longest"` with
+  `language=None` (auto-detect) crashed inside transformers' own
+  `detect_language()`, which hard-requires the standard fixed-3000-mel-frame
+  padding for its internal probe forward pass ("Whisper expects the mel
+  input features to be of length 3000, but found 981"). Fixed by never
+  letting `language=None` reach the long-form call: a separate
+  `model.detect_language()` pass against standard-padded features resolves
+  a concrete language first (decoded `"<|en|>"` → `"en"`), which is then
+  fed into the long-form `generate()` call explicitly and also returned in
+  the response. An explicitly-supplied, unrecognized `language` string is
+  caught and returned as a 400 (`InvalidAudioInput`), not a 500.
+- **`python-bridge/local_models/vad.py`** (new) — Silero VAD via the ONNX
+  release (see above for why, not the pre-downloaded MLX checkpoint).
+  `ModelSpec(device="cpu")` — **not** GPU: live-benchmarked at ~250x
+  real-time on CPU alone (11.5s of audio, 360 chunks, processed in ~45ms
+  total), so GPU placement would need a separate `onnxruntime-gpu` package
+  and CUDA execution-provider setup for no measurable benefit at this
+  model's size (~309K params, 2.3MB ONNX file) — exactly the "don't force
+  GPU placement onto a model this small if it doesn't matter" case the task
+  itself anticipated. `detect_speech_segments(audio_path, threshold=0.5,
+  min_speech_duration_ms=250, min_silence_duration_ms=100,
+  speech_pad_ms=30) -> [{start, end}]` (seconds), `..._async`, `warmup()`.
+  Session/state/context tensors are passed explicitly per `session.run()`
+  call (not stored as mutable session state) — no shared-mutable-state
+  concern across concurrent requests, unlike the reference JIT wrapper's
+  design. Segment extraction is a simplified, direct adaptation of the
+  reference `get_speech_timestamps()`'s hysteresis loop — the
+  `max_speech_duration_s` long-run-splitting branch was deliberately not
+  ported (this bridge's stated use case, trimming silence/skipping dead air
+  before Whisper, never needs speech segments capped in length); documented
+  as a known simplification in the module docstring for whoever needs that
+  behavior later.
+- **`server.py`**: `POST /transcribe` and `POST /vad` routes added,
+  following the exact existing Pydantic request/response + route-handler
+  pattern (same `FileNotFoundError`/`UnsupportedAudioError` → 404,
+  `InvalidAudioInput` → 400 mapping used elsewhere). `/status`'s
+  `registered` list auto-includes both new models (it enumerates
+  `manager`'s specs directly — nothing to hand-maintain there).
+- **`requirements.txt`**: `transcribe.py` needed zero new dependencies
+  (existing transformers/torch stack). `vad.py` needed exactly one:
+  `onnxruntime==1.28.0` (CPU-only — no `onnxruntime-gpu`), plus its own
+  direct runtime deps `flatbuffers==25.12.19`/`protobuf==7.35.1`, all
+  resolved once via normal pip dependency resolution in a throwaway venv
+  (same recipe as every other pin in this file) then reinstalled with
+  `--no-deps` into the real venv. `numpy`/`torch`/`transformers` versions
+  unchanged — no upgrade risk to the shared bookkeeping this file exists to
+  prevent.
+- **`python-bridge/README.md`**: documented both new routes in the
+  endpoints list, added two "History" entries (the Whisper Auto*-works
+  finding, the Silero-VAD-MLX investigation), moved `whisper-large-v3-turbo`
+  out of "not yet wired up".
+- **`.claude/contracts/tool-contract.md`**: added a "Phase 4 hearing
+  routes" section (§3) with the exact request/response shapes, and a §4
+  entry noting `AudioAnalyze`/`TranscribeAndSummarize` are planned but not
+  yet built, for `tools-execution-agent`'s future pickup.
+
+### Verification — live, against real audio, through the actual HTTP routes (not just unit-level Python calls)
+
+No pre-existing audio test file was found in this repo or an obvious
+Windows sample-media location suitable for real speech (Windows'
+`C:\Windows\Media\*.wav` are UI sound effects, not speech) — synthesized
+test audio via Windows' built-in SAPI TTS (`System.Speech.Synthesis`,
+PowerShell), which produces real, if synthetic, speech waveforms, not
+fabricated data:
+- **`/transcribe`, short clip** (9.8s, 22050Hz mono 16-bit PCM — exercises
+  the resampling path): `curl`-equivalent POST returned the correct
+  transcript verbatim ("The quick brown fox jumps over the lazy dog. This
+  is a test of the local whisper transcription bridge, running entirely
+  offline on this machine.") with `language: "en"` (auto-detected, no
+  `language` supplied) and two correctly-boundaried segments, in 13.9s
+  (cold — first request against a freshly-loaded model).
+- **`/transcribe`, long-form clip** (48.3s, three paragraphs): correct full
+  transcript across three segments with accurate boundary timestamps
+  (0-14.84s / 14.84-30.52s / 30.52-47.48s), 2.3s (warm GPU). Confirms the
+  >30s long-form path genuinely works through the live HTTP route, not just
+  the standalone script that found the bug above.
+- **`/transcribe` error paths**: missing file → 404
+  `{"detail":"audio file not found or not readable"}`; an existing
+  non-audio file (`C:\Windows\System32\drivers\etc\hosts`) → the same 404
+  (collapsed correctly, not a 500); an unrecognized `language` value → 400
+  with the underlying transformers error message surfaced in `detail`.
+- **`/vad`**: a synthesized two-speech-segments-with-a-3.5s-true-silence-gap
+  test clip (built by concatenating two SAPI outputs around a literal
+  zero-sample gap, not just relying on TTS's own inter-sentence pauses)
+  correctly returned two segments (`0.098–3.646s`, `7.938–10.782s`) bounding
+  the real gap; a max speech-probability check during the known-silence
+  window separately confirmed near-zero (0.0086) model output there.
+  Also run against the 48s long-form clip (multiple segments at natural
+  sentence pauses — plausible, not independently ground-truthed). Missing
+  file → 404; out-of-range `threshold` (1.5) → 422 via Pydantic's own
+  `Field(gt=0, lt=1)` constraint (consistent with `/forecast`'s existing
+  `horizon: int = Field(gt=0)` pattern, not a new convention).
+- **GPU device placement — proven, not assumed**: `/status` after loading
+  `transcribe` reported `"device": "cuda", "fp16": true` (resolved, not
+  just declared); `torch.cuda.memory_allocated()`/`memory_reserved()`
+  measured directly in a standalone script showed ~1544MB/~1674MB for the
+  loaded fp16 model (this checkpoint's weights are already stored as fp16
+  on disk, so `.half()` here is close to a no-op, not a further halving) —
+  and separately, `nvidia-smi` showed real GPU memory climb from 0 MiB
+  (idle) to 1867 MiB after loading `transcribe` alone.
+- **Composition with existing GPU models — measured live, not assumed
+  correct**: loaded `transcribe`, `image-caption`, and `document-qa`
+  simultaneously (via real `/transcribe`, `/image-caption`, `/document-qa`
+  calls in sequence) — all three stayed resident together
+  (`committed_mb_estimated: 4550` of the `4608` budget, no eviction
+  triggered), and `nvidia-smi` showed real usage at **3641 MiB of 4096 MiB
+  total** — fits, but tight (~455MB headroom); worth the project owner
+  knowing the real number, not just "it composes." `/image-caption` and
+  `/document-qa` both returned correct, unchanged results during this
+  (BLIP caption on a real photo, DistilBERT-QA "blue" at 0.972 confidence)
+  — confirming no regression from the new imports/routes added to
+  `server.py`. Separately confirmed the **existing LRU eviction mechanism
+  correctly handles the new models with zero code changes**: loading
+  `/forecast` afterward (200MB, CPU) pushed estimated committed MB over
+  budget, and `/status` showed `transcribe` (the least-recently-used idle
+  entry at that point) evicted automatically to make room — exactly the
+  designed behavior, not a new mechanism built for this session.
+- **Stray-process check**: before starting the bridge, checked for the
+  documented recurring wrong-interpreter-`server.py` issue — none found
+  this session (only unrelated pre-existing `python.exe` processes:
+  `lmstudio_mcp.py`, `graphify.serve`, confirmed via command-line
+  inspection, not the bridge). Bridge started cleanly via a single
+  `venv\Scripts\python.exe server.py` process, stopped cleanly at the end
+  of verification, port 8756 confirmed free afterward.
+- **Compile/import checks**: `python -m py_compile server.py
+  local_models/*.py` clean; `python -c "import server"` clean (real
+  import-time check, not just syntax — this venv has torch/transformers
+  installed, so this exercises the actual model-registration import chain,
+  not a stub).
+
+### Open items for whoever picks up `TranscribeAndSummarize`/`AudioAnalyze` or Phase 4's own eval gate
+
+- **Phase 4's stated gate — "transcription spot-check vs a cloud STT on 3
+  real recordings" — not attempted this session.** Everything verified
+  above used synthesized (SAPI TTS) speech, not real human recordings, and
+  no cloud STT comparison was run (would need a live paid API call, out of
+  this bridge-focused session's scope and not requested). A real gate run
+  needs actual recorded speech and an explicit cloud-STT opt-in, mirroring
+  how `scripts/eval/specialistEval.ts`'s `--frontier` flag is gated.
+- **Format support is WAV-only**, deliberately not widened this session —
+  see `audio_utils.py`'s own docstring. A real recording captured as mp3/
+  m4a/ogg (common on phones) will 404 today, not silently mistranscribe.
+  Widening this is a real dependency decision (ffmpeg-backed decode), not a
+  quick fix.
+- **VAD segment extraction is a simplified adaptation**, not a byte-for-byte
+  port of the reference algorithm — the `max_speech_duration_s` long-run
+  splitting branch is intentionally omitted (see vad.py's module docstring
+  for why it doesn't matter for this bridge's stated use case). If a future
+  caller needs speech segments capped in length, port that branch from
+  `utils_vad.py`'s `get_speech_timestamps` rather than reinventing it.
+- **No bridge-side pipeline endpoint** composes `/vad` + `/transcribe`
+  (e.g., trim silence then transcribe) — left as tool-side orchestration
+  for whoever builds `TranscribeAndSummarize`, matching how
+  `DataAnalyzeTool` already composes three independent bridge routes
+  rather than the bridge doing multi-model pipelines itself.
+- **VRAM headroom with all three GPU models loaded is tight** (~455MB free
+  of 4096MB, measured live — see Verification above). Not a problem today
+  (LRU eviction handles it, confirmed working), but worth knowing before
+  adding a fourth always-resident GPU model without re-checking this
+  number.
+
+### Files touched
+
+New: `python-bridge/local_models/audio_utils.py`,
+`python-bridge/local_models/transcribe.py`,
+`python-bridge/local_models/vad.py`,
+`C:\Users\allge\AI Models\huggingface\silero-vad-onnx\silero_vad.onnx` (+
+`LICENSE`, downloaded, not committed to this repo — outside its own
+directory tree). Modified: `python-bridge/server.py`,
+`python-bridge/requirements.txt`, `python-bridge/README.md`,
+`.claude/contracts/tool-contract.md`, this file. Not touched: anything
+under `src/` (no TypeScript tool built this session, per the task's own
+scope boundary), the sibling `openclaude` repo.
+
+**Not committed**, per this project's established process — reporting back
+for the orchestrating session to personally verify and commit.
+
+## Session 20 (2026-08-13, orchestrating session) — Session 19 independently verified; VRAM budget-ceiling root cause identified
+
+Read `transcribe.py`/`vad.py`/`audio_utils.py` in full, the diffs of
+`server.py`/`requirements.txt`/`tool-contract.md`. Synthesized my own
+independent test WAV (Windows SAPI TTS, a sentence pair with a natural
+pause — not the same file session 19 used) and called `/transcribe`/`/vad`
+directly against a freshly-started bridge: **word-perfect transcript**,
+correct language auto-detection, and VAD segments (`0.098–2.686s`,
+`3.458–6.142s`) correctly bounding the two spoken sentences. Confirmed live
+GPU placement (`nvidia-smi`: 0→1867MiB after loading `transcribe` alone,
+matching session 19's own ~1674MB figure within normal variance) and
+independently reproduced the tight co-residency finding: loading
+`transcribe`+`vad`+`image-caption` together measured **3597MiB of 4096MiB**
+on this machine (vs. session 19's own 3641MiB with the same three models —
+consistent, not a discrepancy).
+
+**One root-cause detail added beyond session 19's own report**: traced
+*why* headroom is this tight. `manager.py`'s `DEFAULT_BUDGET_MB` (the
+software ceiling the LRU-eviction bookkeeping targets) is **4608MB — already
+above this machine's actual 4096MB physical VRAM** — confirmed pre-existing
+(`git diff` shows zero changes to `manager.py` from session 19's own work).
+This means the eviction system's own accounting has *no real safety margin*
+below the hardware ceiling: it only starts evicting once its internal
+count exceeds a number that's already larger than what physically exists,
+rather than proactively freeing room before the card is actually full.
+Adding transcribe's ~2.2GB estimate to the roster of loadable GPU models
+is what makes this pre-existing miscalibration materially more likely to
+matter in practice than it was before (previously the built-in models
+alone — BLIP/DistilBERT/TabPFN — didn't push as close to the ceiling as
+transcribe now does).
+
+**Deliberately not fixed this session** — this is squarely the kind of
+"optimize/tune a constant" work the project owner's standing sequencing
+policy (see `LOCAL_AI_MASTER_PLAN.md`'s top-of-file revision log,
+2026-08-13) defers until after the full plan is built out. Documented here
+prominently instead so it isn't lost: whoever does the optimization pass
+should lower `DEFAULT_BUDGET_MB` to something safely below 4096 (leaving
+real margin for CUDA context/driver overhead) as part of that pass, and
+separately, this remains the same "real, not yet stress-tested" Ollama-vs-
+bridge cross-process VRAM contention risk `LOCAL_AI_MASTER_PLAN.md` §9's
+risk register already named — Whisper's addition doesn't create that risk,
+it just makes it a better-evidenced one worth prioritizing when the
+optimization pass comes.
+
+No discrepancies found between session 19's report and this verification.
+Confirmed no `src/` changes (Python-only dispatch, tsc/build unaffected —
+skipped re-running them for that reason, not an oversight). Committing
+session 19's + this session's changes together.
