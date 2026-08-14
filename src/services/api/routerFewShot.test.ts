@@ -33,10 +33,10 @@ describe('shouldApplyRouterFewShot', () => {
 describe('buildRouterFewShotMessages', () => {
   const messages = buildRouterFewShotMessages()
 
-  test('produces exactly 5 example turns (10 messages: 5 user, 5 assistant)', () => {
-    expect(messages).toHaveLength(10)
-    expect(messages.filter(m => m.role === 'user')).toHaveLength(5)
-    expect(messages.filter(m => m.role === 'assistant')).toHaveLength(5)
+  test('produces exactly 6 example turns (12 messages: 6 user, 6 assistant)', () => {
+    expect(messages).toHaveLength(12)
+    expect(messages.filter(m => m.role === 'user')).toHaveLength(6)
+    expect(messages.filter(m => m.role === 'assistant')).toHaveLength(6)
   })
 
   test('every user message is immediately followed by an assistant message', () => {
@@ -91,9 +91,18 @@ describe('buildRouterFewShotMessages', () => {
     expect((assistantMsg?.content as string).length).toBeGreaterThan(0)
   })
 
-  test('example 5 (last, closest to the real conversation) is a bare greeting with NO tool call — targets the session-opener Skill-hallucination failure (session 29)', () => {
+  test('example 5 is a general-knowledge trivia question with NO tool call — targets the DocumentQA-no-passage over-delegation cluster found in the holdout sweep (session 29)', () => {
     const userMsg = messages[8]
     const assistantMsg = messages[9]
+    expect(userMsg?.content).toBe('How many moons does Jupiter have?')
+    expect(assistantMsg?.tool_calls).toBeUndefined()
+    expect(typeof assistantMsg?.content).toBe('string')
+    expect((assistantMsg?.content as string).length).toBeGreaterThan(0)
+  })
+
+  test('example 6 (last, closest to the real conversation) is a bare greeting with NO tool call — targets the session-opener Skill-hallucination failure (session 29)', () => {
+    const userMsg = messages[10]
+    const assistantMsg = messages[11]
     expect(userMsg?.content).toBe('hi')
     expect(assistantMsg?.tool_calls).toBeUndefined()
     expect(typeof assistantMsg?.content).toBe('string')

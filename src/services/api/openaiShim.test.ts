@@ -512,8 +512,8 @@ test('inserts the router few-shot examples for a local URL, non-recovery model, 
   })
 
   const messages = requestBody?.messages as Array<Record<string, unknown>>
-  // system + 10 few-shot messages (5 examples, session 29) + the real user turn = 12
-  expect(messages).toHaveLength(12)
+  // system + 12 few-shot messages (6 examples, session 29) + the real user turn = 14
+  expect(messages).toHaveLength(14)
   expect(messages[0]?.role).toBe('system')
   expect(messages[1]?.role).toBe('user') // first few-shot example
   expect(messages.at(-1)).toEqual({ role: 'user', content: '12 x 7' })

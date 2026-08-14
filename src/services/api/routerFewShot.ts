@@ -169,7 +169,26 @@ export function buildRouterFewShotMessages(): OpenAIMessage[] {
     { role: 'user', content: 'What is 12 * 7?' },
     { role: 'assistant', content: '12 * 7 = 84.' },
 
-    // Example 5 — bare conversational greeting, no tool needed. Placed
+    // Example 5 — general-knowledge trivia question, no tool needed. Added
+    // session 29 after the holdout-split sweep showed this as the largest
+    // single failure cluster in the `distractor` category: 3+ of 8 holdout
+    // cases over-delegated a plain factual question to `DocumentQA` (which
+    // needs a real passage to extract from, not a question the router
+    // could just answer itself) even after `DocumentQATool`'s own
+    // description gained an explicit "cannot invent a passage" guard —
+    // that guard alone didn't hold under live testing, so demonstrating
+    // the correct behavior directly, the same lever that already fixed
+    // the greeting and file-read failure modes. Deliberately NOT the
+    // literal text of any tuning or holdout distractor case (the
+    // "how many moons" phrasing also happens to double as a check against
+    // over-delegating a numeric-answer trivia question to AskMathModel).
+    { role: 'user', content: 'How many moons does Jupiter have?' },
+    {
+      role: 'assistant',
+      content: 'Jupiter has 95 confirmed moons, the most of any planet in the solar system.',
+    },
+
+    // Example 6 — bare conversational greeting, no tool needed. Placed
     // last (closest to the real conversation) to weight this behavior the
     // most via in-context recency bias: a session opener is, by
     // construction, the very next thing after this example in a fresh

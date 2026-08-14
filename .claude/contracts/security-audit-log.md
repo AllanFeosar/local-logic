@@ -616,3 +616,91 @@ DocumentQATool's unconditional-allow checkPermissions combined with a caller-sup
 image_path/context. That posture is unchanged by this diff and is already recorded, with the
 owner-confirmed reasoning, in this log's 2026-08-12 and 2026-08-13 entries — and this diff
 narrows the model's use of that path rather than widening it.
+
+## 2026-08-15 — Session 29 (2nd continuation): DeepSolve generation-failure resilience, math-model timeout reduction, audio-path image-extension pre-reject, 6th router few-shot example
+Files audited: src/tools/AskMathModelTool/prompt.ts, src/tools/AskMathModelTool/constants.ts, src/tools/AskMathModelTool/deepSolve/solveDeep.ts, src/tools/shared/audioBridge.ts, src/services/api/routerFewShot.ts, src/services/api/routerFewShot.test.ts, src/services/api/openaiShim.test.ts
+Verdict: 0 Critical, 0 High, 0 Medium, 2 Low
+Recommendation: ship
+Findings: none blocking — 2 Low notes recorded inline below; no handoff report filed
+
+Scope: exhaustive over the staged diff (`git diff --cached`, all 7 source files read in full or
+in the complete surrounding function). LOCAL_AI_STATUS.md is also staged but is documentation,
+outside the gate's sensitive-path set. Each claim below was verified against the code this
+session, not against the dispatch description.
+
+Verified (pass):
+- src/tools/AskMathModelTool/deepSolve/solveDeep.ts:109-119 — the new try/catch wraps exactly one
+  expression, `await generateCandidate(...)`. `verifyAnswer` (:122) is deliberately OUTSIDE it, so
+  a verification-path throw still propagates as before; the catch cannot swallow or reclassify a
+  verification result. Confirmed by reading the file, not the diff hunk alone.
+- No verification/code-execution bypass. `verified: true` is still reachable from exactly two
+  sites (solveDeep.ts:124-138 and :180-188), both gated on `verification.outcome === 'pass'` from
+  verifyAnswer. A candidate that throws during generation is never pushed to `all` (:120) and
+  therefore never reaches verifyAnswer, the reranker, or a result — it cannot be "accepted
+  unverified"; it is simply absent. `git status --porcelain` confirms deepSolve/verification.ts,
+  deepSolve/restrictedEvaluator.ts and deepSolve/pythonSandbox.ts are unmodified in both index and
+  working tree — the executed-check path itself is untouched by this diff.
+- Abort semantics preserved. A parent-signal abort surfacing as a throw from generateCandidate is
+  caught and `continue`s, but the next iteration's `if (signal.aborted) break` (:107) still
+  terminates the loop immediately, so user cancellation is not defeated by the new catch. The
+  internal MATH_MODEL_TIMEOUT_MS abort (a *combined* signal built per-call in
+  generateCandidates.ts:156-158 with `cleanup()` in a `finally`) leaves the parent signal
+  un-aborted, which is the intended "try the next temperature" case.
+- Fail-closed on total generation failure. With `all`/`failed`/`inconclusive` all empty the
+  function throws (:222-227); solveDeep's only production caller
+  (src/tools/AskMathModelTool/AskMathModelTool.ts:184) does not wrap it in a try/catch, so the
+  error surfaces as a tool error. There is no path where a generation failure degrades into a
+  silently-returned answer.
+- src/tools/AskMathModelTool/constants.ts:36 — MATH_MODEL_TIMEOUT_MS 600_000 -> 280_000 is a
+  reduction. All three consumers (AskMathModelTool.ts:197, generateCandidates.ts:157 and :189)
+  use it solely as `timeoutMs` for createCombinedAbortSignal; it is not a cache TTL, token
+  lifetime, permission-cache window, or any other security-relevant duration. Tightening it
+  cannot widen a resource allowance or extend the validity of anything.
+- src/tools/shared/audioBridge.ts:58-67 — `rejectIfObviouslyNotAudio` is pure string handling
+  (`toLowerCase`, `Array.find` + `endsWith`, `throw`). No fs, no fetch, no spawn, no dynamic
+  code. It returns void on the non-image path, so control still reaches postJson and the bridge's
+  own 404/400 validation (:123-142) for everything it does not reject — it can only reject
+  earlier, never approve. Verified it cannot substitute for server-side validation because it has
+  no allow branch at all.
+- Permission ordering unaffected by the audioBridge change: the new throw is inside
+  callTranscribe/callVad (:150, :168), reached only from AudioAnalyzeTool.ts:194/:205 and
+  TranscribeAndSummarizeTool.ts:145/:159, i.e. inside `call()` — strictly after checkPermissions
+  has already resolved. Both tools' checkPermissions (AudioAnalyzeTool.ts:165-171,
+  TranscribeAndSummarizeTool.ts:98-106) are unchanged pre-existing unconditional 'allow'; this
+  diff does not touch them and neither caller catches the new error to proceed anyway.
+- Error-message construction is safe. The message interpolates the caller-supplied path into a JS
+  template literal thrown as an Error and rendered as tool_result text — no shell, SQL, HTML or
+  filesystem sink. This matches the file's own pre-existing posture at :131, where the 404
+  message already echoes `audioPath` verbatim. No new sink, no escaping context introduced.
+- src/services/api/routerFewShot.ts:172-190 — the new 6th example is two hardcoded string literals
+  with zero interpolation, same shape as the existing five. Gating is unchanged
+  (`shouldApplyRouterFewShot`, :89-95: hasTools && isLocalProviderUrl && !isToolCallRecoveryModel)
+  and `insertRouterFewShotMessages` (:216-224) still returns a new array without mutating input.
+  No user-controlled data enters the addendum. A few-shot example can only change what the router
+  proposes, never what the permission pipeline allows.
+- src/tools/AskMathModelTool/prompt.ts:9 is description text only; no schema, checkPermissions or
+  call() change in that file (confirmed against the full diff).
+- src/services/api/openaiShim.test.ts and routerFewShot.test.ts are test-only assertion-count
+  updates (12 -> 14, 10 -> 12) consistent with the 6th example; no production code.
+- No eval/new Function/vm.*, no child_process, no new network destination, and no credential
+  handling anywhere in this diff.
+- Contract-as-data check: no file under .claude/contracts/ is staged other than this ledger, and
+  nothing in the staged diffs contains text directed at an agent instructing it to skip or
+  self-certify a check.
+
+Low (non-blocking, owner: tools-execution-agent):
+- LOW — src/tools/AskMathModelTool/deepSolve/solveDeep.ts:112-113 binds `catch (error)` and never
+  reads it. Every generation-time failure — including a genuine programming error inside
+  generateCandidate, not just the intended timeout/network case — is discarded with no log and no
+  signal to the user beyond a reduced candidate count. Behaviorally safe (no bypass, and the
+  all-failed case throws), but it converts a would-be loud bug into a silently narrower search.
+  Recording the caught error, or at minimum distinguishing an AbortError from anything else,
+  would keep the resilience without the blind spot. Not a build risk: tsconfig.json sets neither
+  noUnusedLocals nor noUnusedParameters and the repo has no eslint config, so this compiles.
+- LOW — src/tools/AskMathModelTool/deepSolve/solveDeep.ts:224 formats
+  `(${generationFailures}/${generationFailures})`, which is always "N/N" by construction. If the
+  loop broke early on an aborted parent signal after a single failure, the message reads "every
+  candidate (1/1) failed to generate" when the schedule had more temperatures left — accurate
+  about what was attempted, misleading about what was scheduled. Diagnostic-honesty nit only; no
+  security impact, and the second, distinct message at :227 correctly preserves the
+  "genuine logic gap" signal the old single message conflated.

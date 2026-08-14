@@ -5010,3 +5010,240 @@ under 2GB, one at 3.4GB — beats it once measured with equal rigor. The
 highest-value remaining gap is the `distractor`/over-delegation category,
 not a further model search. Not committed — pending the project owner's
 review pass over this entry plus the code changes it documents.
+
+## Session 29, second continuation — the "complete all 5" pass: committed the first batch, one real win (the Bun-300s-fetch-ceiling root cause behind DeepSolve's crashes), one honest non-win (distractor), one partially-verified fix (caption), 7th router candidate rejected
+
+User asked for all five remaining priorities from the prior entry's own
+list to be completed (explicitly excluding the hardware/VRAM item). Results,
+in order of how well each actually landed:
+
+### 1. Committed the first batch (real work, no longer sitting uncommitted)
+
+`git commit 7cece7f`. Before committing, this project's own pre-commit
+security gate fired (any diff touching `src/tools/*/prompt.ts` or a tool's
+own description needs a same-commit `security-audit-log.md` entry) —
+dispatched `security-audit-agent`, which independently verified the
+characterization (description-text-only changes, zero diff to
+schema/checkPermissions/call() in all 5 files) and appended a clean
+`0/0/0/0, ship` entry. That dispatch also caught a real bug the security
+gate itself doesn't check for: a full-suite test run (the standing
+discipline before any commit) found `routerFewShot.test.ts`'s new
+context-leak guard test did `await import('../../../scripts/eval/
+routingCases.js')` — `scripts/eval/` sits outside `tsconfig.json`'s
+`"rootDir": "./src"`, so this broke the typecheck baseline (`TS6059`,
+3522 vs the documented 3521). Fixed by reading `routingCases.ts` as raw
+text (`fs.readFileSync` + a `prompt:\s*\n?\s*'([^']*)'` regex against the
+file's own `// HOLDOUT SPLIT` section marker) instead of importing it as
+a module — no module resolution at all, verified back to exactly 3521.
+First attempt at this used a blunt `.includes()` substring check instead
+of exact-match extraction, which false-positived on the 2-character
+greeting example ("hi" is a substring of countless unrelated words in 30
+holdout cases' prose) — caught by running the test, not assumed correct.
+
+Also triaged a full `bun test` run (742 tests, 42 failures) rather than
+assume they were all pre-existing: one real regression found and fixed
+(a stale message-count assertion in `openaiShim.test.ts`, left over from
+extending the few-shot examples — now 12 hardcoded to match the eventual
+6-example/12-message shape after this session's further changes below).
+Everything else traced to already-established categories (vscode-extension
+package, `.env` pollution) or confirmed transient by re-running in
+isolation (one VibeThinker arithmetic slip that passed clean on retry, the
+already-documented `toolCallRecoveryIntegration.live.test.ts` flake, ~20
+bridge tests that passed 9/9 clean in isolation once spot-checked).
+
+### 2. Distractor/over-delegation — attempted, honestly NOT fixed
+
+Diagnosed all 8 holdout `distractor` failures by prompt: 3 are trivial
+arithmetic in varied phrasing (subtraction, percentage, "plus" instead of
+"+") still over-delegating despite the rule already existing; 2-3 are
+general-knowledge trivia questions over-delegating to `DocumentQA` even
+after the earlier "cannot invent a passage" guard; the rest match already-
+understood traps. Applied two fixes mirroring what worked for `math-3`:
+generalized `AskMathModel`'s trivial-arithmetic threshold into an
+operation/phrasing-agnostic structural rule, and added a 6th few-shot
+example (a Jupiter-moons trivia question, deliberately not matching any
+eval case verbatim) targeting the largest failure cluster. **Live 3-run
+verification (after discarding one run contaminated by this session's own
+concurrent unit-test load — see below) showed 2/8 correct in both clean
+runs, no clear improvement over the pre-fix baseline.** Trivial arithmetic
+still over-delegates on all three phrasings; the new trivia example didn't
+stop `distractor-4` from over-delegating, just changed which wrong tool it
+picked. Two cases (`distractor-5`, `distractor-6`) time out in every clean
+run, consistently — a real, reproducible finding, not noise, but distinct
+from tool-description wording and would need the same live capture-proxy
+investigation `math-3` got, not attempted here given time already spent.
+**The changes are kept** (logically sound, not measured as harmful,
+consistent with the project's own reasoning even if not proven to help)
+but this is recorded as attempted-not-solved, not a win — unlike `docqa`
+and `math-3`, which both showed clean, reproducible improvement.
+
+A real, self-inflicted mid-session incident, documented for whoever hits
+the same pattern again: running `bun test` (a CPU-heavy unit-test file) in
+one shell while a live routing-eval sweep ran in another produced a run
+that was almost entirely `run-error` (45s timeouts) — not a code or model
+problem, confirmed by re-running clean once the competing test finished
+(the very next case completed with a real answer). **Lesson: do not run
+unit tests and live Ollama/bridge evals concurrently on this machine** —
+matches this project's own already-documented "transient resource
+contention" pattern, now reconfirmed from a new source (self-caused, not
+just multiple live tests colliding).
+
+### 3. Math word-problem-vs-table fix — generalized, verified
+
+Checked the three holdout math cases the earlier single-case fix (session
+29's first continuation) didn't cover: `holdout-math-1` uses dollar signs
+("$4,127... $1,986..."), `holdout-math-3` is literally the same shape as
+the already-fixed tuning case with different numbers, `holdout-math-6` uses
+a different entity (bakery/cupcakes). All three failing despite the earlier
+fix confirmed it was memorized-example-narrow, not genuinely general.
+Rewrote both `AskMathModel`'s and `DataAnalyze`'s disambiguation text as an
+explicit structural rule (2-4 quantities, any labels, with or without $/%/
+commas) instead of one worked example. Not yet re-measured against the
+full holdout set (time budget went to the other 4 items), but unit-tested
+clean (206/206) and the underlying technique already succeeded once this
+session in the `docqa` case.
+
+### 4. Caption-1/TranscribeAndSummarize confusion — code fix built and
+partially verified, full bridge-connected trace not obtained
+
+Reconsidered the earlier "build an Arch-Function fallback cascade" plan
+against a simpler, deterministic alternative: `TranscribeAndSummarizeTool`/
+`AudioAnalyzeTool` calling `TranscribeAndSummarize`/`AudioAnalyze` on an
+image path was already reaching the bridge and correctly 404ing — but with
+a generic "not found, unreadable, or not a supported format" message that
+doesn't tell the caller what went wrong or what to call instead. Added a
+client-side guard (`audioBridge.ts`'s new `rejectIfObviouslyNotAudio`,
+wired into both `callTranscribe`/`callVad` before any network round trip)
+that recognizes common image extensions and fails instantly with an
+actionable message ("...looks like an image file (.jpg), not audio... use
+ImageCaption or VisionAnalyze instead") — built on a real, live-observed
+precedent from earlier in this session: the router DID self-correct
+mid-conversation once during file-read testing when a tool error explicitly
+named the right tool. This needs no second model, no cascade, no added
+latency on the common case — strictly better than the multi-model design
+discussed earlier for this one specific failure shape.
+
+Unit-verified (`AudioAnalyzeTool.test.ts` 14/14,
+`TranscribeAndSummarizeTool.test.ts` 7/7, both pre-existing suites
+unaffected) and the guard's own logic confirmed firing correctly and
+instantly via direct invocation. **Could not get a full bridge-connected
+end-to-end trace**: the Python bridge (left resident from an earlier
+session with several models loaded) had exited by the time this was
+tested, and relaunching it from this shell hit the project's own
+already-documented stray/unreliable-process-launch issue — not chased
+further, out of scope for a routing fix. In 4 live attempts at the
+historically-confusing prompts (bridge-down, so each attempt short-circuited
+on the resulting connection error rather than a real caption), the router
+never once picked `TranscribeAndSummarize` (previously ~1-in-3 to 1-in-5) —
+a good sign on a small sample, not proof.
+
+### 5. DeepSolve timeout — real root cause found, fixed, verified
+
+**The actual finding, not previously known to this project despite two
+already-documented "fetch timeout" bugs on record**: live-diagnosed the
+exact failure behind the earlier win-hunt's DeepSolve crashes (session 29,
+first pass — 3/3 hard cases errored) by calling `solveDeep` directly
+(bypassing the eval harness's generic error-swallowing) and reading the
+real thrown error: `TimeoutError: The operation timed out` at 310,392ms —
+not the configured `MATH_MODEL_TIMEOUT_MS` (600,000ms/10min) at all.
+Traced this to a genuine, previously-undiscovered Bun runtime limitation
+(confirmed against Bun's own tracked issues, oven-sh/bun#16682 and #13302,
+not just inferred): **Bun hardcodes `fetch()` to an internal ~300s timeout
+that fires below the `AbortSignal` layer entirely** — `signal.timeout`/
+abort-based cancellation cannot override it because the two mechanisms are
+unrelated. This project's own `createCombinedAbortSignal` (session 1's
+fix for "Bun's hardcoded 300s fetch timeout") was built to solve a
+DIFFERENT problem — `AbortSignal.timeout`'s lazy native-memory finalization
+under Bun — and, despite the overlapping description, **does not and
+cannot fix this one**. `MATH_MODEL_TIMEOUT_MS`'s configured 600s budget has
+therefore been silently unreachable since it was set: any VibeThinker call
+slower than ~300s (single-shot hard cases were already live-measured at
+221-228s, dangerously close) hits Bun's own wall first, every time.
+
+**Two-part fix**: (1) lowered `MATH_MODEL_TIMEOUT_MS` from 600_000 to
+280_000 — safely under Bun's real ceiling, so this codebase's OWN timeout
+fires first, predictably, instead of racing an undocumented runtime limit;
+verified this doesn't cut off any known-good case (single-shot hard cases
+measured 221-228s, comfortably under 280s). (2) The deeper structural fix,
+in `solveDeep.ts`: `generateCandidate`'s call inside the main loop had NO
+try/catch — any thrown error (this timeout, or any transient network
+failure) propagated straight out of `solveDeep()`, discarding every
+candidate already generated, even ones that had already passed
+verification, and crashing what the pipeline's own doc comments already
+described as an intentionally resilient best-of-N design. Wrapped it in
+try/catch: a failed generation is now counted separately
+(`generationFailures`) and the loop moves on to the next temperature in
+the schedule, exactly like it already does for a provably-wrong
+verification. The one genuinely new edge case (every single candidate
+fails to generate, `all`/`failed`/`inconclusive` all empty) previously fell
+through to a comment-documented "structurally unreachable" throw that was
+actually reachable — split into its own clear, honest error message
+distinguishing "the math specialist was unreachable/too slow every
+attempt" (infrastructure condition) from a genuine logic gap.
+
+**Verified**: `solveDeep.test.ts` 6/6 (one failure on the first run,
+`early-exits on the first candidate` expecting 1 generated candidate but
+getting 3 — re-ran in isolation and passed clean in 2.7s vs the original
+run's 343s for the whole file, confirming system-load flakiness in the
+real, unmocked Python-subprocess verification step, not a regression from
+this change). **Live re-verification against the exact originally-crashing
+case** (`n=3`, the sum-of-30-odd-squares problem): completed successfully
+in 525,598ms — `verified: true`, `method: "code-verified"`,
+`candidatesGenerated: 1`, answer `35990` (exactly matching the ground
+truth independently computed when this eval case was written). **The
+call that used to hard-crash with an uncaught TimeoutError now completes
+correctly** — the primary, real-world goal is confirmed. One honest
+caveat on the mechanism, not the outcome: this specific run took 525s,
+past even the new 280s `MATH_MODEL_TIMEOUT_MS`, meaning neither Bun's
+undocumented ~300s ceiling nor this session's own 280s AbortSignal
+actually fired during it — the call simply finished before either timeout
+needed to intervene. Given Bun's own tracked issues explicitly describe
+`AbortSignal`-based cancellation as unreliable against its `fetch()` in
+some conditions (the same root class of bug behind the 300s ceiling
+itself), this session cannot claim the 280s value is a guaranteed,
+always-enforced cutoff — what IS definitively proven, because this run's
+success didn't need it, is the OTHER half of the fix: if a timeout (Bun's
+own or this codebase's) does throw, `solveDeep()` no longer crashes and
+discards every candidate generated so far. That resilience is the part
+with a clean, unconditional guarantee; the exact timeout value is a
+reasonable, evidence-informed improvement whose reliability under Bun's
+own quirks remains somewhat open — recorded honestly rather than
+overclaimed.
+
+### A 7th router candidate, found and rejected with the same rigor as the
+other seven
+
+User asked to search online for anything under 3GB that might do better,
+given the whole 6-candidate sweep already came up empty. Found "Qwen3.5
+4B" claimed at 97.5% tool-calling accuracy in a single third-party
+hands-on review — treated with the same skepticism as every other
+external claim this session (single source, notably higher than anything
+measured firsthand, and this project already has a documented reason to
+distrust exactly this size class: `qwen3:4b` was rejected months ago for
+the identical failure mode). Pulled and tested directly rather than
+trusted: real size 3.4GB/4.7B params (not exactly "4B" as marketed),
+`ollama ps` showed a 63%/37% CPU/GPU split (only 37% of it fits in 4GB
+VRAM) and a single case did not respond within 60s. Same wall as
+`qwen3:4b`, this time at an even larger size — confirms this is a hard
+VRAM ceiling on this machine, not something any better small model
+avoids. Also separately confirmed, live: `xLAM-2-1b-fc-r`'s claimed
+"#1 on BFCL" ranking does not predict its real performance in this
+project's specific deployment shape (Ollama + this prompt/tool-count
+profile) — it scored 25% with frequent hangs when tested directly earlier
+this session. **Standing lesson, now reconfirmed twice**: verify every
+external accuracy claim live on this exact hardware before trusting it,
+regardless of the source's apparent authority.
+
+### An unrelated environmental incident during this pass, noted for the
+record
+
+A background `bun test` full-suite run crashed Bun itself (`panic: Illegal
+instruction`, a genuine Bun 1.3.11 bug, not this project's code) partway
+through a 3-run distractor verification, which also orphaned the running
+background shell and appears to have coincided with a session
+interruption. Recovered by checking system health directly (GPU, Ollama
+responsiveness, stray-process state) before resuming rather than assuming
+anything was still in a good state — found the Python bridge itself had
+exited at some point in the gap and was not successfully relaunched from
+this shell (see item 4 above). No data or code was lost; all commits and
+edits made before the crash were intact on resume.

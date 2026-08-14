@@ -6,6 +6,7 @@ import {
   generateCandidate,
   generateRetryCandidate,
 } from './generateCandidates.js'
+import { logForDebugging } from '../../../utils/debug.js'
 import { pickWinner, scoreCandidatesWithReranker } from './rerankCandidates.js'
 import { verifyAnswer, type VerificationResult } from './verification.js'
 
@@ -92,11 +93,43 @@ export async function solveDeep(
   const all: Candidate[] = []
   const failed: Array<{ candidate: Candidate; verification: VerificationResult }> = []
   const inconclusive: Array<{ candidate: Candidate; verification: VerificationResult }> = []
+  // Session 29: a candidate that fails to GENERATE at all (network error,
+  // or the MATH_MODEL_TIMEOUT_MS abort — see that constant's own comment
+  // for why this is a real, observed case, not a hypothetical) used to
+  // propagate straight out of this function uncaught, crashing the entire
+  // solve and discarding every candidate generated so far — even ones that
+  // already passed. Counted separately from `failed` (a provable wrong
+  // answer) because there is no real candidate/answer content here to
+  // score or feed into a retry prompt; it only affects whether the loop
+  // keeps trying more temperatures and the final generatedCount/error path.
+  let generationFailures = 0
 
   for (let i = 0; i < temperatures.length; i++) {
     if (signal.aborted) break
 
-    const candidate = await generateCandidate(problem, temperatures[i]!, i, signal)
+    let candidate: Candidate
+    try {
+      candidate = await generateCandidate(problem, temperatures[i]!, i, signal)
+    } catch (error) {
+      generationFailures++
+      // Security-audit finding (session 29, LOW): log what was actually
+      // caught rather than silently discarding it — a genuine bug inside
+      // generateCandidate would otherwise be indistinguishable from the
+      // expected timeout/network-failure case, narrowing the search with
+      // no visible signal. Distinguish an intentional abort (the timeout
+      // this resilience exists for) from anything else, which is worth a
+      // caller's attention even though this loop recovers from it either way.
+      const isAbort = error instanceof Error && error.name === 'AbortError'
+      logForDebugging(
+        `[solveDeep] candidate ${i} (temp=${temperatures[i]}) failed to generate` +
+          `${isAbort ? ' (timed out)' : ''}: ${error instanceof Error ? error.message : String(error)}`,
+      )
+      // Try the next temperature in the schedule rather than losing every
+      // candidate generated so far to one slow/failed attempt — the same
+      // "one bad attempt doesn't sink the pipeline" resilience this
+      // function already applies to a provably-wrong verification result.
+      continue
+    }
     all.push(candidate)
 
     const verification = await verifyAnswer(candidate.answer, { signal })
@@ -189,9 +222,27 @@ export async function solveDeep(
     )
   }
 
-  // Structurally unreachable (n >= 1 always produces at least one candidate,
-  // which lands in exactly one of pass/fail/inconclusive) — kept as an
-  // explicit, honest error rather than silently returning something instead
-  // of ever reaching here.
-  throw new Error('DeepSolve: no candidate produced any usable result')
+  // Session 29: this WAS structurally unreachable before generation failures
+  // were caught above (n >= 1 always produced at least one candidate landing
+  // in pass/fail/inconclusive) — it is genuinely reachable now, in exactly
+  // one case: every single candidate failed to GENERATE (network error or
+  // MATH_MODEL_TIMEOUT_MS elapsed on all of them), so `all`, `failed`, and
+  // `inconclusive` are all empty. Distinguished from the truly-unreachable
+  // case with its own message so a caller can tell "the math specialist was
+  // unreachable/too slow every attempt" apart from "it answered every time
+  // but this function still has a real logic gap" — the latter would be a
+  // genuine bug report, the former is an infrastructure/timeout condition.
+  if (generationFailures > 0 && all.length === 0) {
+    // Security-audit finding (session 29, LOW): report against the actual
+    // schedule length, not `generationFailures` against itself (which is
+    // always "N/N" by construction and would misreport a run that broke
+    // early on an aborted parent signal after only one attempt as if the
+    // full schedule had been tried).
+    const abortedEarly = generationFailures < temperatures.length
+    throw new Error(
+      `DeepSolve: ${generationFailures}/${temperatures.length} scheduled candidate(s) failed to generate` +
+        `${abortedEarly ? ' (stopped early — parent signal aborted)' : ''} — the math specialist was unreachable or exceeded MATH_MODEL_TIMEOUT_MS, not a verification failure.`,
+    )
+  }
+  throw new Error('DeepSolve: no candidate produced any usable result — this indicates a genuine logic gap in this function, not an expected outcome.')
 }

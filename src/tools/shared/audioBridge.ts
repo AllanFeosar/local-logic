@@ -31,6 +31,41 @@ export type VadOptions = {
   speech_pad_ms?: number
 }
 
+/**
+ * Extensions this project's own image tools (ImageCaptionTool,
+ * VisionAnalyzeTool) treat as images — not exhaustive, just the common
+ * cases worth catching before a wasted round trip to the bridge.
+ */
+const IMAGE_EXTENSIONS = ['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp']
+
+/**
+ * Session 29 finding: the router sometimes calls TranscribeAndSummarize/
+ * AudioAnalyze on an image path instead of ImageCaption/VisionAnalyze
+ * (live-verified, e.g. holdout-caption-1's persistent failure). Previously
+ * this reached the bridge, which correctly 404'd with a generic
+ * "not found, unreadable, or not a supported format" message — technically
+ * accurate but not actionable: it doesn't tell the caller WHY the format is
+ * wrong or what to call instead. A same-session live test showed the
+ * router CAN self-correct mid-conversation when a tool error explicitly
+ * names the right tool (observed during file-read retrieval testing this
+ * session) — so this catches the obviously-wrong-extension case client-side,
+ * before any bridge round trip, with a message built to be actionable on
+ * the router's own next turn rather than just technically correct. Not a
+ * full-format detector (magic-byte sniffing) — it only catches the common,
+ * confidently-wrong case; anything else still falls through to the
+ * bridge's own real format validation below.
+ */
+function rejectIfObviouslyNotAudio(audioPath: string): void {
+  const lower = audioPath.toLowerCase()
+  const ext = IMAGE_EXTENSIONS.find(e => lower.endsWith(e))
+  if (ext) {
+    throw new Error(
+      `${audioPath} looks like an image file (${ext}), not audio — this tool only accepts WAV audio. ` +
+        `For "what's in this image" style requests, use ImageCaption or VisionAnalyze instead.`,
+    )
+  }
+}
+
 async function postJson(
   path: string,
   body: unknown,
@@ -112,6 +147,7 @@ export async function callTranscribe(
   language: string | undefined,
   signal: AbortSignal,
 ): Promise<TranscribeResult> {
+  rejectIfObviouslyNotAudio(audioPath)
   const response = await postJson(
     '/transcribe',
     { audio_path: audioPath, language },
@@ -129,6 +165,7 @@ export async function callVad(
   options: VadOptions,
   signal: AbortSignal,
 ): Promise<VadSegment[]> {
+  rejectIfObviouslyNotAudio(audioPath)
   const response = await postJson(
     '/vad',
     { audio_path: audioPath, ...options },
