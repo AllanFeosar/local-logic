@@ -532,3 +532,87 @@ Informational, no action taken:
   raw 500 bridge-side was not verified in this read-only pass. Flagged as a contract-accuracy
   question for python-bridge-agent (same class as the earlier /tabular-predict Low), not a
   vulnerability, outside this diff.
+
+## 2026-08-14 — Session 29 routing-eval work: tool DESCRIPTION/prompt text only (5 tool files)
+Files audited: src/tools/AskMathModelTool/prompt.ts, src/tools/DataAnalyzeTool/prompt.ts, src/tools/DocumentQATool/DocumentQATool.ts, src/tools/ImageCaptionTool/ImageCaptionTool.ts, src/tools/VisionAnalyzeTool/prompt.ts
+Also staged in this commit, outside the gate's own sensitive-path set — read for context, not deep-audited (two of them noted below): src/services/api/toolPreFilter.ts, src/services/api/routerFewShot.ts, src/services/api/routerFewShot.test.ts, src/services/api/openaiShim.test.ts, scripts/eval/deepSolveCases.ts, scripts/eval/deepSolveEval.ts, LOCAL_AI_STATUS.md.
+Verdict: 0 Critical, 0 High, 0 Medium, 0 Low
+Recommendation: ship
+Findings: none — no separate handoff report.
+
+Scope claim, independently verified rather than accepted: the dispatching characterization
+("description/prompt string only, no inputSchema/checkPermissions/call()/validation change") was
+checked against `git diff --cached` per file, not taken on faith, and is accurate. `git diff
+--name-only` is empty, so index and working tree agree and nothing is hidden outside the staged
+diff. Per-file numstat: +2/-0, +2/-0, +5/-1, +5/-1, +1/-0 — 17 changed lines total, every one of
+them inside a DESCRIPTION template literal. All five files were read end to end this session;
+this is not a sampled pass, and every staged file matching the gate's `^src/tools/` pattern is
+named above.
+
+- DocumentQATool.ts: the only hunk replaces the one-line DESCRIPTION literal with the three-
+  paragraph version now at :13-17. inputSchema (:19-24), outputSchema (:27-32), checkPermissions
+  (:64-66), call() (:73-101) and mapToolResultToToolResultBlockParam (:102-112) are unchanged
+  from HEAD.
+- ImageCaptionTool.ts: same shape — only hunk is DESCRIPTION at :13-17. inputSchema (:19-23),
+  getPath (:59-61), checkPermissions (:65-67) and call() (:74-105) are unchanged from HEAD.
+- All three prompt.ts files are pure string modules — one exported DESCRIPTION template literal
+  plus an exported PROMPT alias, no imports, no functions, no branching, nothing executable to
+  change (AskMathModelTool/prompt.ts:1,25; DataAnalyzeTool/prompt.ts:1,29;
+  VisionAnalyzeTool/prompt.ts:1,26).
+
+Checks run against the added text specifically — a text-only diff needs text-specific checks, not
+a re-run of a control-flow checklist that has nothing here to bite on:
+
+1. No template-literal escape or interpolation introduced. Zero dollar-brace sequences across all
+   15 added lines; the only dollar signs are in the literal phrase "$ signs"
+   (AskMathModelTool/prompt.ts:12, DataAnalyzeTool/prompt.ts:9). The backticks added in
+   VisionAnalyzeTool/prompt.ts:4 are correctly backslash-escaped, so no literal terminates early
+   and no expression position is opened. These are static developer-authored constants — no
+   runtime or user-derived value is concatenated into any of them.
+2. Hidden-character scan of every added line: no bidi controls (U+202A-202E, U+2066-2069), no
+   zero-width or format characters (U+200B-200F, U+2060-2064, U+FEFF, U+00AD), no private-use,
+   surrogate or tag characters. The only non-ASCII character present is EM DASH (U+2014, 16
+   occurrences), matching the surrounding prose style. This is the check that actually matters
+   for a diff whose entire payload is text the model reads — invisible-instruction smuggling
+   would land exactly here, and there is none.
+3. No prompt-injection surface added. Each string reaches the model as a static tool description
+   through tool.prompt() (consumed at src/utils/api.ts:171, src/services/api/toolPreFilter.ts:160,
+   src/utils/toolSearch.ts:350, src/utils/analyzeContext.ts:652) with no untrusted content spliced
+   in. The quoted sample passage appearing in both DataAnalyzeTool/prompt.ts:8 and
+   DocumentQATool.ts:15 ("...is over 13,000 miles long...") is inert illustrative prose used to
+   separate two tools, not an instruction, and carries no path, URL, credential or command.
+4. Direction of the change is restrictive, not permissive. ImageCaptionTool.ts:15 ("cannot
+   invent, imagine, or find an image") and DocumentQATool.ts:17 ("cannot invent, recall, or fetch
+   source text") narrow the set of calls the model will attempt; the rest redistributes routing
+   between three already-registered local-bridge tools. Checked explicitly against architecture
+   rule 2: no added line tells the model to skip a confirmation, assume approval, retry past a
+   denial, treat a permission as already granted, or route around any gate —
+   bypassPermissionsKillswitch.ts remains the only bypass path and is untouched.
+5. Permission-ordering invariant re-confirmed for both modified tool files rather than assumed:
+   checkPermissions is still present and unconditional-allow at DocumentQATool.ts:64-66 and
+   ImageCaptionTool.ts:65-67, identical to HEAD, and both tools still go through the shared
+   validateInput -> checkPermissions -> call pipeline. Nothing in this diff is async, awaited, or
+   ordered at all — there is no execution path to invert.
+6. No new executable surface of any kind: the diff adds no import, no statement, no eval / new
+   Function, no child_process, no filesystem or network call.
+
+Adjacent, reviewed, not findings:
+- src/services/api/toolPreFilter.ts:94-102 adds 'AudioAnalyze', 'TranscribeAndSummarize' and
+  'VisionAnalyze' to CORE_TOOL_NAMES. That set governs which tools are offered to the local
+  router, never whether a call is permission-checked — each of the three still runs its own
+  checkPermissions through the same pipeline. Outside the gate's sensitive-path set; named for
+  completeness.
+- src/services/api/routerFewShot.ts:159-163 adds a few-shot example teaching the router to emit
+  Read with a file_path. The path is an illustrative non-existent C:\Users\me\notes.txt, not a
+  real or sensitive location, and a few-shot example cannot weaken FileReadTool's own permission
+  check — it changes what the router proposes, not what the pipeline allows.
+- Contract-as-data check: no file under .claude/contracts/ is staged other than this ledger, and
+  the staged LOCAL_AI_STATUS.md diff's uses of "audit" are narrative descriptions of the
+  session's routing-eval work, not directives addressed to an agent or instructions to skip a
+  check.
+
+Pre-existing and explicitly NOT re-litigated as a finding of this entry: ImageCaptionTool's and
+DocumentQATool's unconditional-allow checkPermissions combined with a caller-supplied
+image_path/context. That posture is unchanged by this diff and is already recorded, with the
+owner-confirmed reasoning, in this log's 2026-08-12 and 2026-08-13 entries — and this diff
+narrows the model's use of that path rather than widening it.

@@ -9,6 +9,8 @@ When NOT to use:
 - Genuinely trivial arithmetic: both operands 2 digits or fewer (e.g. "12*7", "15% of 80", "9+16"). Delegating these wastes several minutes for no benefit.
 - Anything that isn't actually math (this model is not a general assistant and was not evaluated for other tasks).
 
+One narrow disambiguation, not a reason to delegate more broadly (the trivial-arithmetic exception above still applies exactly as stated): apply this as a STRUCTURAL test, not by matching against any one example's wording — a prose sentence naming 2-4 quantities tied to short labels (days, drives, cities, products, people; with or without $ signs, %, or commas — the surface formatting never changes the answer) and asking for their sum/difference/total is this tool, not DataAnalyze, no matter what the labels or numbers are. The only question that matters: were you handed an actual multi-row/column table, or are the numbers just embedded in one or two sentences? Only the former is DataAnalyze.
+
 Timing: the specialist model reasons visibly before answering and this routinely takes 1-5 minutes. That is expected, not a hang — do not retry or assume failure just because it's slow.
 
 Output: only the specialist's final answer is returned; its internal reasoning trace is stripped before being handed back to you. Treat the returned answer as authoritative and quote/use it directly rather than re-deriving the result yourself — re-deriving risks introducing a transcription error on top of an already-correct answer. If the result looks incomplete or is flagged as truncated, say so rather than guessing at what was cut off.

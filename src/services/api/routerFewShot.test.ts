@@ -1,3 +1,5 @@
+import { readFileSync } from 'node:fs'
+import { resolve } from 'node:path'
 import { describe, expect, test } from 'bun:test'
 import {
   buildRouterFewShotMessages,
@@ -31,10 +33,10 @@ describe('shouldApplyRouterFewShot', () => {
 describe('buildRouterFewShotMessages', () => {
   const messages = buildRouterFewShotMessages()
 
-  test('produces exactly 3 example turns (6 messages: 3 user, 3 assistant)', () => {
-    expect(messages).toHaveLength(6)
-    expect(messages.filter(m => m.role === 'user')).toHaveLength(3)
-    expect(messages.filter(m => m.role === 'assistant')).toHaveLength(3)
+  test('produces exactly 5 example turns (10 messages: 5 user, 5 assistant)', () => {
+    expect(messages).toHaveLength(10)
+    expect(messages.filter(m => m.role === 'user')).toHaveLength(5)
+    expect(messages.filter(m => m.role === 'assistant')).toHaveLength(5)
   })
 
   test('every user message is immediately followed by an assistant message', () => {
@@ -65,13 +67,73 @@ describe('buildRouterFewShotMessages', () => {
     expect(args.problem.length).toBeGreaterThan(0)
   })
 
-  test('example 3 (last, closest to the real conversation) is trivial arithmetic with NO tool call — targets the over-delegation failure mode directly', () => {
+  test('example 3 is a file-read routed to Read with a file_path arg — targets the Grep-mis-route / hallucinated-file-contents failure (session 29)', () => {
     const userMsg = messages[4]
     const assistantMsg = messages[5]
+    expect(typeof userMsg?.content).toBe('string')
+    expect((userMsg?.content as string).toLowerCase()).toContain('read the file')
+    const call = assistantMsg?.tool_calls?.[0]
+    expect(call?.function.name).toBe('Read')
+    const args = JSON.parse(call?.function.arguments ?? '{}')
+    expect(typeof args.file_path).toBe('string')
+    expect(args.file_path.length).toBeGreaterThan(0)
+    // The demonstrated call carries ONLY file_path — no stray Grep-style
+    // args (pattern/-A/-B/-i), which is the exact malformation being corrected.
+    expect(Object.keys(args)).toEqual(['file_path'])
+  })
+
+  test('example 4 is trivial arithmetic with NO tool call — targets the over-delegation failure mode directly', () => {
+    const userMsg = messages[6]
+    const assistantMsg = messages[7]
     expect(userMsg?.content).toBe('What is 12 * 7?')
     expect(assistantMsg?.tool_calls).toBeUndefined()
     expect(typeof assistantMsg?.content).toBe('string')
     expect((assistantMsg?.content as string).length).toBeGreaterThan(0)
+  })
+
+  test('example 5 (last, closest to the real conversation) is a bare greeting with NO tool call — targets the session-opener Skill-hallucination failure (session 29)', () => {
+    const userMsg = messages[8]
+    const assistantMsg = messages[9]
+    expect(userMsg?.content).toBe('hi')
+    expect(assistantMsg?.tool_calls).toBeUndefined()
+    expect(typeof assistantMsg?.content).toBe('string')
+    expect((assistantMsg?.content as string).length).toBeGreaterThan(0)
+  })
+
+  test('no few-shot example reuses a HOLDOUT routing-eval case prompt verbatim (context-leak guard — tuning-split overlap is allowed, e.g. example 3 deliberately mirrors routing-distractor-1)', () => {
+    // Read routingCases.ts as raw text rather than importing it as a module:
+    // scripts/eval/ sits outside tsconfig.json's "rootDir": "./src", so a
+    // real `import` here breaks the typecheck baseline (TS6059) even though
+    // it works fine at runtime under bun. A plain substring check against
+    // the file's own HOLDOUT SPLIT section marker (routingCases.ts's own
+    // header comment) needs no module resolution at all, and is exactly as
+    // effective for this guard's actual job — did any few-shot example's
+    // literal text leak into the holdout section — as parsing every case's
+    // `prompt` field individually would be.
+    const routingCasesSource = readFileSync(
+      resolve(import.meta.dir, '../../../scripts/eval/routingCases.ts'),
+      'utf8',
+    )
+    const holdoutMarker = '// HOLDOUT SPLIT'
+    const holdoutStart = routingCasesSource.indexOf(holdoutMarker)
+    expect(holdoutStart).toBeGreaterThan(-1) // fails loudly if routingCases.ts's own structure ever changes
+    const holdoutSection = routingCasesSource.slice(holdoutStart)
+    // Exact-match against each case's actual `prompt:` string value, not a
+    // blunt substring search over the whole section — a plain .includes()
+    // false-positived on the short greeting example ("hi" is a substring of
+    // countless unrelated words in 30 cases' worth of prose). All prompt
+    // values in this file are single-quoted with no embedded quotes
+    // (verified before writing this regex, not assumed).
+    const holdoutPrompts = new Set(
+      [...holdoutSection.matchAll(/prompt:\s*\n?\s*'([^']*)'/g)].map(m => m[1]),
+    )
+    expect(holdoutPrompts.size).toBeGreaterThan(0) // fails loudly if the regex stops matching
+
+    for (const m of messages) {
+      if (m.role === 'user' && typeof m.content === 'string') {
+        expect(holdoutPrompts.has(m.content)).toBe(false)
+      }
+    }
   })
 
   test('every tool_calls id is unique and every JSON arguments string parses cleanly', () => {

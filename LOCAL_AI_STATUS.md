@@ -4706,3 +4706,307 @@ ends in the plan's own explicitly-sanctioned partial state (2 of 3 models
 built and verified, 1 honestly parked with concrete evidence), not full
 completion, which is the documented, legitimate outcome its own gate text
 anticipated.
+
+## Session 29 (2026-08-14, interactive session) — live REPL Skill-hallucination on a bare greeting; lever F extended with a greeting example
+
+**Repro (user-reported, real REPL session, not the eval harness):** a fresh
+`bun run dev` session, user types `hi` → three consecutive malformed `Skill`
+tool calls (`InputValidationError`: first `args` as object where string
+required, then `skill` missing twice) before any answer. This is the same
+hallucinated-`Skill` shape Session 2 first recorded on "12 x 7" — the
+conversational-opener flavor of the over-delegation failure mode the
+routing eval's distractor category measures.
+
+**Fix (Lever F extension, `src/services/api/routerFewShot.ts`):** added a
+fourth few-shot example — bare `hi` → plain no-tool greeting reply — placed
+last (closest to the real conversation) per the module's own recency-bias
+ordering rationale; the trivial-arithmetic no-tool example moved to
+third. Deliberately NOT the literal text of `routing-distractor-2` or
+`holdout-distractor-2` so the eval keeps measuring generalization
+(Session 17's math-3 context-leak lesson). A new regression test asserts
+no few-shot user prompt matches any **holdout**-split eval prompt verbatim
+— this guard incidentally documented a pre-existing, acceptable overlap:
+example 3 IS tuning-split `routing-distractor-1`'s literal prompt
+("What is 12 * 7?"), which is fine (tuning split exists to be tuned
+against) and now explicitly noted in the test name.
+
+**Verification:** `bun test routerFewShot.test.ts` 17/17. `bun run build`
+clean. Live, through the compiled CLI (`-p` headless, requires
+`CLAUDE_CODE_GIT_BASH_PATH` on this machine — `E:\Tools\Git\usr\bin\bash.exe`):
+3/3 fresh `hi` runs → zero tool calls, zero `InputValidationError`s, clean
+greeting reply. Delegation not regressed: `routingEval --case routing-math-1`
+→ correct (`AskMathModel`, 27.9s). Generalization beyond the example's
+literal text: `--case routing-distractor-2` ("Hi there! How's it going?")
+→ correct (no tool, 18.0s).
+
+**Not done, flagged honestly:** the full `--split holdout --runs 3` sweep
+was NOT re-run (targeted verification only) — the 64.4% holdout baseline
+number is now stale with respect to this change and should be re-measured
+when the routing-reliability optimization pass (now unblocked — all §8
+phases attempted as of Session 28) begins in earnest. A second candidate
+fix was considered and deliberately not done here: coercing/softening
+`SkillTool`'s input schema for malformed local-router calls touches the
+shared tool-execution surface (tools-execution-agent ownership +
+security-gate territory), and the few-shot fix already removes the
+observed failure at its source. Not committed — left for the project
+owner's review.
+
+### Session 29 continued — file-read retrieval fix, 6-model router-replacement candidate sweep (all rejected, with real numbers), a mid-sweep GPU-contention scare correctly caught and corrected, and a verified 65%→80% tuning-split win from a tool-description fix (no ensemble needed)
+
+**File-read retrieval few-shot (Lever F, `routerFewShot.ts`).** A live REPL
+run ("`<path> explain how this project is created`") showed the router not
+retrieving the named file at all — either fabricating file contents
+outright (including an invented confidence score) or mis-routing to
+`Grep` with its required `pattern` field missing entirely. Added a fifth
+few-shot example (now 5 examples / 10 messages, up from 4/8): user names a
+path to read → emit `Read` with `file_path` only. Tests updated (18/18).
+Live-verified this is a genuine nudge, not a cure: repeated live runs
+showed the router sometimes reaching `Read` correctly (once self-correcting
+mid-turn: "Let's try using the Read tool instead"), and other times still
+spiraling through malformed `Grep` retries to max-turns — consistent with
+this being a 1.7B reliability-ceiling problem, not a one-line fix.
+
+**Router-replacement candidate sweep — 6 sub-2GB models, "try all this
+suggestion".** User supplied a list of 6 candidate small tool-calling
+models claimed to exist as Mar–Aug 2026 releases (outside this assistant's
+training data too, so nothing was taken on faith). All 6 verified real by
+direct `ollama pull`/`hf.co/` resolution before building anything —
+`function-gemma:270m` (hyphenated) does NOT exist, `functiongemma:270m`
+(no hyphen) does. Confirmed pullable: `qwen3.5:0.8b` (873M, Ollama
+official), `granite4.1:3b` (3.4B, Ollama official), `functiongemma:270m`
+(268M, Ollama official), `hf.co/katanemo/Arch-Function-1.5B.gguf` (1.54B,
+vendor GGUF), `hf.co/mradermacher/Hammer2.1-1.5b-GGUF` (1.54B, community
+GGUF), `hf.co/Salesforce/xLAM-2-1b-fc-r-gguf` (1.54B, vendor GGUF). Each
+built into a `router-cand-*` Ollama tag the same way `qwen3-router:1.7b`
+was built — `num_ctx 32768` baked in (uniform across all 6: high enough to
+clear the ~15.6k-token production prompt with headroom, capped down from
+some models' much larger native windows — qwen3.5's native is 262144 — to
+avoid repeating the exact VRAM/CPU-fallback failure that sank the
+qwen3:4b A/B). All 6 report `tools` capability natively via `ollama show`.
+
+Ran each candidate through the project's own 20-case **tuning** split
+(`routingEval.ts --split tuning`), swapping `.openclaude-profile.json`'s
+`OPENAI_MODEL` between runs via a driver script with a `trap`-guaranteed
+restore to `qwen3-router:1.7b` on exit (profile backed up first). **Zero
+candidates beat the router.** Clean, final numbers (see the GPU-contention
+finding below for why "final" required a redo):
+
+| Model | Score | Dominant failure |
+|---|---|---|
+| qwen3-router:1.7b (current) | 65.0% (13/20) | wrong-tool, over-delegation |
+| Arch-Function-1.5B | 60.0% (12/20) | wrong-tool, no-tool-called |
+| qwen3.5:0.8b | 45.0% (9/20) | wrong-tool, no-tool-called |
+| granite4.1:3b | 30.0% (6/20) | no-tool-called (8/20 — rarely uses tools despite reporting the capability) |
+| functiongemma:270m | 25.0% (5/20) | wrong-tool, over-delegation |
+| Hammer2.1-1.5b | 25.0% (5/20) | no-tool-called (15/20 — almost never calls a tool) |
+| xLAM-2-1b-fc-r | 25.0% (5/20) | run-error (6/20 — hangs past the 45s timeout generating) |
+
+Arch-Function-1.5B is the only candidate close enough to be worth a future
+`--runs 3` confirmation sweep before ruling out entirely (this project's
+own methodology treats ~5pp as normal run-to-run noise); the other five
+have a disqualifying *pattern*, not just a lower score.
+
+**A mid-sweep GPU-contention scare, caught and corrected, not reported
+blind.** A same-moment baseline re-run immediately after the sweep
+returned 10.0% (2/20), 15/20 hitting the exact 45s kill-timeout.
+Investigated rather than reported: `ollama ps` showed zero models loaded
+(so not an Ollama-side issue) but `nvidia-smi` still showed 3.7–3.8GB/4096MB
+used — traced to the user's own Steam game (`Dark and Darker`,
+`DungeonCrawler.exe`) running concurrently and claiming most of the 4GB
+card, confirmed via `nvidia-smi --query-compute-apps`. Did not kill the
+user's process unilaterally; flagged it and waited. Once the user closed
+the game, GPU dropped 3.7GB→1.9GB and an immediate re-run correctly scored
+65.0% (13/20) — matching the documented historical range, confirming the
+router itself was never broken. Cross-referenced candidate-log timestamps
+against the game's process-creation time: 5 of 6 candidates had already
+finished before the game started and are unaffected; `xLAM-2-1b-fc-r`'s
+run window overlapped the game's start, so it alone was re-run clean
+(25.0%, 5/20 — actually *slightly worse* than its contaminated number,
+confirming the correction wasn't inflating any candidate). This is the
+same class of environmental finding Session 17 already established
+("GPU/VRAM contention degraded router latency") — reconfirmed here from an
+unrelated non-AI source (a game) rather than dismissed as a one-off.
+
+**The real finding: a targeted tool-description fix beat every model swap
+tried.** User asked whether `qwen3-router:1.7b` and `Arch-Function-1.5B`
+could be combined to cover each other's weaknesses. Checked the actual
+per-case failure sets rather than reasoning abstractly: they *do* fail on
+different categories (router weak at `caption` 2/5, Arch-Function weak at
+`docqa` 1/5; "oracle" best-of-both would be 15/20=75%), but naive
+parallel-vote is exactly the anti-pattern `LOCAL_AI_MASTER_PLAN.md` §11
+already found doesn't work (Self-MoA: diverse models on the *same*
+problem underperform; Lever H self-consistency already measured negative)
+— and it would double per-turn latency on an interactive router.
+Crucially, both models fail *identically* (not complementarily) on
+`routing-docqa-1`/`routing-docqa-3` — both call `DataAnalyze` instead of
+`DocumentQA`. Reading the actual prompts (both: "Here is a passage: '...is
+over N miles long...' Question: how long is X? Answer using only the
+passage.") showed why: a passage-grounded question with a *numeric*
+answer pattern-matches to `DataAnalyze`'s "question" operation for a small
+model, even though there's no table. This is a shared tool-description
+ambiguity, not two independent model weaknesses — no ensemble fixes two
+votes for the same wrong answer.
+
+Sharpened both descriptions instead (`DataAnalyzeTool/prompt.ts`,
+`DocumentQATool/DocumentQATool.ts`): `DataAnalyze`'s "question" operation
+now states the table-requirement as a hard, checked-first rule with the
+exact ambiguous example spelled out; `DocumentQA` gained the reciprocal
+cross-reference it previously lacked (it referenced nothing about
+`DataAnalyze`; `DataAnalyze` already had a one-line "use DocumentQA
+instead" that evidently wasn't prominent enough on its own). `bun test`
+28/28 pass, clean build. **Live-verified before and after**: both
+previously-failing cases now correctly route to `DocumentQA`
+(`routing-docqa-1` needed a slightly longer timeout on first retry — 45s
+vs the 60s retry that passed at 38.5s — before confirming it wasn't a real
+regression, just normal latency variance crossing the timeout boundary).
+Full tuning-split re-run: **65.0% (13/20) → 80.0% (16/20)**, `docqa`
+category now a clean 5/5 (was 3/5), zero regressions in any other
+category. This is a materially larger, more certain win than anything the
+6-model sweep or a would-be ensemble offered, for a fraction of the
+complexity and no new architecture.
+
+**Recommended next step, not yet built (flagged for a decision, matching
+this project's own convention for anything touching tool-selection
+behavior project-wide):** a disagreement-triggered cascade — keep
+`qwen3-router` as the always-on primary; only on a real uncertainty signal
+(not "always run both," which the evidence above rules out) fall back to
+a second model or an existing-infrastructure tiebreak (e.g.
+`toolPreFilter.ts`'s already-built embedding-similarity ranking, applied
+only to the disputed tool names) rather than trusting either blindly.
+Explicitly unproven — would need its own prototype and eval before
+trusting a number from it, same discipline as everything above. Also
+worth re-running the holdout sweep now that both this session's fixes
+(greeting/file-read few-shot, DocumentQA/DataAnalyze description sharpen)
+are in, since the 64.4% holdout figure predates all of it.
+
+**Cleanup status:** the 6 `router-cand-*` Ollama tags and their 6 base
+pulls remain on disk (~7GB total, 67GB free at time of writing) in case
+further poking is wanted; not removed unilaterally.
+`.openclaude-profile.json` confirmed restored to `qwen3-router:1.7b`
+after every swap in this session, verified by direct read each time, not
+assumed. Not committed — all of the above (routerFewShot.ts's 5th
+example, the two tool-description edits, this doc) sits in the working
+tree for the project owner's review.
+
+### Session 29 continued further — the "20/20" chase: real code-level audit, an honest 3-run mean±std baseline (71.7% tuning), a genuine math-3 fix, two more candidates measured on real failures, and the real holdout number (62.2%)
+
+**Chasing the remaining 4 tuning-split failures found real bugs and real
+noise, and separated the two.** Three more rounds of targeted
+tool-description edits swung the single-run score 80%→75%→80% — informative,
+not just annoying: `caption-1`/`caption-4` (structurally near-identical
+prompts) flipped which one failed to `TranscribeAndSummarize` between runs
+with no content difference explaining it (genuine model noise), while a
+real self-inflicted regression was found and fixed (`AskMathModel`'s
+own added disambiguation text diluted its pre-existing, already-correct
+"9+16 is trivial" example via sheer added length — tightened, confirmed
+fixed).
+
+**A proper 3-run mean±std, not a single lucky/unlucky sample, is the honest
+tuning-split number: 71.7% mean, std 5.8pp** (75%/75%/65%) — the earlier
+single-run 80% was optimistic. Per-case analysis across the 3 runs
+separated **persistent failures** (wrong in all 3 runs — real, not noise)
+from single-run flukes: `routing-math-3`, `routing-caption-1`,
+`routing-caption-2`, `routing-distractor-3`, `routing-distractor-5`. Two
+"fixes" from earlier rounds (`distractor-3`, `distractor-5`) turned out to
+have passed by single-run luck, not because the underlying issue was
+solved — corrected the record rather than keep the false claim.
+
+**Real code-level audit of `math-3`, using this project's own established
+technique** (a minimal capture proxy in front of Ollama's OpenAI-compat
+endpoint, same method Session 4/5 used to diagnose the original truncation
+bug — script not committed, one-shot diagnostic in the scratchpad): no
+truncation (request ≈24.8k tokens against the 40960 `num_ctx` budget, ~60%
+headroom, comfortable — NOT a repeat of the historical bug), no stale-build
+issue (captured tool descriptions matched source exactly), actual query
+correctly positioned last in the message array (recency-favorable) but
+preceded in the same message by ~3700 chars of unrelated skills-list/
+CLAUDE.md system-reminder boilerplate injected by the base harness on
+every turn regardless of query complexity — flagged as a general dilution
+risk for a 1.7B router, not fixed (out of scope, base-harness behavior).
+**One real, self-inflicted bug found and fixed**: the literal eval-case
+example text ("3,842 tickets... Friday... Saturday") had been used
+verbatim in both `AskMathModel`'s positive example and `DataAnalyze`'s
+negative example — a plausible lexical-similarity trap sitting in two
+competing tool schemas. Swapped in a different example
+(bakery/loaves/Monday-Tuesday) for one side. **Verified live: `math-3` now
+passes 3/3 with zero variance** — the one failure that survived every
+model swap tried is fixed, durably.
+
+**Two more router-replacement candidates measured on qwen3-router's exact
+persistent failures** (3 runs each, `--case` repeated, same fixed tool
+descriptions), extending the earlier Arch-Function-1.5B result:
+
+| Case | qwen3-router | Arch-Function-1.5B | qwen3.5:0.8b | functiongemma:270m |
+|---|---|---|---|---|
+| `math-3` | 0/3 | 0/3 | 1/3 | 1/3 |
+| `distractor-3` | 0/3 | 2/3 (1× → `Bash`) | **3/3** | 0/3 (+1 hallucinated-tool) |
+| `distractor-5` | 0/3 | 1/3 | **3/3** | 0/3 (+1 run-error) |
+
+`qwen3.5:0.8b` — less than half `qwen3-router`'s size — cleanly rescues
+both distractor cases every time, with none of Arch-Function's one-off
+`Bash`-over-delegation risk. `functiongemma:270m` confirmed worse across
+the board, including two new failure classes not seen elsewhere this
+session (a genuinely hallucinated tool name outside the registered list,
+and a full 45s timeout).
+
+**Full 3-run tuning-split sweeps run for both candidates (apples-to-apples
+with qwen3-router's own 71.7%), and neither beats the incumbent**:
+
+| Model | Mean | Std |
+|---|---|---|
+| qwen3-router:1.7b | **71.7%** | ±5.8pp |
+| Arch-Function-1.5B | 65.0% | ±8.7pp |
+| qwen3.5:0.8b | 56.7% | ±12.6pp |
+
+Both candidates' narrow-case brilliance (qwen3.5:0.8b's flawless
+distractor record; Arch-Function's earlier persistent-failure wins) did
+NOT predict full-sweep reliability — qwen3.5:0.8b's docqa/caption
+categories collapsed to near-total silence in one of its three full runs,
+and Arch-Function's own docqa/distractor categories were far more volatile
+across the full 20 cases than the 5-case probe suggested. **Lesson,
+matching this session's own recurring theme: a narrow probe is not a
+substitute for the full sweep, no matter how clean the narrow result
+looks.**
+
+**The real, trustworthy number — holdout split, 3 runs, current
+qwen3-router with every fix above applied: mean 62.2%, std 3.8pp**
+(60.0%/60.0%/66.7%). Lower than the tuning-split's 71.7% (expected — the
+tuning set was iterated against directly) but genuinely more stable
+(3.8pp vs 5.8pp), and roughly flat against the pre-session 64.4% baseline
+despite the session's real fixes — an honest, not-hidden finding. Full
+per-case breakdown: **`docqa` is a clean 21/21 across all three
+holdout runs** (7 cases × 3 runs, zero failures) — real, holdout-confirmed
+proof the `DocumentQA`/`DataAnalyze` fix generalizes beyond the tuning
+set it was built against. Captions likewise clean. **`distractor`
+(over-delegation) is the dominant remaining weakness**: 7 of 8 holdout
+distractor cases failed at least once (mostly over-delegating to
+`AskMathModel`/`DocumentQA`/`DataAnalyze`), including 3 outright 45s
+timeouts on distinct cases — a materially worse showing than the tuning
+split's distractor category suggested. The `math-3` fix, while durable for
+the exact tuning case, is **not fully general**: the same table-vs-word-
+problem confusion recurs on three different holdout math cases
+(`holdout-math-1/3/6`) with the identical shape, unfixed.
+
+**A user-supplied "under 3GB" candidate, checked and rejected on hard
+evidence, not speculation**: a hands-on third-party review claimed
+"Qwen3.5 4B" (3.4GB) hits 97.5% tool-calling accuracy. Pulled and tested
+directly rather than trusted: `ollama ps` showed a 63%/37% CPU/GPU split
+(only 37% of the 4.8GB resident footprint fits in the 4GB card) and a
+single routing case did not respond within 60s — the identical VRAM/
+CPU-fallback wall that got `qwen3:4b` rejected months earlier, this time
+at an even larger size. Torn down immediately (`ollama stop`, profile
+restored, confirmed). Separately, a claimed "#1 on BFCL" ranking for
+`xLAM-2-1b-fc-r` was found not to hold up against this project's own
+first-party measurement of the same exact model (25%, frequent hangs) —
+recorded as a caution against trusting published leaderboard rank for
+this specific deployment shape (Ollama + local prompt/tool-count profile)
+without live verification.
+
+**Status at end of this pass**: `qwen3-router:1.7b` remains the router,
+unchanged in identity, with real fixes applied (`DocumentQA`/`DataAnalyze`
+disambiguation, the `math-3` example-dedup fix, the greeting/file-read
+few-shot examples, the `repeat_penalty` fix). No candidate model — six
+under 2GB, one at 3.4GB — beats it once measured with equal rigor. The
+highest-value remaining gap is the `distractor`/over-delegation category,
+not a further model search. Not committed — pending the project owner's
+review pass over this entry plus the code changes it documents.

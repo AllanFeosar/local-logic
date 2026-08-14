@@ -19,21 +19,29 @@ import { isLocalProviderUrl } from './providerConfig.js'
  * model, and it's what the Meta-Tool ablation's "few-shot examples" arm
  * means concretely.
  *
- * Three examples, chosen to target this project's own measured routing-eval
+ * Four examples, chosen to target this project's own measured routing-eval
  * failure modes (`LOCAL_AI_STATUS.md` Session 5/7 — 3 wrong-tool
  * hallucinations, 3 over-delegations on trivial/no-tool-needed prompts,
  * confirmed to be a reliability ceiling independent of tool count): one math
- * delegation, one table→DataAnalyze, and one "no tool needed" (trivial
- * arithmetic below AskMathModelTool's own 2-digit-operand delegation
- * threshold — this is the exact shape of `routing-distractor-1`/`-3` in
- * `scripts/eval/routingCases.ts`). Ordered least-similar → most-similar to
+ * delegation, one table→DataAnalyze, one "no tool needed" trivial-arithmetic
+ * case (below AskMathModelTool's own 2-digit-operand delegation threshold —
+ * the exact shape of `routing-distractor-1`/`-3` in
+ * `scripts/eval/routingCases.ts`), and one "no tool needed" bare greeting
+ * (added session 29 after a live REPL session showed a plain "hi" producing
+ * three consecutive malformed `Skill` tool calls — the same
+ * hallucinated-Skill shape Session 2 first recorded; this is the
+ * conversational-opener flavor of the same over-delegation mode
+ * `routing-distractor-2` measures). Ordered least-similar → most-similar to
  * a typical incoming router query, per the master plan's own guidance to
  * exploit in-context recency bias: since this is a fixed, static addendum
  * (not re-ranked per turn), "most similar to a typical query" is
  * interpreted here as "most directly targets the plurality failure mode" —
- * the no-tool-needed example is placed last, closest to the real
- * conversation that follows, since 3 of the 6 known remaining failures are
- * over-delegation and recency bias should weight that example the most.
+ * the two no-tool-needed examples are placed last, closest to the real
+ * conversation that follows, since over-delegation is the plurality of
+ * known remaining failures and recency bias should weight them the most.
+ * Neither no-tool example reuses a holdout case's literal prompt text
+ * (`routingCases.ts` holdout split) — the eval's own context-leak lesson
+ * (Session 17, math-3).
  *
  * **Gated local-only** — `shouldApplyRouterFewShot()` below is the single
  * gate every caller must check first, mirroring `toolPreFilter.ts`'s own
@@ -138,13 +146,43 @@ export function buildRouterFewShotMessages(): OpenAIMessage[] {
     { role: 'user', content: 'What is 734 x 851?' },
     toolCallMessage('AskMathModel', { problem: '734 x 851' }, '2'),
 
-    // Example 3 — trivial arithmetic, no tool needed. Placed last
-    // (closest to the real conversation) to weight this behavior the most
-    // via in-context recency bias — this is the exact shape of the
-    // over-delegation failures (`routing-distractor-1`/`-3`) this lever
-    // targets directly.
+    // Example 3 — read a specific file → Read (file_path). Added session 29
+    // after a live REPL run ("<path> explain how this project is created")
+    // showed the router NOT retrieving the file at all: it either fabricated
+    // file contents outright (a hallucinated answer with an invented
+    // confidence score) or mis-routed a "read this file" request to Grep with
+    // its required `pattern` arg missing entirely — the same wrong-tool-plus-
+    // malformed-args shape the greeting hit with Skill. The file-read plumbing
+    // (FileReadTool) is the same code the cloud parent uses; the 1.7B router
+    // just has zero few-shot coverage for the read-a-file wire format, so it
+    // guesses. This demonstrates it once: user names a path to read → emit
+    // Read with the absolute path as file_path, nothing else.
+    {
+      role: 'user',
+      content: 'Read the file C:\\Users\\me\\notes.txt and tell me what it says.',
+    },
+    toolCallMessage('Read', { file_path: 'C:\\Users\\me\\notes.txt' }, '3'),
+
+    // Example 4 — trivial arithmetic, no tool needed. This is the exact
+    // shape of the over-delegation failures (`routing-distractor-1`/`-3`)
+    // this lever targets directly.
     { role: 'user', content: 'What is 12 * 7?' },
     { role: 'assistant', content: '12 * 7 = 84.' },
+
+    // Example 5 — bare conversational greeting, no tool needed. Placed
+    // last (closest to the real conversation) to weight this behavior the
+    // most via in-context recency bias: a session opener is, by
+    // construction, the very next thing after this example in a fresh
+    // conversation. Added session 29 — a live REPL "hi" produced three
+    // consecutive malformed `Skill` calls (args-as-object, then missing
+    // `skill` twice) before this example existed. Deliberately NOT the
+    // literal text of `routing-distractor-2` or `holdout-distractor-2`, so
+    // the eval keeps measuring generalization rather than recall.
+    { role: 'user', content: 'hi' },
+    {
+      role: 'assistant',
+      content: 'Hi! What would you like to work on?',
+    },
   ]
 }
 

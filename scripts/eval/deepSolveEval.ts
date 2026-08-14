@@ -7,12 +7,14 @@
  * eval set" (frontier comparison is a separate, later step — this harness
  * covers the local-vs-local half first, following this project's own
  * eval-gating discipline of measuring before claiming). This harness's case
- * set (deepSolveCases.ts) is intentionally small (6, not >=20) to keep a
- * single run's wall-clock time reasonable — DeepSolve's own worst case is
- * N x 1-5 minutes PER CASE — see deepSolveCases.ts's own header for why
- * these 6 specifically (2 easy/regression, 2 medium, 2 deliberately hard).
- * Growing the case set toward the >=20 gate is future work, not blocked by
- * anything in this harness's shape.
+ * set (deepSolveCases.ts) now holds 21 cases (grown from 9 in session 29),
+ * clearing the gate's ">=20-problem" bar. A full run is expensive —
+ * DeepSolve's own worst case is N x 1-5 minutes PER CASE, so the full 21 x
+ * (single-shot + deep) sweep is a dedicated multi-hour run; use `--case` to
+ * spot-check a single case, or `--n 1` to cut DeepSolve's candidate budget
+ * for a faster (weaker) pass. The win the gate asks for lives in the
+ * deep-10..21 "win zone" cases (see deepSolveCases.ts's header) — problems
+ * where single-shot has a real slip probability but Tier 1 can still verify.
  *
  * For each case, runs BOTH:
  *   - AskMathModelTool.call({ problem })            (single-shot, existing)

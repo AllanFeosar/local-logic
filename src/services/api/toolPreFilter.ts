@@ -91,6 +91,17 @@ export const CORE_TOOL_NAMES: ReadonlySet<string> = new Set([
   'DocumentQA',
   'ImageCaption',
   'DataAnalyze',
+  // Phase 4/5 gateway tools (added session 29 — the batched pass flagged as
+  // "currently harmless, worth doing" in LOCAL_AI_STATUS.md's open items).
+  // Same literal-name convention as the three above (their tool files each
+  // define a private `const TOOL_NAME`, no exported *_TOOL_NAME constant).
+  // Keeps every local-AI specialist in the always-visible core set so a
+  // grown tool list can never rank one of them out — the whole point of this
+  // set. Inert today (the discretionary tail is below TOP_K so no trim runs),
+  // but correct the moment the tool count crosses the threshold.
+  'AudioAnalyze',
+  'TranscribeAndSummarize',
+  'VisionAnalyze',
 ])
 
 /**

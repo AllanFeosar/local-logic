@@ -10,7 +10,11 @@ import {
 
 const TOOL_NAME = 'DocumentQA'
 
-const DESCRIPTION = `Answers a question by extracting the relevant span directly from a supplied text passage, via a local extractive-QA model (distilbert-base-cased-distilled-squad). This is not a general assistant — it can only point at where in the given text the answer already appears, it cannot reason, summarize, or answer from outside the passage. Use it when you have a specific passage (e.g. from a file you've read) and want a fast, precise answer to a factual question the text actually contains. If the answer isn't literally present in the passage, expect a low score and a poor-quality extracted span rather than a helpful response.`
+const DESCRIPTION = `Answers a question by extracting the relevant span directly from a supplied text passage, via a local extractive-QA model (distilbert-base-cased-distilled-squad). This is not a general assistant — it can only point at where in the given text the answer already appears, it cannot reason, summarize, or answer from outside the passage. Use it when you have a specific passage (e.g. from a file you've read) and want a fast, precise answer to a factual question the text actually contains. If the answer isn't literally present in the passage, expect a low score and a poor-quality extracted span rather than a helpful response.
+
+Use this whenever the source is prose (sentences/paragraphs), even when the question asks for a specific number or fact — e.g. "Here is a passage: '...is over 13,000 miles long...' Question: How long is X? Answer using only the passage." is THIS tool, not DataAnalyze, because there is no table here, only sentences. If the source is instead a table (columns + rows), use DataAnalyze's "question" operation instead — the presence of columns/rows, not whether the answer happens to be a number, is what decides which of the two to use.
+
+Requires an actual passage already supplied or already read (e.g. from a file) — do not call this without one. General-knowledge trivia with no passage attached (e.g. "give me a fun fact about octopuses") is not a document-QA task, even though it's phrased as a question with a factual answer — this tool cannot invent, recall, or fetch source text, only extract from text you already have.`
 
 const inputSchema = lazySchema(() =>
   z.strictObject({

@@ -2,13 +2,23 @@
 /**
  * Seed test cases for the DeepSolve pipeline-vs-single-shot eval
  * (scripts/eval/deepSolveEval.ts). Mirrors cases.ts's MathCase shape and
- * conventions. Includes two easy/regression cases (reused verbatim from
- * cases.ts's mathCases so the two harnesses stay comparable), two medium
- * cases, and two genuinely hard cases picked specifically because they are
- * the kind of problem a 3B model's raw mental arithmetic is likely to slip
- * on, but a short Python check can settle unambiguously — exactly the
- * profile DeepSolve's verification step is meant to help with (per
- * LOCAL_AI_MASTER_PLAN.md §11/§8 Phase 3.5's own framing).
+ * conventions.
+ *
+ * 21 cases (was 9) — grown past the LOCAL_AI_MASTER_PLAN.md §8 Phase 3.5
+ * exit gate's ">=20-problem" bar in session 29. The added 12 (deep-10..21)
+ * were chosen specifically for the "win zone" the gate actually needs to
+ * probe: problems multi-step enough that a strong-but-3B solver
+ * (VibeThinker, ~94 AIME) has a *real* single-shot slip probability, yet
+ * whose final answer is a single distinctive closed-form number a Tier-1
+ * restricted-evaluator check can settle unambiguously (no loops, no
+ * simulation — deep-9 remains the deliberate counter-example that Tier 1
+ * *cannot* verify, kept on purpose). Every ground truth below was computed
+ * independently in Python before being written here (session 29), never
+ * taken from memory — same discipline the original 9 used. Distinctive
+ * multi-digit answers were preferred over 1-2 digit ones to reduce the
+ * harness's known substring-false-match risk (a bare '9' can appear in
+ * reasoning that reaches a wrong final answer); a few short answers remain
+ * where the problem shape earns its slot.
  */
 
 export type DeepSolveCase = {
@@ -119,6 +129,121 @@ export const deepSolveCases: DeepSolveCase[] = [
       'odd, multiply it by 3 and add 1. Keep applying the rule until you reach 1. How many steps does it take to ' +
       'reach 1? Show your final answer clearly.',
     expectedSubstrings: ['111'],
+    hard: true,
+  },
+
+  // === session 29: 12 added to clear the >=20 gate, targeting the win zone ===
+  {
+    id: 'deep-10-inclusion-exclusion',
+    description:
+      'Hard — sum of all integers 1..200 divisible by 3 OR 5. Inclusion-exclusion trap: forgetting to subtract ' +
+      'the multiples-of-15 overlap double-counts them. Closed-form (three arithmetic-series sums), Tier-1 ' +
+      'verifiable. Ground truth computed in Python: 6633 + 4100 - 1365 = 9368.',
+    problem:
+      'What is the sum of all integers from 1 to 200 (inclusive) that are divisible by 3 or by 5? Show your final answer clearly.',
+    expectedSubstrings: ['9368'],
+    hard: true,
+  },
+  {
+    id: 'deep-11-binomial',
+    description:
+      'Medium — a single binomial coefficient C(12,5). Slip-prone by hand (factorial ratio), unambiguous ' +
+      'closed-form check. Ground truth: 792.',
+    problem: 'How many ways are there to choose 5 items from a set of 12 distinct items (order does not matter)? Show your final answer clearly.',
+    expectedSubstrings: ['792'],
+  },
+  {
+    id: 'deep-12-digit-sum-power',
+    description:
+      'Hard — the flagship silent-slip case: the sum of the decimal digits of 2^100. There is no shortcut; a ' +
+      'by-hand solver must actually carry out the 31-digit expansion of 2^100 and then add its digits, with many ' +
+      'independent places to slip. A one-line check (sum of digits of pow(2,100)) settles it. Ground truth ' +
+      'computed in Python: 2^100 = 1267650600228229401496703205376, digit sum = 115.',
+    problem: 'What is the sum of the decimal digits of 2^100? Show your final answer clearly.',
+    expectedSubstrings: ['115'],
+    hard: true,
+  },
+  {
+    id: 'deep-13-count-with-exclusion',
+    description:
+      'Medium — how many integers in 1..1000 are divisible by 7 but NOT by 11. Trap: forgetting the "not 11" ' +
+      'exclusion (gives 142) or miscounting the multiples of 77. Ground truth: 142 - 12 = 130.',
+    problem:
+      'How many integers from 1 to 1000 (inclusive) are divisible by 7 but not divisible by 11? Show your final answer clearly.',
+    expectedSubstrings: ['130'],
+  },
+  {
+    id: 'deep-14-sum-odd-squares',
+    description:
+      'Hard — sum of the squares of the first 30 positive odd numbers (1^2 + 3^2 + ... + 59^2). A 30-term sum ' +
+      'with real accumulation-error risk done by hand; closed form ((n(2n-1)(2n+1)/3) or direct) is Tier-1 ' +
+      'verifiable. Ground truth computed in Python: 35990.',
+    problem: 'What is the sum of the squares of the first 30 positive odd numbers (that is, 1^2 + 3^2 + 5^2 + ... + 59^2)? Show your final answer clearly.',
+    expectedSubstrings: ['35990'],
+    hard: true,
+  },
+  {
+    id: 'deep-15-sum-of-cubes',
+    description:
+      'Hard-looking, closed-form-clean — sum of cubes 1^3 + ... + 100^3. The elegant check is (100*101/2)^2 = ' +
+      '5050^2; a solver that does not recall the identity and adds by hand is very slip-prone, while the ' +
+      'identity makes it trivially Tier-1 verifiable. Ground truth: 25502500.',
+    problem: 'What is the value of 1^3 + 2^3 + 3^3 + ... + 100^3 (the sum of the cubes of the integers from 1 to 100)? Show your final answer clearly.',
+    expectedSubstrings: ['25502500'],
+    hard: true,
+  },
+  {
+    id: 'deep-16-mixed-powers',
+    description:
+      'Medium — evaluate 2^10 + 3^7 + 5^4. Three independent power computations then a sum; each is a place to ' +
+      'slip (3^7 especially). Ground truth: 1024 + 2187 + 625 = 3836.',
+    problem: 'What is the value of 2^10 + 3^7 + 5^4? Show your final answer clearly.',
+    expectedSubstrings: ['3836'],
+  },
+  {
+    id: 'deep-17-compound-growth',
+    description:
+      'Hard word problem — compound growth with rounding: 5000 grown 8% per year for 3 years, rounded to the ' +
+      'nearest whole number. Trap: linear (5000 + 3*8%) instead of compound, or rounding 6298.56 wrong. ' +
+      'Ground truth: 5000 * 1.08^3 = 6298.56 -> 6299.',
+    problem:
+      'A population starts at 5000 and grows by exactly 8% each year. What is the population after 3 years, rounded to the nearest whole number? Show your final answer clearly.',
+    expectedSubstrings: ['6299'],
+    hard: true,
+  },
+  {
+    id: 'deep-18-polygon-angles',
+    description:
+      'Medium word problem — sum of interior angles of a 15-sided polygon. Formula (n-2)*180; trap is using ' +
+      'n*180 or the exterior-angle 360. Ground truth: 13 * 180 = 2340.',
+    problem: 'What is the sum of the interior angles of a polygon with 15 sides, in degrees? Show your final answer clearly.',
+    expectedSubstrings: ['2340'],
+  },
+  {
+    id: 'deep-19-percentage-chain',
+    description:
+      'Medium word problem — chained percentages: of 300 students, 60% are girls, and 25% of the girls play a ' +
+      'sport. Trap: taking 25% of all 300, or 60%*25% applied to the wrong base. Ground truth: 300*0.6*0.25 = 45.',
+    problem:
+      'A school has 300 students. 60% of them are girls. Of the girls, 25% play a sport. How many girls play a sport? Show your final answer clearly.',
+    expectedSubstrings: ['45'],
+  },
+  {
+    id: 'deep-20-handshakes',
+    description:
+      'Medium — classic handshake count for 25 people (each pair shakes once): C(25,2). Trap: 25*25 or 25*24 ' +
+      'without halving. Ground truth: 25*24/2 = 300.',
+    problem: 'At a party of 25 people, every person shakes hands with every other person exactly once. How many handshakes happen in total? Show your final answer clearly.',
+    expectedSubstrings: ['300'],
+  },
+  {
+    id: 'deep-21-modular-power',
+    description:
+      'Hard — modular exponentiation 13^99 mod 100 (the last two digits of 13^99). A by-hand solver must find ' +
+      'the cycle of 13^k mod 100 (period 20) and reduce 99 mod 20 = 19 correctly; many slip points. A one-line ' +
+      'pow(13,99,100) settles it. Ground truth computed in Python: 77.',
+    problem: 'What are the last two digits of 13^99 (equivalently, 13^99 mod 100)? Show your final answer clearly.',
+    expectedSubstrings: ['77'],
     hard: true,
   },
 ]

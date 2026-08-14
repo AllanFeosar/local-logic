@@ -10,7 +10,11 @@ import {
 
 const TOOL_NAME = 'ImageCaption'
 
-const DESCRIPTION = `Generates a short natural-language caption describing the contents of a local image file, via a local captioning model (blip-image-captioning-large). Use this when you need a description of what's in an image you can't otherwise inspect. It produces a single generic description (e.g. "a dog running on a beach"), not detailed analysis, OCR, or answers to specific questions about the image — for those, still needs a real vision-capable model.`
+const DESCRIPTION = `Generates a short natural-language caption describing the contents of a local image file, via a local captioning model (blip-image-captioning-large). Use this when you need a description of what's in an image you can't otherwise inspect. It produces a single generic description (e.g. "a dog running on a beach"), not detailed analysis, OCR, or answers to specific questions about the image — for those, still needs a real vision-capable model.
+
+Requires an actual local image file path you already have — do not call this without one. A request that's merely ABOUT a visually-evocative topic (an animal, a place, a scene) with no actual image file mentioned or implied is not a captioning task, even if the subject is naturally something you could picture — this tool cannot invent, imagine, or find an image, only describe one you already have a path to.
+
+This does the same thing as VisionAnalyze's "caption" operation (both call the same underlying model) — prefer this tool directly for a plain "what's in this image" request; reach for VisionAnalyze's "caption" operation instead only when you're already using (or expect to also need) one of VisionAnalyze's other operations (classify/detect/segment/pose/embed) on the same image.`
 
 const inputSchema = lazySchema(() =>
   z.strictObject({
